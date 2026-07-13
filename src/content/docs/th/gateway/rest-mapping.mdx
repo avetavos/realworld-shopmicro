@@ -1,0 +1,209 @@
+---
+title: REST Mapping
+description: "annotation google.api.http กลายเป็น REST ได้อย่างไร: path param, body: \"*\", query param, การตั้งชื่อ field แบบ protojson (camelCase, int64-as-string), default mapping จาก gRPC status ไป HTTP status และ extension point WithErrorHandler/WithIncomingHeaderMatcher — ยืนยันด้วย curl flow เต็มรูปแบบ create-product → create-order → get-order"
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+บทนี้ไม่มีไฟล์ใหม่ — `gateway/cmd/main.go` จาก [grpc-gateway →](/shopmicro/th/gateway/grpc-gateway/) ไม่เปลี่ยนเลย บทนี้ว่าด้วยการทำความเข้าใจว่าไฟล์นั้นทำอะไรอยู่แล้วในทุก request: แต่ละ option `google.api.http` จาก [The Contracts →](/shopmicro/th/proto-grpc/contracts/) ตัดสินใจ path, body, และ query parameter ของ request อย่างไร; JSON บน wire จริง ๆ แล้วหน้าตาเป็นแบบไหน; และ gRPC error กลายเป็น HTTP status code อะไรโดย default โดยไม่มีโค้ดที่ไหนเขียนไว้เพื่อให้มันเกิดขึ้นเลย
+
+## Why
+
+reverse proxy ที่ generate มาจาก annotation จะน่าเชื่อถือได้ก็ต่อเมื่อคุณรู้แน่ชัดว่ามันทำอะไรกับ request ที่เข้ามา — ไม่งั้นทุก REST endpoint ก็เป็นกล่องดำที่บังเอิญทำงานได้ในวันนี้ ทุกกฎในบทนี้อ่านมาจากไฟล์ `.proto` ทั้งสองไฟล์โดยตรง หรือไม่ก็เป็นพฤติกรรม default ของ grpc-gateway เองที่กำหนดไว้ชัดเจนและไม่ config ได้ — ไม่มีอะไรในนี้ที่เป็นการเดาว่า gateway "น่าจะ" ทำงานยังไง
+
+## Pros & cons
+
+**พึ่งพา status mapping default และ error body default ของ grpc-gateway (สิ่งที่คอร์สนี้ทำ)**
+
+- **Pros:** ไม่มีโค้ดเพิ่มเลย — ทุก `codes.NotFound`/`codes.InvalidArgument`/`codes.FailedPrecondition` ที่ Catalog กับ Order service คืนค่าอยู่แล้ว (จาก [The Product API →](/shopmicro/th/catalog-service/product-api/) กับ [The Order Repository →](/shopmicro/th/order-service/order-repo/)) ถูกแปลเป็น HTTP status โดยอัตโนมัติ; mapping นี้มีเอกสารรองรับ เสถียร และเหมือนกันทุกเซอร์วิสที่อยู่หลัง grpc-gateway ที่ไหนก็ตาม ดังนั้น client ที่เคยเจอ grpc-gateway API มาก่อนก็รู้อยู่แล้วว่าจะเจออะไรจากตัวนี้
+- **Cons:** error body default เป็น envelope ทั่วไป `{"code":..., "message":..., "details":[]}` — ไม่มีทางเพิ่ม field เฉพาะโปรเจกต์ (สตริง `error_code` ที่ machine อ่านได้แน่นอน, ข้อความที่แปลภาษา) ได้เลยถ้าไม่ override มัน; ทุก gRPC status code ไหลผ่าน mapping table เดียวกันที่ตายตัว เซอร์วิสจึงบอกไม่ได้ว่า "`NotFound` ตัวนี้ควรจะเป็น `410 Gone` จริง ๆ" ถ้าไม่ไปใช้ extension point ด้านล่าง
+
+**`runtime.WithErrorHandler` แบบกำหนดเอง**
+
+- **Pros:** ควบคุมรูปแบบของ JSON error body ได้เต็มที่ — เพิ่ม field, แปลข้อความ, log ทุกความล้มเหลวระดับ gateway ไว้ที่เดียวกันไม่ว่า RPC ไหนเป็นคนสร้างมัน
+- **Cons:** อีกหนึ่งฟังก์ชันที่ทุก REST error response ไหลผ่าน — บั๊กตรงนี้พังการรายงาน error ของ*ทั้ง*gateway ไม่ใช่แค่ endpoint เดียว; ต้องคอย sync มือกับพฤติกรรม default ที่มัน override อยู่ เพราะ default ของ grpc-gateway เองอาจเปลี่ยนไปตาม version
+
+คอร์สนี้ใช้ default ต่อจากทั้งสองบทที่ผ่านมา (`main.go` ของ `grpc-gateway.mdx` เรียก `runtime.NewServeMux()` แบบไม่มี option เลย) — mapping ด้านล่างนี้ถูกต้อง เสถียร และไม่มีต้นทุนอะไรเลย `runtime.WithErrorHandler` ถูกบันทึกไว้ตรงนี้ในฐานะ extension point ที่มีอยู่จริง ไม่ใช่สิ่งที่ `main.go` ของคอร์สนี้ใช้อยู่ในตอนนี้
+
+## Set it up
+
+### 1. Path parameter — `{id}`
+
+```proto
+rpc GetProduct(GetProductRequest) returns (Product) {
+  option (google.api.http) = { get: "/v1/products/{id}" };
+}
+```
+
+path template ที่เขียนเป็น `` `{id}` `` ผูก URL segment นั้นตรงเข้ากับ field ชื่อ `id` บน `GetProductRequest` ตามชื่อเป๊ะ ๆ — `GET /v1/products/8f14e45f-...` มาถึง handler เป็น `&GetProductRequest{Id: "8f14e45f-..."}` โดยไม่มีการ parse URL มือเลย กฎเดียวกันนี้คือสิ่งที่ทำให้ `GET /v1/orders/{id}` ผูกกับ `GetOrderRequest.id` ได้
+
+### 2. Request body — `body: "*"`
+
+```proto
+rpc CreateProduct(CreateProductRequest) returns (Product) {
+  option (google.api.http) = { post: "/v1/products" body: "*" };
+}
+```
+
+`body: "*"` หมายความว่า JSON request body*ทั้งหมด*ที่เข้ามาถูก unmarshal ลงบนทุก field ของ `CreateProductRequest` — body ของ `POST` ที่เป็น `{"name":"Coffee Mug","price_cents":1299}` กลายเป็น `&CreateProductRequest{Name: "Coffee Mug", PriceCents: 1299}` `CreateOrder` ที่มี `post: "/v1/orders" body: "*"` ก็ทำงานแบบเดียวกันกับ `CreateOrderRequest` mapping แบบ `get` ไม่มี field `body` เลย — request แบบ `GET` ไม่มี body ดังนั้น input เดียวของมันคือ path template กับ query parameter
+
+### 3. Query parameter — ทุกอย่างที่เหลือ
+
+```proto
+rpc ListProducts(ListProductsRequest) returns (ListProductsResponse) {
+  option (google.api.http) = { get: "/v1/products" };
+}
+rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse) {
+  option (google.api.http) = { get: "/v1/orders" };
+}
+```
+
+field ไหนของ request message ที่ไม่ได้ถูกใช้โดย path template หรือ body จะถูกอ่านจาก query string แทนโดยอัตโนมัติ — ไม่ต้องประกาศแยกเลย field `page`/`page_size` ของ `ListProductsRequest` ไม่มี path segment ให้ผูก ดังนั้น `GET /v1/products?page=2&page_size=10` จะเติมค่าให้มันตรง ๆ จาก query string `ListOrdersRequest.customer_id` ก็ทำงานแบบเดียวกัน: `GET /v1/orders?customer_id=cust-1` คือวิธีที่ client กรอง order ตาม customer ผ่าน REST เป๊ะ ๆ โดยไม่มีโค้ด parse query เฉพาะของ gateway เขียนไว้ที่ไหนเลย — มันคือการผูกตามชื่อ field แบบเดียวกับ path parameter เพียงแต่มาจาก `?key=value` แทนที่จะเป็น URL segment
+
+### 4. การตั้งชื่อ field แบบ protojson — camelCase และ `int64` เป็น JSON string
+
+ชื่อ field JSON ทุกตัวบน wire คือรูป **lowerCamelCase** ของชื่อ field แบบ snake_case ใน `.proto` — `price_cents` กลายเป็น `priceCents`, `unit_price_cents` กลายเป็น `unitPriceCents`, `customer_id` กลายเป็น `customerId` นี่คือ mapping มาตรฐานของ `protojson` ไม่ใช่สิ่งที่ grpc-gateway คิดขึ้นเอง — [The Product API →](/shopmicro/th/catalog-service/product-api/) แสดงกฎเดียวกันนี้ไปแล้วจากฝั่ง `grpcurl`
+
+field แบบ `int64` serialize เป็น JSON **string** ไม่ใช่ JSON number — `"priceCents": "1299"` ไม่ใช่ `"priceCents": 1299` — เพราะ JSON number ไม่สามารถแทนค่า 64-bit integer ทุกค่าได้อย่างปลอดภัยโดยไม่เสีย precision ใน client JavaScript field แบบ `int32` (`stock`, `quantity`) ยังคงเป็น JSON number ธรรมดา เพราะค่า 32-bit จะพอดีอย่างปลอดภัยเสมอ ถ้าเขียน request body มือแล้วพลาดตรงนี้ gateway จะปฏิเสธเป็น decode error ก่อนที่ request จะไปถึง gRPC service เลยด้วยซ้ำ
+
+อีกหนึ่ง default ที่ควรพูดถึงตรง ๆ ที่เห็นไปแล้วในบทที่แล้วตอน `curl localhost:8080/v1/products` คืนค่ามาเป็น `{}`: protojson (และก็คือ `runtime.JSONPb`) ละ field ไหนก็ตามที่ยังเป็น**zero value**อยู่ทิ้งไป — string ว่าง, `0`, repeated field ที่ว่างเปล่า — เว้นแต่ marshaler จะถูก config ด้วย `EmitUnpopulated` อย่างชัดเจน `main.go` ของคอร์สนี้ไม่เคยทำแบบนั้นเลย ดังนั้น response ที่เป็นค่า default ทั้งหมดจึงกลับมาเป็น `{}` ได้จริง ๆ และ `ListProductsResponse` ที่ไม่มีแถวเลยจะละทั้ง `products` กับ `total` ทิ้งไป แทนที่จะส่ง `{"products":[],"total":0}`
+
+### 5. Default mapping จาก gRPC code ไป HTTP status
+
+`runtime.ServeMux` ของ grpc-gateway แปลทุก `status.Error(code, msg)` ที่เซอร์วิสคืนค่าเป็น HTTP status ผ่าน table ที่ตายตัวและมีเอกสารรองรับ — นี่คือส่วนย่อยที่เซอร์วิสของคอร์สนี้คืนค่าจริง ๆ:
+
+| gRPC code | HTTP status | คืนค่าโดย |
+| --- | --- | --- |
+| `OK` | 200 | ทุก call ที่สำเร็จ |
+| `InvalidArgument` | 400 | input หายไป/ผิดรูปแบบ — `id` ว่างของ `GetProduct`, `name` หายไปของ `CreateProduct` |
+| `FailedPrecondition` | 400 | `CreateOrder` ตั้งราคา `product_id` ที่ Catalog รายงานว่าไม่มีอยู่จริง |
+| `NotFound` | 404 | `GetProduct`/`GetOrder` สำหรับ id ที่ไม่มีอยู่จริง |
+| `AlreadyExists` | 409 | (เซอร์วิสของคอร์สนี้ยังไม่ใช้วันนี้ แสดงไว้เพื่อความครบถ้วน) |
+| `Unauthenticated` | 401 | (ยังไม่ใช้ — [Resilience →](/shopmicro/th/resilience/) คือจุดที่ auth จะลงมา) |
+| `Unimplemented` | 501 | RPC ไหนก็ตามที่ยังไม่ implement — ตรงกับ response ของ placeholder server ทุกตัวก่อนที่ `Server` จริงจะมีอยู่ |
+| `Internal` | 500 | ความล้มเหลวของ repository/database ใด ๆ ที่ไม่ใช่ `NotFound` |
+| `Unavailable` | 503 | gRPC service ฝั่ง backend เข้าถึงไม่ได้เลย |
+
+table นี้คือเหตุผลตรง ๆ ที่ `codes.FailedPrecondition` เป็นทางเลือกที่จงใจเลือกใน [The Order Repository →](/shopmicro/th/order-service/order-repo/) สำหรับ "Catalog บอกว่า product นี้ไม่มีอยู่จริง" แทนที่จะเป็น `codes.InvalidArgument` — ทั้งคู่ map เป็น `400` เหมือนกันตรงนี้ ดังนั้น REST client แยกทั้งสองออกจากกันไม่ได้เลยด้วย status code อย่างเดียว แยกได้แค่จาก `message` ใน error body นี่คือข้อจำกัดที่แท้จริงและตรงไปตรงมาของการพึ่งพา default mapping แทนที่จะใช้ error handler แบบกำหนดเอง
+
+### 6. Extension point ไว้อ้างอิง — `runtime.WithErrorHandler` กับ `runtime.WithIncomingHeaderMatcher`
+
+ไม่ได้ถูกใช้ใน `main.go` ของคอร์สนี้ แต่ควรรู้ว่ามีอยู่:
+
+```go
+mux := runtime.NewServeMux(
+	runtime.WithErrorHandler(func(ctx context.Context, mux *runtime.ServeMux, marshaler runtime.Marshaler, w http.ResponseWriter, r *http.Request, err error) {
+		// Full control over the JSON error body and status code here —
+		// this course relies on runtime.DefaultHTTPErrorHandler instead,
+		// which is what mux uses automatically when this option is omitted.
+	}),
+	runtime.WithIncomingHeaderMatcher(func(header string) (string, bool) {
+		// Controls which incoming HTTP headers are forwarded into the
+		// gRPC call's metadata — the default matcher forwards a small
+		// standard set (like grpc-metadata- prefixed headers) and drops
+		// the rest.
+		return header, true
+	}),
+)
+```
+
+`WithErrorHandler` แทนที่การแปล error เป็น JSON ทั้งหมดที่แสดงใน table ด้านบน; `WithIncomingHeaderMatcher` ตัดสินใจว่า HTTP request header ตัวไหน (header `Authorization`, header สำหรับ tracing) จะถูกส่งต่อเข้าไปใน gRPC call เป็น metadata เทียบกับถูกทิ้งไปเงียบ ๆ ที่ gateway ทั้งสองเป็น extension point จริง ๆ ที่ gateway ใน production คงต้องใช้ — การแนบ request ID หรือ auth token เข้ากับทุก gRPC call ที่ยิงลงไปต้องใช้แบบนี้เป๊ะ — แต่ยังไม่จำเป็นสำหรับ REST surface ของคอร์สนี้ในวันนี้ ดังนั้น `main.go` จึงยังคงใช้ `runtime.NewServeMux()` ธรรมดาจากบทที่แล้ว
+
+## Verify
+
+ให้ Catalog, Order, และ gateway ยังรันอยู่จาก [grpc-gateway →](/shopmicro/th/gateway/grpc-gateway/) รัน flow เต็มรูปแบบ create-product → create-order → get-order ผ่าน REST ล้วน ๆ:
+
+```bash
+curl -s -X POST localhost:8080/v1/products \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Coffee Mug","description":"350ml ceramic mug","price_cents":1299,"stock":50}'
+```
+
+```json
+{
+  "id": "8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21",
+  "name": "Coffee Mug",
+  "description": "350ml ceramic mug",
+  "priceCents": "1299",
+  "stock": 50
+}
+```
+
+copy `id` แล้วสั่งซื้อสองชิ้น:
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
+```
+
+```json
+{
+  "id": "3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90",
+  "customerId": "cust-1",
+  "status": "ORDER_STATUS_PENDING",
+  "totalCents": "2598",
+  "items": [
+    {
+      "productId": "8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21",
+      "quantity": 2,
+      "unitPriceCents": "1299"
+    }
+  ],
+  "createdAt": "2026-07-14T09:12:03Z"
+}
+```
+
+`totalCents` คือ `1299 × 2 = 2598` — HTTP request นี้ไม่เคยส่งราคาไปเลย มันถูกหาราคาสด ๆ จาก Catalog โดย Order service เป๊ะ ๆ ตามที่ [The Order Repository →](/shopmicro/th/order-service/order-repo/) สร้างไว้ gateway แค่แปลงชั้น transport เท่านั้น ดึง order นั้นกลับมาด้วย id โดยใช้การผูก path-parameter จากขั้นตอนที่ 1 ของบทนี้:
+
+```bash
+curl -s localhost:8080/v1/orders/3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90
+```
+
+list order ทั้งหมดของ customer นั้น โดยใช้การผูก query-parameter จากขั้นตอนที่ 3:
+
+```bash
+curl -s "localhost:8080/v1/orders?customer_id=cust-1"
+```
+
+ยืนยัน status mapping table ด้วย request จริง — `codes.NotFound` กลายเป็น `404`:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' localhost:8080/v1/products/00000000-0000-0000-0000-000000000000
+```
+
+```txt
+404
+```
+
+และ `codes.InvalidArgument` กลายเป็น `400` พร้อม error envelope default:
+
+```bash
+curl -s -X POST localhost:8080/v1/products \
+  -H 'Content-Type: application/json' \
+  -d '{"description":"no name given"}'
+```
+
+```json
+{
+  "code": 3,
+  "message": "name is required",
+  "details": []
+}
+```
+
+`"code": 3` คือค่า numeric ของ `codes.InvalidArgument` ใน enum ของ gRPC status code — code table เดียวกับที่ [The Product API →](/shopmicro/th/catalog-service/product-api/) ใช้ไปแล้ว เพียงแต่ตรงนี้แสดงออกมาเป็น JSON แทนข้อความ `Code: InvalidArgument` ของ `grpcurl`
+
+สุดท้าย ยืนยันว่าทั้ง module ยัง build ผ่านสะอาด:
+
+```bash
+go build ./...
+```
+
+ไม่มี output แปลว่าสำเร็จ
+
+## Recap
+
+ไม่มีอะไรใน `gateway/cmd/main.go` เปลี่ยนเลยในบทนี้ — ทุกกฎที่นี่ทำงานอยู่แล้วโดยไม่มีใครเห็น ตั้งแต่ [grpc-gateway →](/shopmicro/th/gateway/grpc-gateway/): path segment `` `{id}` `` ผูกกับ request field ชื่อเดียวกัน; `body: "*"` unmarshal JSON body ทั้งหมดลงบน request message; field ที่เหลือ (`page`/`page_size`, `customer_id`) ถูกอ่านจาก query string โดยอัตโนมัติ; ชื่อ field ทุกตัวบน wire เป็น lowerCamelCase โดย `int64` serialize เป็น JSON string และ field ที่เป็น zero value ถูกละทิ้งทั้งหมด; และทุก `status.Error(code, ...)` ที่เซอร์วิสคืนค่ากลายเป็น HTTP status ผ่าน table ที่ตายตัวและมีเอกสารรองรับ — `InvalidArgument`/`FailedPrecondition` → 400, `NotFound` → 404, `Internal` → 500 — โดยมี `runtime.WithErrorHandler`/`runtime.WithIncomingHeaderMatcher` เป็น extension point จริงที่คอร์สนี้แค่ยังไม่จำเป็นต้องใช้ REST flow เต็มรูปแบบ — สร้าง product, สั่งซื้อที่ตั้งราคาสดจาก product นั้น, ดึง order กลับมา, list ตาม customer, และเห็นทั้ง 404 กับ 400 ทำงานถูกต้อง — ยืนยันทั้งหมดนี้แบบ end-to-end โดยไม่มีโค้ดเฉพาะของ gateway เขียนไว้ที่ไหนเลย บทถัดไป [OpenAPI Documentation →](/shopmicro/th/gateway/openapi/) จะ serve เอกสาร `*.swagger.json` ที่ [Code Generation →](/shopmicro/th/proto-grpc/codegen/) สร้างไปแล้วจาก annotation ชุดเดียวกันนี้ พร้อม Swagger UI ในฐานะเอกสารที่มีชีวิตของ REST surface นี้

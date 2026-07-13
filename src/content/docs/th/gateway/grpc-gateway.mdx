@@ -1,0 +1,208 @@
+---
+title: grpc-gateway
+description: "gateway/cmd/main.go: runtime.NewServeMux, การลงทะเบียน gateway handler ที่ generate มาให้ของ Catalog กับ Order service จาก gRPC endpoint ของแต่ละตัว และ http.Server ที่มี timeout กับ graceful shutdown — REST/JSON front door ที่ generate มาจาก google.api.http annotation"
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+`gateway/cmd/main.go` — binary ตัวที่สี่ ควบคู่ไปกับ `services/catalog/cmd` และ `services/order/cmd` แต่เป็น process คนละแบบเลย: มันไม่ใช่ gRPC server เลยด้วยซ้ำ มันสร้าง `runtime.ServeMux` จาก grpc-gateway ลงทะเบียน gateway handler ที่ generate มาให้ของ Catalog กับ Order service กับ gRPC endpoint ของแต่ละตัว ห่อด้วย `http.Server` ธรรมดาที่มี timeout ที่สมเหตุสมผล แล้ว serve HTTP/JSON บน `GATEWAY_HTTP_ADDR` — พร้อม graceful shutdown เมื่อได้รับ `SIGINT`/`SIGTERM` รูปแบบเดียวกับที่ `cmd/main.go` ทุกตัวในคอร์สนี้ใช้มาตั้งแต่ [The gRPC Server →](/shopmicro/th/catalog-service/grpc-server/)
+
+## Why
+
+grpc-gateway คือ **reverse proxy ที่ generate มาจาก annotation ใน `.proto`** — ไม่ใช่ REST framework ทั่วไปที่คุณเขียน handler เอง [Code Generation →](/shopmicro/th/proto-grpc/codegen/) สร้าง `catalog.pb.gw.go` กับ `order.pb.gw.go` ไปแล้ว แต่ละไฟล์ export ฟังก์ชัน `Register*ServiceHandlerFromEndpoint` ที่สร้างขึ้นทั้งหมดจาก option `google.api.http` ที่ [The Contracts →](/shopmicro/th/proto-grpc/contracts/) เขียนไว้บนทุก RPC ฟังก์ชันนั้นทำหน้าที่เดียว: รับ HTTP request แล้ว decode เป็น gRPC request message ที่ตรงกันโดยใช้ path template และ body mapping ที่ annotation กำหนดไว้ เรียก gRPC service จริงผ่าน network แบบเดียวกับที่ Order service เรียก Catalog อยู่แล้ว แล้ว encode response กลับเป็น JSON ไม่มีส่วนไหนของ REST surface ที่เขียนมือเลยตรงนี้ — มันเป็นผลที่ตกออกมาจากการตัดสินใจที่ Module 2 ทำไปแล้วโดยตรง ซึ่งเป็นแก่นทั้งหมดของ schema-first contract: ไฟล์ `.proto` ไฟล์เดียวขับเคลื่อนทั้ง Go type, gRPC stub, *และ* REST API โดยไม่มี artifact ที่สี่ให้ต้องคอย sync มือ
+
+ผลลัพธ์คือจุดเข้า API เดียว: client ที่ไม่อยากพูด gRPC — browser, mobile app, `curl` — ได้ HTTP/JSON ธรรมดาบน host และ port เดียว ในขณะที่ Catalog กับ Order ยังคุยกันด้วย gRPC เหมือนเดิม ทั้งกับกันเองและกับ gateway ที่อยู่ข้างล่าง โดยไม่ต้องรู้เลยว่า REST มีอยู่จริง
+
+## Pros & cons
+
+**grpc-gateway (reverse proxy ที่ generate มาจาก annotation ใน `.proto`) — สิ่งที่คอร์สนี้ใช้**
+
+- **Pros:** ไม่มี REST handler ที่เขียนมือเลย — mapping ทั้งหมดมีอยู่แล้วในรูปข้อมูลใน `catalog.proto`/`order.proto`; REST กับ gRPC ไม่มีทางเพี้ยนออกจากกันได้เลย เพราะทั้งคู่ generate มาจาก annotation ชุดเดียวกัน; consumer อื่นที่*อยาก*ใช้ gRPC ตรง ๆ (เซอร์วิสในอนาคต, internal tool) ก็ยังเรียก Catalog หรือ Order ได้โดยไม่ต้องผ่าน gateway เลย
+- **Cons:** รูปแบบ REST ถูกจำกัดอยู่แค่สิ่งที่ `google.api.http` แสดงออกมาได้อย่างสะอาด — idiom อย่าง partial `PATCH` semantics หรือ bulk endpoint ที่ไม่ map กับ RPC เดียวนั้นทำได้ยากมาก; ทุก REST request ตอนนี้มี hop เพิ่มขึ้น (HTTP → gateway process → gRPC → service) แทนที่จะชน handler ตรง ๆ เพิ่ม latency และอีกหนึ่ง process ที่ต้อง deploy และ monitor; การปรับแต่ง error body หรือพฤติกรรมเฉพาะของ REST หมายถึงต้องเรียนรู้ extension point ของ grpc-gateway เอง ([REST Mapping →](/shopmicro/th/gateway/rest-mapping/)) ไม่ใช่แค่เขียนโค้ด Go handler ธรรมดา
+
+**REST layer ที่เขียนมือ เรียกเข้า gRPC client (หรือเข้า business logic ตรง ๆ)**
+
+- **Pros:** อิสระเต็มที่เหนือรูปแบบ REST และ versioning ของมันเอง แยกขาดจาก gRPC contract โดยสิ้นเชิง; เพิ่มฟีเจอร์เฉพาะของ REST ได้ตามใจ — cursor pagination, bulk endpoint, รูปแบบ response ที่ตัดเย็บให้ frontend ตัวใดตัวหนึ่ง — ที่ไม่จำเป็นต้องตรงกับ RPC เดียวเลย
+- **Cons:** อีกหนึ่ง surface ที่ต้องคอย sync มือกับ gRPC contract — ปัญหา implicit-contract แบบเดียวกับที่ [The Contracts →](/shopmicro/th/proto-grpc/contracts/) ปฏิเสธไปแล้วสำหรับ gRPC layer เอง เพียงแต่โผล่กลับมาอีกชั้นหนึ่ง; เพิ่มโค้ด (และ test) เป็นสองเท่าเพื่อ expose functionality เดิมออกมาสองครั้ง
+
+**GraphQL BFF (Backend-For-Frontend) วางไว้หน้าทั้งสองเซอร์วิส**
+
+- **Pros:** ทีม frontend สร้าง query เดียวข้ามข้อมูล Catalog *และ* Order ได้ใน round trip เดียว แทนที่จะเรียก REST หนึ่งครั้งต่อหนึ่ง resource; ความยืดหยุ่นที่ client เป็นคนกำหนดสูงมาก โดยไม่ต้องจัดการ REST versioning เลย
+- **Cons:** เทคโนโลยีสแต็กใหม่ทั้งชุด — schema language, resolver layer, query executor — ที่ต้องสร้าง เรียนรู้ และดูแล หนักกว่า reverse proxy ที่ generate มาให้มาก; ปัญหา N+1 query กับ caching กลายเป็นปัญหาของ GraphQL layer เองไปเลย ซ้อนทับกับทุกอย่างที่ Catalog กับ Order ทำอยู่แล้ว; สำหรับคอร์สที่สอนเรื่องขอบเขตของ microservice การเอา GraphQL มาใช้ตรงนี้คือ scope creep ที่ไม่เกี่ยวกับบทเรียนตรงหน้าเลย
+
+คอร์สนี้เลือกทางแรก: annotation ใน `.proto` มีอยู่แล้ว `buf generate` สร้างโค้ด gateway ให้แล้ว และการตั้งมันขึ้นมาก็แค่ `main.go` ไม่กี่สิบบรรทัด — REST front door ที่ถูกที่สุดเท่าที่จะเป็นไปได้สำหรับสองเซอร์วิสที่ contract จริงคือ gRPC อยู่แล้ว
+
+## Set it up
+
+### 1. `gateway/cmd/main.go`
+
+```go
+// Command gateway runs the HTTP/JSON reverse proxy in front of the Catalog
+// and Order gRPC services, generated from their google.api.http
+// annotations.
+package main
+
+import (
+	"context"
+	"errors"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	catalogv1 "github.com/avetavos/shopmicro/gen/shopmicro/catalog/v1"
+	orderv1 "github.com/avetavos/shopmicro/gen/shopmicro/order/v1"
+	"github.com/avetavos/shopmicro/pkg/config"
+	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+)
+
+func main() {
+	ctx := context.Background()
+
+	httpAddr := config.Get("GATEWAY_HTTP_ADDR", ":8080")
+	catalogAddr := config.Get("CATALOG_GRPC_ADDR", ":50051")
+	orderAddr := config.Get("ORDER_GRPC_ADDR", ":50052")
+
+	mux := runtime.NewServeMux()
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+
+	if err := catalogv1.RegisterCatalogServiceHandlerFromEndpoint(ctx, mux, catalogAddr, opts); err != nil {
+		log.Fatalf("gateway: register catalog handler: %v", err)
+	}
+	if err := orderv1.RegisterOrderServiceHandlerFromEndpoint(ctx, mux, orderAddr, opts); err != nil {
+		log.Fatalf("gateway: register order handler: %v", err)
+	}
+
+	root := http.NewServeMux()
+	root.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	root.Handle("/", mux)
+
+	srv := &http.Server{
+		Addr:         httpAddr,
+		Handler:      root,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	go func() {
+		log.Printf("gateway: HTTP listening on %s", httpAddr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("gateway: serve: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Println("gateway: shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Fatalf("gateway: shutdown: %v", err)
+	}
+}
+```
+
+บันทึกไฟล์นี้เป็น `gateway/cmd/main.go` มีรายละเอียดสองสามอย่างที่ควรพูดถึง:
+
+- **`runtime.NewServeMux()` แบบไม่มี option** สร้าง `*runtime.ServeMux` ที่ใช้ marshaler default ของ grpc-gateway คือ `runtime.JSONPb` — JSON เข้าออกที่เข้ากันได้กับ protojson [REST Mapping →](/shopmicro/th/gateway/rest-mapping/) จะอธิบายเป๊ะ ๆ ว่า default นี้ให้อะไรออกมา (ชื่อ field แบบ camelCase, `int64` เป็น JSON string) และ extension point (`runtime.WithErrorHandler`, `runtime.WithIncomingHeaderMatcher`) ที่มีให้ใช้ถ้าวันหนึ่ง default ต้อง override
+- **`Register*ServiceHandlerFromEndpoint(ctx, mux, endpoint, opts)` dial connection ของตัวเอง** แต่ละ call — ตัวหนึ่งสำหรับ `catalogAddr` ตัวหนึ่งสำหรับ `orderAddr` — เปิด `grpc.ClientConn` อิสระไปยังเซอร์วิสนั้นโดยใช้ `grpc.DialOption` slice ที่ส่งเข้าไป รูปแบบเดียวกับ `grpc.WithTransportCredentials(insecure.NewCredentials())` ที่ [The gRPC Server →](/shopmicro/th/order-service/grpc-server/) ใช้ไปแล้วสำหรับ client connection ของ Order เองไปยัง Catalog สุดท้าย gateway ก็กลายเป็น gRPC client ของทั้งสองเซอร์วิส เหมือนกับที่ Order เป็น gRPC client ของ Catalog ไม่มีอะไรใหม่ในเชิงสถาปัตยกรรมเลย แค่ผู้เรียกคนที่สาม
+- **`http.NewServeMux()` ธรรมดา (`root`) ห่อ `mux` ของ grpc-gateway ไว้ ไม่ใช่กลับกัน** นี่คือสิ่งที่ทำให้ `/healthz` เป็นไปได้: request ไปที่ `/healthz` ไม่มีทางไปถึง grpc-gateway เลย เพราะ `http.ServeMux` จับ pattern `/healthz` ที่เฉพาะเจาะจงกว่าก่อนที่จะตกไปหา catch-all `/` ที่ลงทะเบียนไว้กับ mux ของ grpc-gateway [OpenAPI Documentation →](/shopmicro/th/gateway/openapi/) จะเพิ่ม route เข้าไปใน `root` mux ตัวเดียวกันนี้อีก เพื่อ serve เอกสาร OpenAPI ที่ generate มาให้ กับ Swagger UI
+- **`http.Server` ที่มี `ReadTimeout`/`WriteTimeout`/`IdleTimeout` ชัดเจน** ไม่ใช่ `http.ListenAndServe(addr, mux)` ตรง ๆ `http.Server` ค่า zero-value ที่ shortcut พวกนี้สร้างขึ้นภายในไม่มี timeout เลยสักตัว — client ที่ช้าหรือประสงค์ร้ายสามารถถือ connection ค้างไว้ได้ไม่มีที่สิ้นสุด timeout ที่ชัดเจนตรงนี้คือวินัยแบบเดียวกับที่คอร์สนี้ใช้กับ database connection กับ gRPC dial อยู่แล้ว: ไม่มีทาง resource ไหนที่ไม่มีขอบเขตว่าจะถูกถือครองได้นานแค่ไหน
+- **Graceful shutdown เรียก `srv.Shutdown(shutdownCtx)` ไม่ใช่ `grpcServer.GracefulStop()`** `net/http` กับ `google.golang.org/grpc` มี API สำหรับ graceful shutdown ที่ต่างกันสำหรับ idea เดียวกัน — `Shutdown` หยุดรับ connection ใหม่แล้วรอ (จนถึง deadline ของ context) ให้ request ที่กำลังทำอยู่เสร็จก่อน สะท้อนสิ่งที่ `GracefulStop` ทำอยู่แล้วสำหรับ gRPC server ใน `services/catalog/cmd` กับ `services/order/cmd`
+- **`errors.Is(err, http.ErrServerClosed)`** ไม่ใช่การเทียบ `==` ตรง ๆ `ListenAndServe` คืนค่า error ที่ไม่ใช่ nil เสมอ และ `http.ErrServerClosed` คือ error ที่คาดไว้เมื่อ `Shutdown` ถูกเรียกไปแล้ว การเช็คด้วย `errors.Is` คือวินัย sentinel-error แบบเดียวกับที่คอร์สนี้ใช้กับ `pgx.ErrNoRows` อยู่แล้ว
+
+### 2. ตัวแปร environment ที่บทนี้แนะนำ
+
+| ตัวแปร | ค่า default | ใช้โดย |
+| --- | --- | --- |
+| `GATEWAY_HTTP_ADDR` | `:8080` | `http.Server` สำหรับ HTTP listener ของ gateway เอง |
+| `CATALOG_GRPC_ADDR` | `:50051` | dial target ของ `RegisterCatalogServiceHandlerFromEndpoint` |
+| `ORDER_GRPC_ADDR` | `:50052` | dial target ของ `RegisterOrderServiceHandlerFromEndpoint` |
+
+`CATALOG_GRPC_ADDR` กับ `ORDER_GRPC_ADDR` คือตัวแปรสองตัวเดียวกับที่ [The gRPC Server →](/shopmicro/th/order-service/grpc-server/) แนะนำไปแล้วสำหรับ Catalog client ของ Order เอง — gateway บังเอิญต้องใช้ทั้งคู่ เพราะมันอยู่หน้าทั้งสองเซอร์วิส
+
+## Verify
+
+รันทั้งสาม process แยก terminal:
+
+```bash
+go run ./services/catalog/cmd
+go run ./services/order/cmd
+go run ./gateway/cmd
+```
+
+ผลลัพธ์ที่คาดไว้จาก terminal ที่สาม:
+
+```txt
+gateway: HTTP listening on :8080
+```
+
+จาก terminal ที่สี่ ยิงเข้า REST surface ตรง ๆ — ไม่ต้องใช้ `grpcurl` ไม่ต้องรู้จัก `.proto` เลย:
+
+```bash
+curl -s localhost:8080/v1/products
+```
+
+```json
+{}
+```
+
+`{}` ว่าง ๆ นี่ถูกต้องแล้ว ไม่ใช่บั๊ก: marshaling default ของ `runtime.JSONPb` — เหมือนกับ `protojson` เอง — ละ field ที่ยังเป็นค่า zero value อยู่ทิ้งไป และ `ListProductsResponse` ที่ว่างเปล่ามี `products` เป็น repeated field ที่เป็น zero value กับ `total` เป็น `0` ทั้งสองเลยไม่ถูกเขียนออกมาเลย [REST Mapping →](/shopmicro/th/gateway/rest-mapping/) จะพูดถึง default นี้ให้ลึกกว่านี้
+
+สร้าง product ผ่าน gateway แล้วยืนยันว่ามัน round-trip กลับมาเป็น JSON จริง:
+
+```bash
+curl -s -X POST localhost:8080/v1/products \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Coffee Mug","description":"350ml ceramic mug","price_cents":1299,"stock":50}'
+```
+
+```json
+{
+  "id": "8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21",
+  "name": "Coffee Mug",
+  "description": "350ml ceramic mug",
+  "priceCents": "1299",
+  "stock": 50
+}
+```
+
+request นี้เดินทาง `curl` → `http.Server` ของ gateway → handler ที่ generate มาให้ของ grpc-gateway → gRPC call จริงไปยัง Catalog service → PostgreSQL แล้วกลับมา — โดยไม่มีอะไรระหว่างทางเขียนมือเลย ยืนยันว่า `/healthz` ถูกตอบโดย `root` mux ตรง ๆ ไม่ได้ proxy ไปเป็น gRPC call เลย:
+
+```bash
+curl -s localhost:8080/healthz
+```
+
+```txt
+ok
+```
+
+หยุดทั้งสาม process ด้วย `Ctrl-C` และยืนยันว่า gateway log บรรทัด shutdown ก่อนที่จะจบการทำงาน:
+
+```txt
+gateway: shutting down
+```
+
+สุดท้าย ยืนยันว่าทั้ง module ยัง build ผ่านสะอาด:
+
+```bash
+go build ./...
+```
+
+ไม่มี output แปลว่าสำเร็จ
+
+## Recap
+
+`gateway/cmd/main.go` สร้าง `runtime.ServeMux` ด้วย JSON marshaling default ของ grpc-gateway ลงทะเบียน `catalogv1.RegisterCatalogServiceHandlerFromEndpoint` กับ `orderv1.RegisterOrderServiceHandlerFromEndpoint` กับ `CATALOG_GRPC_ADDR`/`ORDER_GRPC_ADDR` ด้วย `grpc.DialOption` แบบ insecure สำหรับ local dev เดียวกับที่ Order ใช้เรียก Catalog อยู่แล้ว และห่อ mux นั้นไว้ใน `http.NewServeMux()` ธรรมดาควบคู่กับ route `/healthz` — ทั้งหมด serve โดย `http.Server` ที่มี timeout ชัดเจน และ shutdown อย่าง graceful ผ่าน `srv.Shutdown` เมื่อได้รับ `SIGINT`/`SIGTERM` ไม่มีส่วนไหนของ REST surface เองที่เขียนมือเลย มันเป็นผลเชิงกลไกจาก annotation `google.api.http` ที่ [The Contracts →](/shopmicro/th/proto-grpc/contracts/) เขียนไว้ และ [Code Generation →](/shopmicro/th/proto-grpc/codegen/) compile ไปแล้ว เลือกใช้แทน REST layer ที่เขียนมือหรือ GraphQL BFF เพราะไม่ต้องเขียนโค้ด server ใหม่เลยสำหรับสองเซอร์วิสที่ contract จริงคือ gRPC อยู่แล้ว `curl localhost:8080/v1/products` กับการ `POST` สร้าง product ทั้งคู่ยืนยันว่าทั้งเส้นทาง — HTTP เข้า gRPC อยู่ข้างใน JSON ออกมา — ทำงานได้ end-to-end บทถัดไป [REST Mapping →](/shopmicro/th/gateway/rest-mapping/) จะดูให้ละเอียดว่า annotation `google.api.http` ตัดสินใจอย่างไรว่า JSON นั้นหน้าตาเป็นแบบไหน และ gRPC error กลายเป็น HTTP status code อะไร

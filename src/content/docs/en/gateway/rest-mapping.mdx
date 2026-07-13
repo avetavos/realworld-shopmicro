@@ -1,0 +1,209 @@
+---
+title: REST Mapping
+description: "How google.api.http annotations become REST: path params, body: \"*\", query params, protojson field naming (camelCase, int64-as-string), the default gRPC-to-HTTP status mapping, and the WithErrorHandler/WithIncomingHeaderMatcher extension points — verified with a full create-product → create-order → get-order curl flow over REST."
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+No new file this lesson — `gateway/cmd/main.go` from [grpc-gateway →](/shopmicro/en/gateway/grpc-gateway/) is unchanged. This lesson is about understanding exactly what that file is already doing on every request: how each `google.api.http` option from [The Contracts →](/shopmicro/en/proto-grpc/contracts/) decides a request's path, body, and query parameters; what the JSON on the wire actually looks like; and what HTTP status code a gRPC error becomes, by default, with no code written anywhere to make that happen.
+
+## Why
+
+A reverse proxy generated from annotations is only trustworthy if you know precisely what it does with an incoming request — otherwise every REST endpoint is a black box that happens to work today. Every rule in this lesson is either read directly off the two `.proto` files or is grpc-gateway's own well-defined, unconfigurable-by-default behavior — nothing here is a guess about how the gateway "probably" behaves.
+
+## Pros & cons
+
+**Relying on grpc-gateway's default status mapping and default error body (what this course does)**
+
+- **Pros:** zero extra code — every `codes.NotFound`/`codes.InvalidArgument`/`codes.FailedPrecondition` the Catalog and Order services already return (from [The Product API →](/shopmicro/en/catalog-service/product-api/) and [The Order Repository →](/shopmicro/en/order-service/order-repo/)) is translated to an HTTP status automatically; the mapping is documented, stable, and identical for every grpc-gateway-fronted service anywhere, so any client that has worked with one grpc-gateway API already knows what to expect from this one.
+- **Cons:** the default error body is a generic `{"code":..., "message":..., "details":[]}` envelope — there's no way to add project-specific fields (a stable machine-readable `error_code` string, a localized message) without overriding it; every gRPC status code funnels through the same fixed mapping table, so a service can't express "this specific `NotFound` should actually be a `410 Gone`" without reaching for the extension point below.
+
+**A custom `runtime.WithErrorHandler`**
+
+- **Pros:** full control over the JSON error body's shape — add fields, translate messages, log every gateway-level failure in one place regardless of which RPC produced it.
+- **Cons:** one more function every single REST error response now funnels through — a bug here breaks error reporting for the *entire* gateway, not just one endpoint; it has to be kept in sync by hand with whatever default behavior it's overriding, since grpc-gateway's own default can change between versions.
+
+This course keeps the default for both lessons already shipped (`grpc-gateway.mdx`'s `main.go` calls `runtime.NewServeMux()` with no options at all) — the mapping below is accurate, stable, and costs nothing. `runtime.WithErrorHandler` is documented here as the extension point that exists, not as something this course's `main.go` currently uses.
+
+## Set it up
+
+### 1. Path parameters — `{id}`
+
+```proto
+rpc GetProduct(GetProductRequest) returns (Product) {
+  option (google.api.http) = { get: "/v1/products/{id}" };
+}
+```
+
+A path template segment written as `` `{id}` `` binds that URL segment directly to the field named `id` on `GetProductRequest`, by name — `GET /v1/products/8f14e45f-...` arrives at the handler as `&GetProductRequest{Id: "8f14e45f-..."}`, with no manual URL parsing anywhere. The same rule is what makes `GET /v1/orders/{id}` bind to `GetOrderRequest.id`.
+
+### 2. Request body — `body: "*"`
+
+```proto
+rpc CreateProduct(CreateProductRequest) returns (Product) {
+  option (google.api.http) = { post: "/v1/products" body: "*" };
+}
+```
+
+`body: "*"` means the *entire* incoming JSON request body is unmarshaled onto every field of `CreateProductRequest` — a `POST` body of `{"name":"Coffee Mug","price_cents":1299}` becomes `&CreateProductRequest{Name: "Coffee Mug", PriceCents: 1299}`. `CreateOrder`'s `post: "/v1/orders" body: "*"` works identically against `CreateOrderRequest`. A `get` mapping never has a `body` field at all — `GET` requests carry no body, so their only inputs are the path template and query parameters.
+
+### 3. Query parameters — everything left over
+
+```proto
+rpc ListProducts(ListProductsRequest) returns (ListProductsResponse) {
+  option (google.api.http) = { get: "/v1/products" };
+}
+rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse) {
+  option (google.api.http) = { get: "/v1/orders" };
+}
+```
+
+Any request-message field that isn't consumed by the path template or the body is automatically read from the query string instead — no separate declaration needed. `ListProductsRequest`'s `page`/`page_size` fields have no path segment to bind to, so `GET /v1/products?page=2&page_size=10` fills them straight from the query string. `ListOrdersRequest.customer_id` works the same way: `GET /v1/orders?customer_id=cust-1` is exactly how a client filters orders by customer over REST, with zero gateway-specific query-parsing code written anywhere — it's the same field-by-name binding as a path parameter, just sourced from `?key=value` instead of a URL segment.
+
+### 4. protojson field naming — camelCase, and `int64` as a JSON string
+
+Every JSON field name on the wire is the **lowerCamelCase** form of the `.proto` field's snake_case name: `price_cents` becomes `priceCents`, `unit_price_cents` becomes `unitPriceCents`, `customer_id` becomes `customerId`. This is `protojson`'s standard mapping, not something grpc-gateway invented — [The Product API →](/shopmicro/en/catalog-service/product-api/) already showed the same rule from the `grpcurl` side.
+
+`int64` fields serialize as a JSON **string**, not a JSON number — `"priceCents": "1299"`, not `"priceCents": 1299` — because a JSON number can't safely represent every possible 64-bit integer value without precision loss in a JavaScript client. `int32` fields (`stock`, `quantity`) stay plain JSON numbers, since a 32-bit value always fits safely. Get this wrong when hand-writing a request body and the gateway will reject it as a decode error before the request ever reaches a gRPC service at all.
+
+One more default worth naming explicitly, already seen in the previous lesson's `curl localhost:8080/v1/products` returning `{}`: protojson (and so `runtime.JSONPb`) omits any field still at its **zero value** — an empty string, `0`, an empty repeated field — unless the marshaler is explicitly configured with `EmitUnpopulated`. This course's `main.go` never does that, so an all-defaults response can genuinely come back as `{}`, and a `ListProductsResponse` with zero rows omits both `products` and `total` rather than sending `{"products":[],"total":0}`.
+
+### 5. The default gRPC-code → HTTP-status mapping
+
+grpc-gateway's `runtime.ServeMux` translates every `status.Error(code, msg)` a service returns into an HTTP status using a fixed, documented table — the subset this course's services actually return:
+
+| gRPC code | HTTP status | Returned by |
+| --- | --- | --- |
+| `OK` | 200 | every successful call |
+| `InvalidArgument` | 400 | missing/malformed input — `GetProduct`'s empty `id`, `CreateProduct`'s missing `name` |
+| `FailedPrecondition` | 400 | `CreateOrder` pricing a `product_id` Catalog reports doesn't exist |
+| `NotFound` | 404 | `GetProduct`/`GetOrder` for an id that doesn't exist |
+| `AlreadyExists` | 409 | (not used by this course's services today, shown for completeness) |
+| `Unauthenticated` | 401 | (not used yet — [Resilience →](/shopmicro/en/resilience/) is where auth lands) |
+| `Unimplemented` | 501 | any RPC not yet implemented — matches every placeholder server's response before its real `Server` existed |
+| `Internal` | 500 | any repository/database failure that isn't a `NotFound` |
+| `Unavailable` | 503 | the backend gRPC service is unreachable entirely |
+
+This table is exactly why `codes.FailedPrecondition` was the deliberate choice in [The Order Repository →](/shopmicro/en/order-service/order-repo/) for "Catalog says this product doesn't exist" rather than `codes.InvalidArgument` — both map to `400` here, so a REST client can't actually tell them apart by status code alone, only by the `message` in the error body. That's a real, honest limitation of leaning on the default mapping instead of a custom error handler.
+
+### 6. The extension points, for reference — `runtime.WithErrorHandler` and `runtime.WithIncomingHeaderMatcher`
+
+Not applied in this course's `main.go`, but worth knowing exist:
+
+```go
+mux := runtime.NewServeMux(
+	runtime.WithErrorHandler(func(ctx context.Context, mux *runtime.ServeMux, marshaler runtime.Marshaler, w http.ResponseWriter, r *http.Request, err error) {
+		// Full control over the JSON error body and status code here —
+		// this course relies on runtime.DefaultHTTPErrorHandler instead,
+		// which is what mux uses automatically when this option is omitted.
+	}),
+	runtime.WithIncomingHeaderMatcher(func(header string) (string, bool) {
+		// Controls which incoming HTTP headers are forwarded into the
+		// gRPC call's metadata — the default matcher forwards a small
+		// standard set (like grpc-metadata- prefixed headers) and drops
+		// the rest.
+		return header, true
+	}),
+)
+```
+
+`WithErrorHandler` replaces the entire error-to-JSON translation shown in the table above; `WithIncomingHeaderMatcher` decides which HTTP request headers (an `Authorization` header, a tracing header) get forwarded into the gRPC call as metadata versus silently dropped at the gateway. Both are genuine extension points a production gateway would likely reach for — attaching a request ID or an auth token to every downstream gRPC call needs exactly this — but neither is needed for this course's REST surface today, so `main.go` stays with the plain `runtime.NewServeMux()` from the previous lesson.
+
+## Verify
+
+With Catalog, Order, and the gateway all still running from [grpc-gateway →](/shopmicro/en/gateway/grpc-gateway/), run the full create-product → create-order → get-order flow purely over REST:
+
+```bash
+curl -s -X POST localhost:8080/v1/products \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Coffee Mug","description":"350ml ceramic mug","price_cents":1299,"stock":50}'
+```
+
+```json
+{
+  "id": "8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21",
+  "name": "Coffee Mug",
+  "description": "350ml ceramic mug",
+  "priceCents": "1299",
+  "stock": 50
+}
+```
+
+Copy the `id` and place an order for two of them:
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
+```
+
+```json
+{
+  "id": "3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90",
+  "customerId": "cust-1",
+  "status": "ORDER_STATUS_PENDING",
+  "totalCents": "2598",
+  "items": [
+    {
+      "productId": "8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21",
+      "quantity": 2,
+      "unitPriceCents": "1299"
+    }
+  ],
+  "createdAt": "2026-07-14T09:12:03Z"
+}
+```
+
+`totalCents` is `1299 × 2 = 2598` — this HTTP request never sent a price at all, it was looked up live from Catalog by the Order service exactly as [The Order Repository →](/shopmicro/en/order-service/order-repo/) built it; the gateway only translated the transport. Fetch that order back by id, using the path-parameter binding from step 1 of this lesson:
+
+```bash
+curl -s localhost:8080/v1/orders/3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90
+```
+
+List every order for that customer, using the query-parameter binding from step 3:
+
+```bash
+curl -s "localhost:8080/v1/orders?customer_id=cust-1"
+```
+
+Confirm the status mapping table with a real request — `codes.NotFound` becomes `404`:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' localhost:8080/v1/products/00000000-0000-0000-0000-000000000000
+```
+
+```txt
+404
+```
+
+And `codes.InvalidArgument` becomes `400`, with the default error envelope:
+
+```bash
+curl -s -X POST localhost:8080/v1/products \
+  -H 'Content-Type: application/json' \
+  -d '{"description":"no name given"}'
+```
+
+```json
+{
+  "code": 3,
+  "message": "name is required",
+  "details": []
+}
+```
+
+`"code": 3` is the numeric value of `codes.InvalidArgument` in the gRPC status-code enum — the same code table [The Product API →](/shopmicro/en/catalog-service/product-api/) already used, just surfaced here as JSON instead of `grpcurl`'s `Code: InvalidArgument` text.
+
+Finally, confirm the whole module still builds:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+## Recap
+
+Nothing in `gateway/cmd/main.go` changed this lesson — every rule here was already running, sight unseen, since [grpc-gateway →](/shopmicro/en/gateway/grpc-gateway/): a `` `{id}` `` path segment binds to the request field of the same name; `body: "*"` unmarshals the whole JSON body onto the request message; any leftover field (`page`/`page_size`, `customer_id`) is read from the query string automatically; every field name on the wire is lowerCamelCase with `int64` serialized as a JSON string and zero-valued fields omitted entirely; and every `status.Error(code, ...)` a service returns becomes an HTTP status through a fixed, documented table — `InvalidArgument`/`FailedPrecondition` → 400, `NotFound` → 404, `Internal` → 500 — with `runtime.WithErrorHandler`/`runtime.WithIncomingHeaderMatcher` available as real extension points this course simply doesn't need yet. A full REST flow — create a product, place an order priced live from that product, fetch the order back, list it by customer, and see both a 404 and a 400 fire correctly — confirmed all of it end-to-end, with zero gateway-specific code written anywhere. Next, [OpenAPI Documentation →](/shopmicro/en/gateway/openapi/) serves the `*.swagger.json` documents [Code Generation →](/shopmicro/en/proto-grpc/codegen/) already produced from these same annotations, plus a Swagger UI, as this REST surface's living documentation.

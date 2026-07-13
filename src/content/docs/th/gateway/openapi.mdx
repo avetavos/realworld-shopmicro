@@ -1,0 +1,197 @@
+---
+title: OpenAPI Documentation
+description: "Serve เอกสาร OpenAPI v2 catalog.swagger.json/order.swagger.json ที่ generate มาให้ กับ Swagger UI ที่ฝังจาก CDN ที่ /docs ต่อยอดจาก gateway/cmd/main.go — พร้อม pros/cons ตรงไปตรงมาของเอกสาร API ที่ generate จาก proto เทียบกับเขียนมือ"
+sidebar:
+  order: 3
+---
+
+## What we're building
+
+การต่อยอด `gateway/cmd/main.go` จาก [grpc-gateway →](/shopmicro/th/gateway/grpc-gateway/): route ใหม่สองตัวที่ serve ไฟล์ `catalog.swagger.json` กับ `order.swagger.json` ที่ [Code Generation →](/shopmicro/th/proto-grpc/codegen/) สร้างไว้แล้ว และ route `/docs` ที่ serve หน้า Swagger UI — ดึงมาจาก CDN ไม่ใช่ Go dependency ตัวใหม่ — ที่ render เอกสารทั้งสองออกมาเป็นเอกสาร API แบบ interactive กดลองใช้ได้จริง
+
+## Why
+
+เอกสาร OpenAPI สำหรับ REST surface นี้มีอยู่แล้ว — plugin `grpc-ecosystem/openapiv2` ของ `buf generate` เขียน `catalog.swagger.json` กับ `order.swagger.json` ไปตั้งแต่ Module 2 รันมัน อธิบาย `/v1/products`, `/v1/orders`, path parameter, และรูปแบบ request/response เป๊ะเดียวกับที่ [REST Mapping →](/shopmicro/th/gateway/rest-mapping/) เพิ่งไล่ดูไป — เพราะมัน compile มาจาก annotation `google.api.http` ชุดเดียวกันกับที่สร้าง gateway เองขึ้นมา การ serve ไฟล์นั้นแล้ว render มันถูกกว่าการเขียนเอกสาร API ด้วยมืออย่างชัดเจน: ไม่มี artifact "เอกสาร" แยกต่างหากที่ต้องคอยจำไปอัปเดตทุกครั้งที่ `.proto` เปลี่ยน เพราะเอกสารเป็นผลลัพธ์ที่กำหนดแน่นอนจากไฟล์ต้นทางเดียวกับที่ artifact อื่น ๆ ในโมดูลนี้เป็นอยู่แล้ว
+
+## Pros & cons
+
+**เอกสาร OpenAPI ที่ generate จาก proto (สิ่งที่คอร์สนี้ทำ)**
+
+- **Pros:** ตรงกับ REST surface จริงเสมอโดยโครงสร้าง — `buf generate` step เดียวกับที่ regenerate `catalog.pb.gw.go` ก็ regenerate `catalog.swagger.json` ไปในรอบเดียวกันเลย ไม่มี step อัปเดตเอกสารแยกต่างหากให้ลืม; ไม่มีต้นทุนการเขียนเพิ่มเลยนอกจากไฟล์ `.proto` ที่ต้องเขียนอยู่แล้วเพื่อให้ gateway มีอยู่ได้ตั้งแต่แรก; แหล่งความจริงเดียวขับเคลื่อนทั้งโค้ด, การต่อสาย, *และ*เอกสารพร้อมกัน เรื่องเดียวกับที่ [Code Generation →](/shopmicro/th/proto-grpc/codegen/) เล่าไปแล้วสำหรับอีกสามไฟล์ที่ generate มา
+- **Cons:** plugin `grpc-ecosystem/openapiv2` เล็ง **OpenAPI v2** (Swagger 2.0) ไม่ใช่ v3 ที่ใหม่กว่า — tooling OpenAPI บางตัวที่สร้างมาเฉพาะสำหรับฟีเจอร์ v3 จะไม่รับเอกสารนี้ตรง ๆ โดยไม่มี step แปลงก่อน; คุณภาพเอกสารเป็นฟังก์ชันของ comment ในไฟล์ `.proto` เองล้วน ๆ และ [The Contracts →](/shopmicro/th/proto-grpc/contracts/) ไม่เคยเขียน comment ระดับ field หรือ RPC เลย — ดังนั้นทุก operation และ field ในเอกสารที่ generate ด้านล่างนี้จึงมี description ว่างเปล่าจริง ๆ ข้อจำกัดที่แท้จริงและตรงไปตรงมาที่ควรพูดถึงตรง ๆ ไม่ใช่กลบเกลื่อนไป; ไม่มีทางเพิ่ม example payload ที่คัดสรรมาหรือ note การใช้งานที่เขียนมือได้เลย นอกจากจะกลับไปเพิ่ม comment ใน `.proto` (ที่ `protoc-gen-openapiv2` อ่านได้จริง) หรือ post-process JSON ที่ generate มา ซึ่งจะทำลาย premise ทั้งหมดของ "auto-generated เสมอ sync"
+
+**เอกสาร OpenAPI ที่เขียนมือ (หรือ collection Postman/Insomnia แยกต่างหาก)**
+
+- **Pros:** อิสระที่จะเขียน description ที่ละเอียด, example ที่คัดสรรมา, และคำอธิบายแบบ prose ที่ code generator ไม่มีทาง infer จากไฟล์ `.proto` เพียวได้เลย; document พฤติกรรมที่ไม่ปรากฏใน schema เลยได้ (rate limit, auth flow, ประกาศ deprecation)
+- **Cons:** artifact ที่สองที่การเปลี่ยน `.proto` อาจทิ้งให้ล้าสมัยไปเงียบ ๆ ได้ — ไม่มีอะไรบังคับว่า field ที่เปลี่ยนชื่อหรือ endpoint ใหม่จะถูกสะท้อนในเอกสารที่เขียนมือ ปัญหา drift แบบเดียวกับที่ `.proto` contract แบบ schema-first มีไว้เพื่อป้องกันตั้งแต่แรก; เพิ่มภาระดูแลเป็นสองเท่าสำหรับข้อมูลชุดเดียวกัน ครั้งหนึ่งใน contract อีกครั้งหนึ่งใน prose
+
+คอร์สนี้เก็บเอกสารที่ generate มาไว้ตามเดิม — ความว่างเปล่าในบางจุดของมันถูกนำเสนออย่างตรงไปตรงมาด้านล่างนี้ แทนที่จะเลี่ยงเงียบ ๆ เพราะ trade-off นั้นคือต้นทุนจริงของ "เอกสารฟรี"
+
+## Set it up
+
+### 1. ยืนยันว่าเอกสารที่ generate มามีอยู่จริง
+
+```bash
+find gen -name '*.swagger.json'
+```
+
+```txt
+gen/shopmicro/catalog/v1/catalog.swagger.json
+gen/shopmicro/order/v1/order.swagger.json
+```
+
+ถ้า `buf generate` ยังไม่ถูกรันเมื่อเร็ว ๆ นี้ (หรือ `gen/` ถูกลบทิ้ง) ให้รันใหม่ — [Code Generation →](/shopmicro/th/proto-grpc/codegen/) อธิบายไว้แล้วเป๊ะ ๆ ว่ามันสร้างอะไรออกมา และไม่มีอะไรในบทนี้ที่แตะไฟล์ `.proto` หรือ plugin configuration เลย
+
+### 2. ต่อยอด `gateway/cmd/main.go` — serve เอกสารทั้งสองกับ Swagger UI
+
+```go
+// Command gateway runs the HTTP/JSON reverse proxy in front of the Catalog
+// and Order gRPC services, generated from their google.api.http
+// annotations, and serves the generated OpenAPI documents plus a Swagger UI
+// at /docs.
+package main
+
+import (
+	"context"
+	"errors"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	catalogv1 "github.com/avetavos/shopmicro/gen/shopmicro/catalog/v1"
+	orderv1 "github.com/avetavos/shopmicro/gen/shopmicro/order/v1"
+	"github.com/avetavos/shopmicro/pkg/config"
+	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+)
+
+const swaggerUIPage = `<!DOCTYPE html>
+<html>
+  <head>
+    <title>ShopMicro API Docs</title>
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+  </head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <script>
+      window.onload = () => {
+        SwaggerUIBundle({
+          urls: [
+            { url: "/openapi/catalog.swagger.json", name: "Catalog" },
+            { url: "/openapi/order.swagger.json", name: "Order" },
+          ],
+          dom_id: "#swagger-ui",
+        });
+      };
+    </script>
+  </body>
+</html>`
+
+func main() {
+	ctx := context.Background()
+
+	httpAddr := config.Get("GATEWAY_HTTP_ADDR", ":8080")
+	catalogAddr := config.Get("CATALOG_GRPC_ADDR", ":50051")
+	orderAddr := config.Get("ORDER_GRPC_ADDR", ":50052")
+
+	mux := runtime.NewServeMux()
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+
+	if err := catalogv1.RegisterCatalogServiceHandlerFromEndpoint(ctx, mux, catalogAddr, opts); err != nil {
+		log.Fatalf("gateway: register catalog handler: %v", err)
+	}
+	if err := orderv1.RegisterOrderServiceHandlerFromEndpoint(ctx, mux, orderAddr, opts); err != nil {
+		log.Fatalf("gateway: register order handler: %v", err)
+	}
+
+	root := http.NewServeMux()
+	root.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	root.HandleFunc("/openapi/catalog.swagger.json", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "gen/shopmicro/catalog/v1/catalog.swagger.json")
+	})
+	root.HandleFunc("/openapi/order.swagger.json", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "gen/shopmicro/order/v1/order.swagger.json")
+	})
+	root.HandleFunc("/docs", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(swaggerUIPage))
+	})
+	root.Handle("/", mux)
+
+	srv := &http.Server{
+		Addr:         httpAddr,
+		Handler:      root,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	go func() {
+		log.Printf("gateway: HTTP listening on %s", httpAddr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("gateway: serve: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Println("gateway: shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Fatalf("gateway: shutdown: %v", err)
+	}
+}
+```
+
+บันทึกไฟล์นี้ทับ `gateway/cmd/main.go` การเปลี่ยนแปลงเดียวจากเวอร์ชันของ [grpc-gateway →](/shopmicro/th/gateway/grpc-gateway/): route ใหม่สามตัวถูกลงทะเบียนบน `root` mux ตัวเดียวกัน ก่อน catch-all `root.Handle("/", mux)` ส่วนที่เหลือทั้งหมด — การ dial gRPC, timeout ของ `http.Server`, goroutine, การจัดการ signal — ไม่เปลี่ยนเลย มีรายละเอียดสองสามอย่างที่ควรพูดถึง:
+
+- **`http.ServeFile(w, r, path)` ไม่ใช่ `http.FileServer` ครอบทั้ง tree ของ `gen/`** การ serve เอกสารที่ generate มาแต่ละไฟล์ผ่าน handler เฉพาะของมันเอง หมายความว่ามีแค่สองไฟล์นี้เป๊ะ ๆ เท่านั้นที่ถูก expose ที่ `/openapi/...` — การ mount `FileServer` ครอบทั้ง `gen/` จะ serve ไฟล์พี่น้องอย่าง `.pb.go`/`.swagger.json` และโครงสร้าง directory ทั้งหมดของ generated tree ไปด้วย ซึ่งไม่ควรเข้าถึงได้ผ่าน HTTP เลย
+- **Swagger UI เป็น bundle ที่ host บน CDN ไม่ใช่ Go module dependency ตัวใหม่** `swaggerUIPage` เป็น HTML string ธรรมดาที่ serve ด้วย `Content-Type: text/html` — ไม่มี template engine, ไม่มี static asset ที่ embed, ไม่มี entry ใหม่ใน `go.mod` เลย option `urls` ของ `SwaggerUIBundle` (array ของ `{url, name}` ไม่ใช่ `url` เดี่ยว) คือสิ่งที่ render เอกสารทั้งสองไว้หลัง dropdown เดียวในหน้าเดียว เพราะคอร์สนี้อยู่หน้าเอกสาร OpenAPI ที่ generate แยกกันสองชุด ไม่ใช่ชุดเดียวที่ merge กันแล้ว
+- **`/docs` กับ `/openapi/*.swagger.json` ลงทะเบียนบน `root` ซึ่งเป็น `http.ServeMux` ธรรมดา เหมือนกับ `/healthz` เป๊ะ ๆ** ไม่มี route ไหนในสามตัวนี้เกี่ยวข้องกับ grpc-gateway เลยแม้แต่น้อย — มันเป็น HTTP response แบบ static ธรรมดา ๆ ที่บังเอิญอยู่ใน binary เดียวกับ reverse proxy ซึ่งเป็นเหตุผลเป๊ะ ๆ ว่าทำไม `root` ถึงห่อ `mux` แทนที่จะกลับกัน ความแตกต่างที่ [grpc-gateway →](/shopmicro/th/gateway/grpc-gateway/) ตั้งไว้แล้ว
+
+## Verify
+
+รันทั้งสามเซอร์วิส แล้วรัน gateway:
+
+```bash
+go run ./services/catalog/cmd
+go run ./services/order/cmd
+go run ./gateway/cmd
+```
+
+ดึงเอกสาร OpenAPI ดิบมา แล้วยืนยันว่ามันเป็นเอกสาร Swagger 2.0 จริง:
+
+```bash
+curl -s localhost:8080/openapi/catalog.swagger.json | head -c 200
+```
+
+```json
+{"swagger":"2.0","info":{"title":"catalog.proto","version":"version not set"},"tags":[{"name":"CatalogService"}],"consumes":["application/json"],"produces":["application/json"],"paths":{"/v1/products":{"get":{"operationId"
+```
+
+`"swagger": "2.0"` ยืนยันว่านี่คือ OpenAPI v2 เป๊ะเดียวกับที่การเลือก plugin ใน [Code Generation →](/shopmicro/th/proto-grpc/codegen/) สร้างออกมา — `"info":{"title":"catalog.proto", ...}` กับ description ของแต่ละ operation ที่ว่างเปล่าลึกลงไปในเอกสาร คือผลลัพธ์ที่มองเห็นได้ตรง ๆ จากการที่ `catalog.proto` ไม่เคยมี comment `.proto` เลยให้ดึงมาใช้
+
+เปิด `http://localhost:8080/docs` ในเบราว์เซอร์ หน้านี้จะโหลด Swagger UI จาก CDN แล้วแสดง dropdown ที่มี **Catalog** กับ **Order**; สลับไปที่ **Catalog** แล้วขยาย `GET /v1/products` จากนั้นกด **Try it out** → **Execute** จะส่ง request เดียวกันเป๊ะกับที่ `curl -s localhost:8080/v1/products` ทำใน [grpc-gateway →](/shopmicro/th/gateway/grpc-gateway/) — เพราะมันยิงเข้า gateway ตัวเดียวกัน ผ่าน REST surface เดียวกัน ที่ถูกอธิบายด้วยเอกสารที่ generate มาชุดเดียวกัน
+
+สุดท้าย ยืนยันว่าทั้ง module ยัง build ผ่านสะอาด:
+
+```bash
+go build ./...
+```
+
+ไม่มี output แปลว่าสำเร็จ
+
+## Recap
+
+`gateway/cmd/main.go` ตอนนี้ serve `catalog.swagger.json` กับ `order.swagger.json` — output ของ `grpc-ecosystem/openapiv2` จาก [Code Generation →](/shopmicro/th/proto-grpc/codegen/) ไม่เปลี่ยนแปลง — ที่ `/openapi/catalog.swagger.json` กับ `/openapi/order.swagger.json` ผ่าน handler `http.ServeFile` ธรรมดา และ Swagger UI ที่ฝังจาก CDN ที่ `/docs` ที่ render เอกสารทั้งสองไว้หลัง dropdown เดียวโดยใช้ array `urls` ของ `SwaggerUIBundle` ไม่มีส่วนไหนต้องใช้ Go dependency ตัวใหม่หรือความพยายามเขียนเอกสารใหม่เลย: เอกสาร OpenAPI ตรงกับปัจจุบันเป๊ะเดียวกับไฟล์ `.proto` ที่ขับเคลื่อน artifact อื่น ๆ ในโมดูลนี้ทุกตัว โดยแลกกับต้นทุนที่ตรงไปตรงมาคือ Swagger 2.0 (ไม่ใช่ v3) และ description ระดับ field ที่ว่างเปล่า เพราะ [The Contracts →](/shopmicro/th/proto-grpc/contracts/) ไม่เคยเขียน comment ใน proto ให้ `protoc-gen-openapiv2` ดึงไปใช้เลย นั่นปิด Module 5: gateway process เดียวตอนนี้อยู่หน้า Catalog กับ Order ด้วย REST/JSON API ที่ generate มาทั้งหมดจาก `.proto` contract ของมัน เอกสารตัวเองที่ `/docs` พร้อม REST mapping และพฤติกรรม status-code เป๊ะเดียวกับที่ [REST Mapping →](/shopmicro/th/gateway/rest-mapping/) ยืนยันแบบ end-to-end ไปแล้ว บทถัดไป [Kafka (Event Stream) →](/shopmicro/th/kafka/) — Module 6 — คือจุดที่แถว `outbox` ที่ [The Transactional Outbox →](/shopmicro/th/order-service/outbox/) เขียนไว้ตลอดมาในที่สุดก็ถูก publish ไปที่ไหนสักแห่งจริง ๆ
