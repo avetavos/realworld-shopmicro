@@ -1,0 +1,110 @@
+---
+title: The Transactional Outbox
+description: "ปัญหา dual-write — ทำไมคุณเขียนลง PostgreSQL แล้ว publish ไป Kafka พร้อมกันแบบอะตอมิกไม่ได้ — และวิธีที่ตาราง outbox ซึ่ง OrderRepo.Create เขียนไว้แล้วแก้ปัญหานี้: at-least-once delivery, idempotent consumer, ลำดับของ event, และ partial index บนแถวที่ยังไม่ publish"
+sidebar:
+  order: 3
+---
+
+## What we're building
+
+ไม่มีอะไรใหม่ `OrderRepo.Create` ของ [The Order Repository →](/shopmicro/th/order-service/order-repo/) เขียน `outbox` row ของทุกคำสั่งซื้อใหม่อยู่ใน transaction เดียวกับคำสั่งซื้อและรายการสินค้าของมันอยู่แล้ว — รายละเอียดจุดเดียวนั้นคือ transactional outbox pattern ทั้งหมด ถูก implement ไว้แล้ว บทนี้อธิบายว่า *ทำไม* มันถึงสำคัญ: ปัญหาที่มันแก้ การรับประกันที่มันให้และไม่ได้ให้ และ partial index ที่ทำให้ pattern นี้ใช้งานได้จริงเมื่อขยายสเกล [Kafka →](/shopmicro/th/kafka/) (Module 6) คือจุดที่ process แยกต่างหาก — relay — จะอ่านตารางนี้จริง ๆ แล้ว publish ไป Kafka ไม่มีอะไรตรงนี้ที่สร้างสิ่งนั้นขึ้นมา
+
+## Why
+
+นี่คือปัญหาในรูปแบบที่ตรงไปตรงมาที่สุด: `CreateOrder` ต้องทำสองอย่างเมื่อมีการสั่งซื้อ — บันทึกคำสั่งซื้อลง PostgreSQL และบอกส่วนที่เหลือของระบบว่ามันเกิดขึ้นแล้วโดย publish `order.created` ไป Kafka สองอย่างนี้เป็นระบบที่แยกจากกันโดยสิ้นเชิง และไม่มีทางห่อการเขียนลงระบบหนึ่งกับการเขียนลงอีกระบบหนึ่งไว้ในการดำเนินการแบบอะตอมิกเดียวได้ ไม่มี transaction ข้ามระบบระหว่าง PostgreSQL กับ Kafka นี่คือ **ปัญหา dual-write** และมันพังทั้งสองลำดับที่เป็นไปได้:
+
+- **บันทึกก่อน แล้วค่อย publish:** ถ้า process crash, เสีย network connection, หรือถูก Kubernetes kill ระหว่างการ commit ที่สำเร็จกับการเรียก publish ไป Kafka คำสั่งซื้อจะถูกบันทึกอย่างปลอดภัย แต่ event ไม่เคยถูกส่งเลย Payment ไม่มีวันรู้ว่าคำสั่งซื้อนี้มีอยู่ คำสั่งซื้อจะค้างที่ `PENDING` ตลอดไป — คำสั่งซื้อจริงที่มองไม่เห็นสำหรับส่วนที่เหลือของระบบอย่างเงียบ ๆ
+- **Publish ก่อน แล้วค่อยบันทึก:** ถ้า process crash หลังจาก Kafka ยืนยันการ publish แต่ก่อนที่ database transaction จะ commit consumer ตอนนี้เชื่อว่ามีคำสั่งซื้ออยู่ทั้งที่ไม่เคยถูกบันทึกจริง — event ผีที่ไม่ได้อธิบายอะไรเลย
+
+ไม่มีลำดับไหนปลอดภัยด้วยตัวมันเอง และไม่ว่าจะจัดการ error รอบคอบแค่ไหนก็แก้ปัญหานี้ไม่ได้ — ปัญหาพื้นฐานคือ "บันทึกแล้ว" กับ "publish แล้ว" เป็นข้อเท็จจริงเกี่ยวกับสองระบบที่แยกกัน ที่ไม่มีทางทำให้เปลี่ยนแปลงพร้อมกันแบบอะตอมิกได้ ไม่ว่าจะเขียนตามลำดับไหนก็ตาม
+
+Outbox pattern เลี่ยงปัญหานี้แทนที่จะแก้มันตรง ๆ: แทนที่จะพยายามทำให้การเขียนลง PostgreSQL กับการเขียนลง Kafka เป็นอะตอมิก ให้เขียน **เฉพาะลง PostgreSQL** — คำสั่งซื้อ รายการสินค้าของมัน และแถวใหม่ในตาราง `outbox` ที่อธิบาย event ที่ควรจะถูก publish ในที่สุด ทั้งสามอย่างเป็นแถวธรรมดาในฐานข้อมูลเดียว ดังนั้น `pgx.Tx` ธรรมดาจึงทำให้มันเป็นอะตอมิกได้เหมือนที่ [The Order Repository →](/shopmicro/th/order-service/order-repo/) ทำไปแล้ว ไม่มี dual-write อีกต่อไป เพราะมีระบบเดียวเท่านั้นที่เกี่ยวข้องกับ transaction process แยกต่างหาก — relay ที่จะสร้างใน [Kafka →](/shopmicro/th/kafka/) — จะ poll ตาราง `outbox` หาแถวที่ยังไม่ publish ส่งแต่ละแถวไป Kafka แล้ว mark ว่า publish แล้ว relay นั้น crash, retry, และตามหลังได้โดยไม่เอาข้อมูลคำสั่งซื้อไปเสี่ยงเลย เพราะการ publish ถูกแยกออกจากการเขียนดั้งเดิมอย่างสมบูรณ์แล้ว
+
+## Pros & cons
+
+**Transactional outbox (relay อ่านตาราง)** เทียบกับ **dual-write ตรง ๆ (insert คำสั่งซื้อ แล้ว publish ไป Kafka ทันทีใน request เดียวกัน)**
+
+- **Pros:** การสร้างคำสั่งซื้อกับ "event นี้จะถูก publish ในที่สุด" กลายเป็นอะตอมิก — เป็นไปไม่ได้ที่อย่างหนึ่งจะเกิดขึ้นโดยไม่มีอีกอย่าง; relay retry การ publish ได้ไม่จำกัดโดยไม่แตะข้อมูลคำสั่งซื้อเลย เพราะข้อมูลคำสั่งซื้อถูก commit อย่างปลอดภัยไปแล้วก่อนที่ relay จะมองแถวนั้นด้วยซ้ำ; `CreateOrder` ไม่มี runtime dependency ต่อการที่ Kafka ต้องเข้าถึงได้เลย — Kafka ล่มกลายเป็น backlog ของ outbox row ที่ยังไม่ publish ที่โตขึ้น ไม่ใช่การสร้างคำสั่งซื้อที่ล้มเหลว
+- **Cons:** การ publish ไม่ทันทีอีกต่อไป — มีความล่าช้าจริง แม้จะเล็กน้อยตามปกติ ระหว่าง "คำสั่งซื้อถูกสร้าง" กับ "event มองเห็นได้สำหรับ Kafka consumer" ขึ้นอยู่กับว่า relay poll บ่อยแค่ไหน; ต้องสร้าง component เพิ่มทั้งตัว (relay) แล้ว deploy และ monitor มัน ในขณะที่การ publish ตรง ๆ ต้องการแค่ Kafka client ที่อยู่ใน request path อยู่แล้ว; ตาราง `outbox` เองต้องมีเรื่องราวของการเก็บรักษาข้อมูล — แถวที่ publish แล้วจะสะสมไปตลอดกาล เว้นแต่จะมีอะไรมาลบหรือ archive มันในที่สุด
+
+**At-least-once delivery ไม่ใช่ exactly-once** — ผลที่ตามมาจากวิธีที่ relay เองล้มเหลวได้
+
+- **Pros:** การรับประกันว่า "event นี้จะถูก publish อย่างน้อยหนึ่งครั้ง" ทำได้ด้วยเครื่องมือธรรมดา (poll, publish, mark ว่า publish แล้ว) และเพียงพอที่จะสร้างระบบที่ถูกต้องบนฐานนี้ ตราบใดที่ consumer ทุกตัวเป็น idempotent; การพยายามรับประกัน delivery แบบ **exactly-once** ข้ามสองระบบที่เป็นอิสระต่อกันเป็นปัญหาที่ยากขึ้นชื่อ และแทบจะเป็นไปไม่ได้ในกรณีทั่วไป ดังนั้นการไม่พยายามทำแบบนั้นทำให้ relay เองยังคงเรียบง่าย
+- **Cons:** การรับประกันนี้โยนความซับซ้อนจริง ๆ ไปให้ consumer ทุกตัว แทนที่จะแก้ครั้งเดียวที่ relay ถ้า relay crash หลังจาก Kafka ยืนยันการ publish แต่ก่อนที่จะ mark outbox row เป็น `published_at` แถวนั้นจะยังดูเหมือนยังไม่ publish ตอน restart และถูก publish ซ้ำ — ดังนั้น `order.created`, `payment.succeeded`, และทุก event อื่นในระบบนี้ต้องปลอดภัยที่จะถูกประมวลผลสองครั้ง [Architecture →](/shopmicro/th/introduction/architecture/) ระบุข้อกำหนดนี้ไว้แล้ว นี่คือกลไกที่ทำให้มันจำเป็น ไม่ใช่ทางเลือก
+
+## Set it up
+
+ไม่มีโค้ดใหม่ในบทนี้ — แค่สองส่วนที่เขียนไว้แล้วใน [The Order Repository →](/shopmicro/th/order-service/order-repo/) มองผ่านมุมมองนี้
+
+### 1. ตารางที่ pattern นี้พึ่งพา
+
+```sql
+create table outbox ( id uuid primary key default gen_random_uuid(), aggregate_id uuid not null, event_type text not null, payload jsonb not null, created_at timestamptz not null default now(), published_at timestamptz );
+create index on outbox (published_at) where published_at is null;
+```
+
+`published_at` คือกลไกทั้งหมด: ทุกแถวเริ่มด้วยค่า `null` และงานของ relay (Module 6) ถูกอธิบายด้วยสอง operation ต่อคอลัมน์นี้เพียงคอลัมน์เดียว — หาแถวที่มันเป็น `null` แล้วตั้งค่ามันเมื่อแต่ละแถว publish สำเร็จ
+
+### 2. Event ที่คอร์สนี้เขียนไว้แล้ว
+
+`OrderRepo.Create` insert outbox row หนึ่งแถวต่อคำสั่งซื้อใหม่หนึ่งครั้ง ด้วยรูปร่างนี้:
+
+```json
+{
+  "order_id": "3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90",
+  "customer_id": "cust-1",
+  "total_cents": 2598,
+  "items": [
+    { "product_id": "8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21", "quantity": 2, "unit_price_cents": 1299 }
+  ]
+}
+```
+
+`event_type` คือ `'order.created'`, `aggregate_id` คือ `id` ของคำสั่งซื้อใหม่ — `id` เดียวกับที่ปรากฏอยู่ข้างในตัว payload เป็น `order_id` ซ้ำกันโดยตั้งใจ: `aggregate_id` คือสิ่งที่ query ใช้กรองและทำ index ด้วย (มันเป็นคอลัมน์ `uuid` ธรรมดา) ในขณะที่ `order_id` ข้างในตัว JSON payload คือสิ่งที่ Kafka consumer อ่านจริง ๆ เมื่อ deserialize event ที่ปลายทาง `OrderRepo.UpdateStatus` เขียนแถวรูปร่างเดียวกันสำหรับ `order.confirmed`/`order.cancelled` แค่มี payload เล็กกว่า (`order_id` กับ `status` ใหม่) — [Order Saga →](/shopmicro/th/saga/) คือส่วนที่เรียก `UpdateStatus` ในที่สุดเมื่อผลลัพธ์ของ Payment กลับมา
+
+### 3. ลำดับ
+
+ไม่มีอะไรในตาราง `outbox` เองที่รับประกันว่า event จะถูก publish ตามลำดับใดลำดับหนึ่งข้ามคำสั่งซื้อที่ต่างกัน — relay เป็นคนตัดสินใจเรื่องนั้นด้วยวิธีที่มัน query (`order by created_at` เช่น publish แถวเก่าสุดก่อน) สิ่งที่สำคัญกว่าคือลำดับ **ต่ออะกริเกต** (per aggregate): ทุก event เกี่ยวกับคำสั่งซื้อเดียวกันควรมาถึง consumer ตามลำดับที่มันเกิดขึ้น (`order.created` ก่อน `order.confirmed` ไม่มีทางกลับกัน) [Kafka →](/shopmicro/th/kafka/) ทำสิ่งนี้ได้โดยใช้ `aggregate_id` เป็น Kafka partition key — ทุก event ของคำสั่งซื้อเดียวกันจะไปลง partition เดียวกัน และ Kafka รับประกันลำดับแค่ *ภายใน* partition เดียวเท่านั้น ไม่ใช่ข้าม partition บทนี้แค่ระบุการตัดสินใจนี้ไว้ ส่วน relay ที่ implement มันจริงเป็นงานของ Module 6
+
+### 4. ทำไม index ถึงเป็น partial
+
+```sql
+create index on outbox (published_at) where published_at is null;
+```
+
+Query หลักที่ relay ใช้ตลอดเวลาคือประมาณ `select * from outbox where published_at is null order by created_at limit N` รันต่อเนื่องไม่หยุด — ทุกแถวที่ยังไม่ publish ต้องหาให้เจอเร็ว ทุกครั้งที่ poll `create index on outbox (published_at)` ธรรมดาจะ index ทุกแถวในตารางตลอดไป รวมถึงแถวที่ publish ไปแล้วนับล้านแถวที่ query นี้จะไม่แตะอีกเลยเมื่อมันถูก mark ว่าเสร็จแล้ว เงื่อนไข `where published_at is null` ทำให้มันเป็น **partial index**: มันมีแค่แถวที่ relay ยังสนใจอยู่เท่านั้น ดังนั้นขนาดของมันจะตามจำนวน backlog ปัจจุบัน ไม่ใช่ประวัติทั้งหมดของตาราง — index ที่เล็กและเร็ววันนี้ ก็ยังคงเล็กและเร็วในอีกหนึ่งปีข้างหน้า ไม่ว่าจะมีคำสั่งซื้อกี่รายการที่ถูกส่งและ publish ไปแล้วในระหว่างนั้น
+
+## Verify
+
+สั่งซื้อสักหนึ่งรายการ (ถ้ายังไม่มีอะไรรันอยู่ ดูคำสั่ง `grpcurl` ที่ตรงกันได้จากส่วน Verify ของ [The Order Repository →](/shopmicro/th/order-service/order-repo/)) แล้วดู outbox row ที่มันสร้างขึ้นโดยตรง:
+
+```bash
+psql "$ORDER_DB_URL" -c "select aggregate_id, event_type, published_at from outbox order by created_at desc limit 5;"
+```
+
+```txt
+             aggregate_id             | event_type    | published_at
+---------------------------------------+---------------+--------------
+ 3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90 | order.created |
+```
+
+`published_at` ว่างเปล่า (`null`) — ยังไม่มีอะไร publish แถวนี้เลย เพราะยังไม่มีอะไรในคอร์สนี้สร้าง relay ขึ้นมา นั่นคือสิ่งที่คาดไว้: แถวนี้จะรอตรงนี้ ค้นหาได้ด้วย partial index ทันทีที่ [Kafka →](/shopmicro/th/kafka/) สร้างอะไรมาอ่านมัน
+
+ตรวจสอบความเข้าใจของคุณ:
+
+- ทำไม request เดียวถึงบันทึกคำสั่งซื้อลง PostgreSQL กับ publish event ไป Kafka พร้อมกันแบบอะตอมิกไม่ได้?
+- การ commit outbox row อยู่ใน transaction เดียวกับคำสั่งซื้อรับประกันอะไร — และจงใจไม่รับประกันอะไร (คำใบ้: ความทันที)?
+- ถ้า relay crash หลังจาก Kafka ยืนยันการ publish แต่ก่อนที่จะอัปเดต `published_at` จะเกิดอะไรขึ้นตอน restart และทำไม consumer ทุกตัวต้องทนกับมันได้?
+- ถ้าไม่มี partial index จะเกิดอะไรขึ้นกับประสิทธิภาพของ query "หาแถวที่ยังไม่ publish" หลังจากคำสั่งซื้อที่ publish แล้วสะสมมาหนึ่งปีในตาราง?
+
+จากนั้นยืนยันว่า module ยัง build ผ่าน — ไม่มีอะไรเปลี่ยน แต่ทุกบทในคอร์สนี้จบแบบเดียวกัน:
+
+```bash
+go build ./...
+```
+
+ไม่มี output แปลว่าสำเร็จ
+
+## Recap
+
+ปัญหา dual-write — ไม่มีทางเขียนลง PostgreSQL กับ Kafka พร้อมกันแบบอะตอมิกในการดำเนินการเดียว — พังทั้งสองลำดับของ "บันทึกก่อน แล้วค่อย publish" และ "publish ก่อน แล้วค่อยบันทึก" แต่ละแบบเหลือช่วงเวลาที่สองระบบไม่ตรงกันว่า event ของคำสั่งซื้อเกิดขึ้นหรือยัง Transactional outbox เลี่ยงมันไปเลยทั้งหมด: `OrderRepo.Create` เขียนคำสั่งซื้อ รายการสินค้าของมัน และ `outbox` row ที่อธิบาย `order.created` อยู่ใน `pgx.Tx` เดียว ดังนั้นจึงมีแค่ transaction ของระบบเดียวเท่านั้นที่เกี่ยวข้อง และ relay แยกต่างหาก (สร้างใน [Kafka →](/shopmicro/th/kafka/) Module 6) จะ publish จากตารางนั้นตามตารางเวลาของตัวเอง mark `published_at` ของแต่ละแถวเมื่อ Kafka ยืนยันแล้ว relay นั้นรับประกันได้แค่ delivery แบบ **at-least-once** — crash ระหว่าง "Kafka ยืนยันแล้ว" กับ "แถวถูก mark ว่า publish แล้ว" จะ publish event เดิมซ้ำ — ซึ่งเป็นเหตุผลว่าทำไม consumer ทุกตัวของ `order.created`, `payment.succeeded`, และทุก event อื่นในระบบนี้ต้องเป็น idempotent ข้อกำหนดที่ [Architecture →](/shopmicro/th/introduction/architecture/) ระบุไว้ตั้งแต่ต้น Partial index บน `outbox (published_at) where published_at is null` ทำให้ query หลักของ relay เร็วอยู่เสมอ ไม่ว่าประวัติที่ publish แล้วจะสะสมมากแค่ไหน นั่นคือ Module 4 เสร็จสมบูรณ์ — Order service สร้างคำสั่งซื้อจริงพร้อมราคาที่ถูกต้อง และบันทึก event ที่อธิบายมันได้อย่างน่าเชื่อถือ ต่อไป [API Gateway →](/shopmicro/th/gateway/) จะเปิด Catalog และ Order ให้ REST client เข้าถึงผ่าน grpc-gateway

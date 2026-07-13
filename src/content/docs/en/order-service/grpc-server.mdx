@@ -1,0 +1,194 @@
+---
+title: The gRPC Server
+description: "Bootstrap the Order service's cmd/main.go: a pgx pool, a TCP listener, grpc.NewServer, reflection, a placeholder implementation of OrderServiceServer — and, new this module, a gRPC client connection to the Catalog service, dialed with grpc.NewClient and injected into the placeholder."
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+`services/order/cmd/main.go` — the Order service's composition root, following the exact shape [The gRPC Server →](/shopmicro/en/catalog-service/grpc-server/) established for Catalog: a `pkg/pg` connection pool, a TCP listener, `grpc.NewServer()`, a placeholder `OrderServiceServer` implementation, reflection, and graceful shutdown on `SIGINT`/`SIGTERM`.
+
+There's one genuinely new piece this module didn't need before: Order has to talk to *another service* to do its job. Pricing an order means asking Catalog what a product currently costs, so this lesson also dials a gRPC connection to the Catalog service with `grpc.NewClient` and constructs a `catalogv1.CatalogServiceClient` from it — and wires that client into the placeholder server today, even though `CreateOrder` doesn't use it until [The Order Repository →](/shopmicro/en/order-service/order-repo/). The dependency is injected now; the business logic that calls it lands next lesson.
+
+## Why
+
+An order's total is money, and money fields don't get to come from wherever's convenient — [The Contracts →](/shopmicro/en/proto-grpc/contracts/) already made this explicit: `CreateOrderItem` only carries `product_id` and `quantity`, deliberately leaving `unit_price_cents` off the request message entirely, so a client can never simply tell the server what price to charge. Something has to look up the real price, and that real price lives in Catalog's own PostgreSQL database — a database Order cannot reach into directly, because [each service owns its own database](/shopmicro/en/introduction/architecture/) and Catalog can't reach into Order's tables either. The only way Order can find out today's price is to ask Catalog, over gRPC, the same way a client asks Order to place one.
+
+## Pros & cons
+
+**Calling Catalog live over gRPC for every item's price**
+
+- **Pros:** Catalog stays the single source of truth for price — there's no second copy of "what does this product cost" anywhere in Order's database that could silently drift out of sync; the price Order charges is always Catalog's *current* price at the moment the order is placed, not whatever it was the last time some sync job ran.
+- **Cons:** `CreateOrder` now has a hard runtime dependency on Catalog being reachable — if Catalog is down, Order can't price anything, so an outage in one service becomes an outage in another; each item in the order is a separate gRPC round trip, adding latency that scales with the number of distinct items in the request.
+
+**Duplicating (caching) price data in Order's own database instead**
+
+- **Pros:** `CreateOrder` never depends on Catalog being up at request time — Order could still accept orders during a Catalog outage; no added per-item network round trip.
+- **Cons:** now there are two copies of the truth that can disagree — Order's cached price and Catalog's real price can drift the moment either one changes; keeping them in sync needs an explicit propagation mechanism (consuming a `product.updated` event, say) that doesn't exist anywhere in this course yet; and the failure mode is worse than an explicit error — an order silently priced at a stale value is a correctness bug, not a loud, obvious outage.
+
+This course chooses the live call: a clear, immediate `codes.FailedPrecondition` when Catalog can't answer is a better failure mode for a course teaching service boundaries than a silently stale price would be. [Resilience →](/shopmicro/en/resilience/) (Module 11) is where this dependency gets a timeout and a circuit breaker so a slow Catalog can't hang every `CreateOrder` call indefinitely — that hardening is out of scope here.
+
+## Set it up
+
+### 1. `services/order/cmd/main.go` — the lesson-1 snapshot
+
+```go
+// Command order (lesson-1 snapshot) proves the gRPC bootstrapping mechanics
+// and the Catalog client connection before the real repo and Server exist:
+// a placeholderServer satisfies orderv1.OrderServiceServer purely by
+// embedding UnimplementedOrderServiceServer, so every RPC returns
+// codes.Unimplemented until the next lesson builds the real thing.
+package main
+
+import (
+	"context"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+
+	catalogv1 "github.com/avetavos/shopmicro/gen/shopmicro/catalog/v1"
+	orderv1 "github.com/avetavos/shopmicro/gen/shopmicro/order/v1"
+	"github.com/avetavos/shopmicro/pkg/config"
+	"github.com/avetavos/shopmicro/pkg/pg"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/reflection"
+)
+
+// placeholderServer satisfies orderv1.OrderServiceServer for now by
+// embedding UnimplementedOrderServiceServer and overriding nothing — every
+// RPC returns codes.Unimplemented until the next lesson builds the real repo
+// and Server. It already holds the Catalog client, though: that dependency
+// is wired up today so the next lesson only has to add the business logic
+// that uses it.
+type placeholderServer struct {
+	orderv1.UnimplementedOrderServiceServer
+	catalog catalogv1.CatalogServiceClient
+}
+
+func main() {
+	ctx := context.Background()
+
+	dbURL := config.Get("ORDER_DB_URL", "postgres://shopmicro:shopmicro@localhost:5432/orders?sslmode=disable")
+	grpcAddr := config.Get("ORDER_GRPC_ADDR", ":50052")
+	catalogAddr := config.Get("CATALOG_GRPC_ADDR", ":50051")
+
+	pool, err := pg.NewPool(ctx, dbURL)
+	if err != nil {
+		log.Fatalf("order: connect to postgres: %v", err)
+	}
+	defer pool.Close()
+
+	catalogConn, err := grpc.NewClient(catalogAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("order: dial catalog at %s: %v", catalogAddr, err)
+	}
+	defer catalogConn.Close()
+	catalogClient := catalogv1.NewCatalogServiceClient(catalogConn)
+
+	lis, err := net.Listen("tcp", grpcAddr)
+	if err != nil {
+		log.Fatalf("order: listen on %s: %v", grpcAddr, err)
+	}
+
+	grpcServer := grpc.NewServer()
+	orderv1.RegisterOrderServiceServer(grpcServer, &placeholderServer{catalog: catalogClient})
+	reflection.Register(grpcServer)
+
+	go func() {
+		log.Printf("order: gRPC server listening on %s", grpcAddr)
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("order: serve: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Println("order: shutting down")
+	grpcServer.GracefulStop()
+}
+```
+
+Save this as `services/order/cmd/main.go`. A few details worth calling out, beyond what [The gRPC Server →](/shopmicro/en/catalog-service/grpc-server/) already explained about `pg.NewPool`, `net.Listen`, the serving goroutine, and signal-based shutdown:
+
+- **`grpc.NewClient`, not the deprecated `grpc.Dial`.** `grpc.NewClient` is the modern, non-deprecated way to build a `*grpc.ClientConn` — it constructs the connection object and its name-resolution/load-balancing machinery but does **not** eagerly connect; the first RPC triggers the actual TCP handshake. `grpc.Dial` behaves differently (it can eagerly connect depending on options like `WithBlock`) and is kept around only for backward compatibility — new code should reach for `grpc.NewClient`.
+- **`insecure.NewCredentials()`.** Every gRPC connection needs transport credentials; `insecure.NewCredentials()` is the explicit way to say "plaintext, no TLS" for local development between services running on a trusted network. Production service-to-service traffic would use real TLS credentials instead — that hardening belongs to [Resilience →](/shopmicro/en/resilience/) and [Kubernetes →](/shopmicro/en/kubernetes/), not this lesson.
+- **`catalogv1.NewCatalogServiceClient(catalogConn)`.** This is the exact call [Code Generation →](/shopmicro/en/proto-grpc/codegen/) previewed when it introduced `CatalogServiceClient` — a `*grpc.ClientConn` goes in, a typed client with `ListProducts`/`GetProduct`/`CreateProduct` methods comes out. Nothing about it is Order-specific; any Go service in this system would dial and construct a client the same way.
+- **`defer catalogConn.Close()` right after the client is dialed**, exactly like `defer pool.Close()` right after the pool is created — both resources get an unconditional cleanup path the moment they exist, so no later `return` or `log.Fatalf` can accidentally skip it.
+- **`placeholderServer` embeds the Catalog client as a field, not just `UnimplementedOrderServiceServer`.** This is new compared to Catalog's lesson 1, where the placeholder had nothing but the embed. Storing `catalog` here proves the wiring — config → dial → client → server — compiles and runs correctly today, even though not a single RPC method reads the field yet.
+
+### 2. Environment variables this lesson introduces
+
+| Variable | Default | Used by |
+| --- | --- | --- |
+| `ORDER_DB_URL` | `postgres://shopmicro:shopmicro@localhost:5432/orders?sslmode=disable` | `pg.NewPool` |
+| `ORDER_GRPC_ADDR` | `:50052` | `net.Listen` for Order's own server |
+| `CATALOG_GRPC_ADDR` | `:50051` | `grpc.NewClient` to reach Catalog |
+
+`ORDER_GRPC_ADDR` defaults to `:50052`, one port after Catalog's `:50051`, so both services can run side by side on one machine without a port collision.
+
+## Verify
+
+Run the Catalog service first, since Order's client dial (lazily) needs it reachable the moment a real RPC is made:
+
+```bash
+go run ./services/catalog/cmd
+```
+
+In a second terminal, run Order:
+
+```bash
+go run ./services/order/cmd
+```
+
+Expected output from the second terminal:
+
+```txt
+order: gRPC server listening on :50052
+```
+
+From a third terminal, ask Order's reflection service what's there:
+
+```bash
+grpcurl -plaintext localhost:50052 list
+```
+
+```txt
+grpc.reflection.v1.ServerReflection
+shopmicro.order.v1.OrderService
+```
+
+Confirm the placeholder genuinely returns `Unimplemented` rather than crashing:
+
+```bash
+grpcurl -plaintext -d '{"id":"anything"}' localhost:50052 shopmicro.order.v1.OrderService/GetOrder
+```
+
+```txt
+ERROR:
+  Code: Unimplemented
+  Message: method GetOrder not implemented
+```
+
+Stop both servers with `Ctrl-C` and confirm each logs its shutdown line before exiting:
+
+```txt
+order: shutting down
+```
+
+Then confirm the whole module still builds cleanly:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+## Recap
+
+`services/order/cmd/main.go` is the Order service's composition root, built the same way as Catalog's: `pkg/pg.NewPool` opens and health-checks a connection pool against `ORDER_DB_URL`, `net.Listen` binds `ORDER_GRPC_ADDR`, `grpc.NewServer()` plus `reflection.Register` make the process discoverable, and `placeholderServer` — `orderv1.UnimplementedOrderServiceServer` embedded by value — satisfies `OrderServiceServer` well enough to register and respond to `grpcurl` with well-formed `codes.Unimplemented` errors. New this module: `grpc.NewClient(catalogAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))` dials the Catalog service, and `catalogv1.NewCatalogServiceClient` wraps that connection into a typed client, injected into the placeholder as a `catalog` field so the dependency is proven wired before any RPC uses it. Calling Catalog live, rather than caching price data locally, keeps price accuracy free at the cost of a runtime dependency between the two services — a trade-off this course makes deliberately, and hardens later in [Resilience →](/shopmicro/en/resilience/). Next, [The Order Repository →](/shopmicro/en/order-service/order-repo/) builds the real `OrderRepo` and `Server`, replacing this placeholder and putting the Catalog client to actual use.

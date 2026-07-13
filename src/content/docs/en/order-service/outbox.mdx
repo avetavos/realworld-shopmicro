@@ -1,0 +1,110 @@
+---
+title: The Transactional Outbox
+description: "The dual-write problem — why you can't atomically write to PostgreSQL and publish to Kafka — and how the outbox table OrderRepo.Create already writes solves it: at-least-once delivery, idempotent consumers, event ordering, and the partial index on unpublished rows."
+sidebar:
+  order: 3
+---
+
+## What we're building
+
+Nothing new. [The Order Repository →](/shopmicro/en/order-service/order-repo/)'s `OrderRepo.Create` already writes every new order's `outbox` row inside the same transaction as the order and its line items — that single detail is the entire transactional outbox pattern, already implemented. This lesson explains *why* it matters: the problem it solves, the guarantees it does and doesn't give you, and the partial index that makes the pattern practical at scale. [Kafka →](/shopmicro/en/kafka/) (Module 6) is where a separate process — the relay — actually reads this table and publishes to Kafka; nothing here builds that yet.
+
+## Why
+
+Here's the problem in its plainest form: `CreateOrder` needs to do two things when an order is placed — save the order to PostgreSQL, and tell the rest of the system it happened by publishing `order.created` to Kafka. Those are two entirely separate systems, and there is no way to wrap a write to one and a write to the other in a single atomic operation. No cross-system transaction exists between PostgreSQL and Kafka. That's the **dual-write problem**, and it breaks in both possible orderings:
+
+- **Save first, then publish:** if the process crashes, loses its network connection, or is killed by Kubernetes between the successful commit and the Kafka publish call, the order is safely saved but the event is never sent. Payment never learns this order exists. The order sits `PENDING` forever — a real order, silently invisible to the rest of the system.
+- **Publish first, then save:** if the process crashes after Kafka acknowledges the publish but before the database transaction commits, consumers now believe an order exists that was never actually saved — a phantom event describing nothing.
+
+Neither ordering is safe on its own, and no amount of careful error handling fixes it — the fundamental issue is that "saved" and "published" are facts about two different systems that can't be made to change atomically together, no matter what order you write them in.
+
+The outbox pattern sidesteps the problem instead of solving it directly: rather than trying to make a write to PostgreSQL and a write to Kafka atomic, write **only to PostgreSQL** — the order, its items, and a new row in an `outbox` table describing the event that should eventually be published. All three are ordinary rows in one database, so an ordinary `pgx.Tx` makes them atomic exactly the way [The Order Repository →](/shopmicro/en/order-service/order-repo/) already does. There's no dual-write anymore, because there's only one system involved in the transaction. A separate process — the relay, built in [Kafka →](/shopmicro/en/kafka/) — polls the `outbox` table for rows that haven't been published yet, pushes each one to Kafka, and marks it published. That relay can crash, retry, and fall behind without ever putting the order data itself at risk, because publishing has been fully decoupled from the original write.
+
+## Pros & cons
+
+**Transactional outbox (a relay reads a table)** vs. **direct dual-write (insert the order, then publish to Kafka inline in the same request)**
+
+- **Pros:** order creation and "this event will eventually be published" become atomic — impossible for one to happen without the other; the relay can retry publishing indefinitely without ever touching order data, since order data was already safely committed before the relay even looks at the row; `CreateOrder` no longer has a runtime dependency on Kafka being reachable at all — an outage in Kafka becomes a growing backlog of unpublished outbox rows, not a failed order creation.
+- **Cons:** publishing is no longer immediate — there's a real, if usually small, delay between "order created" and "event visible to Kafka consumers," bounded by however often the relay polls; an entire extra component (the relay) has to be built, deployed, and monitored, where a direct publish would have needed nothing beyond the Kafka client already in the request path; the `outbox` table itself needs a retention story — published rows accumulate forever unless something eventually deletes or archives them.
+
+**At-least-once delivery, not exactly-once** — a consequence of how the relay itself can fail
+
+- **Pros:** guaranteeing "this event is published at least once" is achievable with ordinary tools (poll, publish, mark published) and is enough to build a correct system on top of, as long as every consumer is idempotent; trying to guarantee **exactly-once** delivery across two independent systems is a famously hard, arguably impossible problem in the general case, so not attempting it keeps the relay itself simple.
+- **Cons:** the guarantee shifts real complexity onto every consumer instead of solving it once in the relay. If the relay crashes after Kafka acknowledges a publish but before it marks the outbox row `published_at`, the row still looks unpublished on restart and gets published again — so `order.created`, `payment.succeeded`, and every other event in this system must be safe to process twice. [Architecture →](/shopmicro/en/introduction/architecture/) already named this requirement; this is the mechanism that makes it necessary, not optional.
+
+## Set it up
+
+There's no new code in this lesson — just the two pieces already written in [The Order Repository →](/shopmicro/en/order-service/order-repo/), looked at through this lens.
+
+### 1. The table the pattern depends on
+
+```sql
+create table outbox ( id uuid primary key default gen_random_uuid(), aggregate_id uuid not null, event_type text not null, payload jsonb not null, created_at timestamptz not null default now(), published_at timestamptz );
+create index on outbox (published_at) where published_at is null;
+```
+
+`published_at` is the whole mechanism: every row starts with it `null`, and the relay's job (Module 6) is entirely described by two operations against this one column — find rows where it's `null`, and set it once each one is successfully published.
+
+### 2. The event this course already writes
+
+`OrderRepo.Create` inserts exactly one outbox row per new order, with this shape:
+
+```json
+{
+  "order_id": "3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90",
+  "customer_id": "cust-1",
+  "total_cents": 2598,
+  "items": [
+    { "product_id": "8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21", "quantity": 2, "unit_price_cents": 1299 }
+  ]
+}
+```
+
+`event_type` is `'order.created'`, `aggregate_id` is the new order's `id` — the same `id` that appears inside the payload as `order_id`, deliberately duplicated: `aggregate_id` is what a query filters and indexes on (it's a plain `uuid` column), while `order_id` inside the JSON payload is what a Kafka consumer actually reads once the event is deserialized on the other end. `OrderRepo.UpdateStatus` writes the same shape of row for `order.confirmed`/`order.cancelled`, just with a smaller payload (`order_id` and the new `status`) — [Order Saga →](/shopmicro/en/saga/) is what eventually calls `UpdateStatus` once Payment's result comes back.
+
+### 3. Ordering
+
+Nothing about the `outbox` table itself guarantees events are published in any particular order across different orders — the relay decides that by how it queries (`order by created_at`, for instance, publishes oldest-first). What matters more is ordering **per aggregate**: every event about the same order should arrive at a consumer in the order it happened (`order.created` before `order.confirmed`, never the reverse). [Kafka →](/shopmicro/en/kafka/) achieves that by using `aggregate_id` as the Kafka partition key — every event for the same order lands on the same partition, and Kafka only guarantees ordering *within* a partition, never across them. That's a decision this lesson only names; the relay that implements it is Module 6's job.
+
+### 4. Why the index is partial
+
+```sql
+create index on outbox (published_at) where published_at is null;
+```
+
+The relay's hot-path query is, in essence, `select * from outbox where published_at is null order by created_at limit N`, run continuously — every unpublished row needs to be found fast, every single poll. A plain `create index on outbox (published_at)` would index every row in the table forever, including the millions of already-published ones that this query will never touch again once they're marked done. The `where published_at is null` clause makes this a **partial index**: it only ever contains rows the relay still cares about, so its size tracks the current backlog, not the table's entire lifetime history — a small, fast index today stays a small, fast index a year from now, regardless of how many orders have shipped and been published in the meantime.
+
+## Verify
+
+Place an order (if you don't have one running already, [The Order Repository →](/shopmicro/en/order-service/order-repo/)'s Verify section shows the exact `grpcurl` command), then look at the outbox row it produced directly:
+
+```bash
+psql "$ORDER_DB_URL" -c "select aggregate_id, event_type, published_at from outbox order by created_at desc limit 5;"
+```
+
+```txt
+             aggregate_id             | event_type    | published_at
+---------------------------------------+---------------+--------------
+ 3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90 | order.created |
+```
+
+`published_at` is empty (`null`) — nothing has published this row yet, because nothing in this course has built the relay yet. That's expected: this row will sit here, discoverable by the partial index the moment [Kafka →](/shopmicro/en/kafka/) builds something to read it.
+
+Check your understanding:
+
+- Why can't a single request atomically save an order to PostgreSQL and publish an event to Kafka?
+- What does committing the outbox row in the same transaction as the order guarantee — and what does it deliberately *not* guarantee (hint: immediacy)?
+- If the relay crashes after Kafka acknowledges a publish but before it updates `published_at`, what happens on restart, and why must every consumer tolerate that?
+- Without the partial index, what would happen to the "find unpublished rows" query's performance after a year of published orders have accumulated in the table?
+
+Then confirm the module still builds — nothing changed, but every lesson in this course ends the same way:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+## Recap
+
+The dual-write problem — no atomic way to write to PostgreSQL and Kafka in one operation — breaks both orderings of "save, then publish" and "publish, then save," each leaving a window where the two systems disagree about whether an order's event happened. The transactional outbox sidesteps it entirely: `OrderRepo.Create` writes the order, its items, and an `outbox` row describing `order.created` in one `pgx.Tx`, so there's only ever one system's transaction involved, and a separate relay (built in [Kafka →](/shopmicro/en/kafka/), Module 6) publishes from that table on its own schedule, marking each row's `published_at` once Kafka confirms it. That relay can only guarantee **at-least-once** delivery — a crash between "Kafka acknowledged" and "row marked published" republishes the same event — which is exactly why every consumer of `order.created`, `payment.succeeded`, and every other event in this system must be idempotent, a requirement [Architecture →](/shopmicro/en/introduction/architecture/) named from the start. The partial index on `outbox (published_at) where published_at is null` keeps the relay's hot query fast regardless of how much published history accumulates. That's Module 4 done — the Order service creates real, correctly-priced orders and reliably records the events describing them. Next, [API Gateway →](/shopmicro/en/gateway/) exposes both Catalog and Order to REST clients over grpc-gateway.
