@@ -1,0 +1,11 @@
+{
+  // Cloudflare Worker (static assets) for the ShopMicro guide.
+  // The site is built with Astro `base: '/shopmicro'`, so the built files must be
+  // served under a `/shopmicro/` path. `npm run deploy` stages `dist/` into
+  // `.cf-assets/shopmicro/` and serves `.cf-assets` as the asset root.
+  "name": "realworld-shopmicro",
+  "compatibility_date": "2024-09-23",
+  "assets": {
+    "directory": "./.cf-assets"
+  }
+}
