@@ -1,0 +1,272 @@
+---
+title: The Contracts
+description: "Contract ของ catalog.proto และ order.proto ที่ทุกโมดูลถัดไปสร้างต่อยอด: proto3 message, field number, enum OrderStatus และ annotation google.api.http ที่ขับเคลื่อน REST gateway"
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+ไฟล์ `.proto` สองไฟล์ — single source of truth สำหรับรูปร่างข้อมูลและ RPC ของเซอร์วิส Catalog และ Order โมดูลถัดไปทุกตัว (ตัวเซอร์วิสเอง, API Gateway, การเทสต์) จะถูก generate จาก หรือเขียนขึ้นตรงกับไฟล์สองไฟล์นี้ และไม่มีวันเบี่ยงเบนไปจากมัน
+
+`proto/shopmicro/catalog/v1/catalog.proto`:
+
+```proto
+syntax = "proto3";
+
+package shopmicro.catalog.v1;
+
+import "google/api/annotations.proto";
+
+option go_package = "github.com/avetavos/shopmicro/gen/shopmicro/catalog/v1;catalogv1";
+
+message Product {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  int64 price_cents = 4;
+  int32 stock = 5;
+}
+
+message ListProductsRequest {
+  int32 page = 1;
+  int32 page_size = 2;
+}
+
+message ListProductsResponse {
+  repeated Product products = 1;
+  int32 total = 2;
+}
+
+message GetProductRequest {
+  string id = 1;
+}
+
+message CreateProductRequest {
+  string name = 1;
+  string description = 2;
+  int64 price_cents = 3;
+  int32 stock = 4;
+}
+
+service CatalogService {
+  rpc ListProducts(ListProductsRequest) returns (ListProductsResponse) {
+    option (google.api.http) = { get: "/v1/products" };
+  }
+  rpc GetProduct(GetProductRequest) returns (Product) {
+    option (google.api.http) = { get: "/v1/products/{id}" };
+  }
+  rpc CreateProduct(CreateProductRequest) returns (Product) {
+    option (google.api.http) = { post: "/v1/products" body: "*" };
+  }
+}
+```
+
+`proto/shopmicro/order/v1/order.proto`:
+
+```proto
+syntax = "proto3";
+
+package shopmicro.order.v1;
+
+import "google/api/annotations.proto";
+
+option go_package = "github.com/avetavos/shopmicro/gen/shopmicro/order/v1;orderv1";
+
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  ORDER_STATUS_PENDING = 1;
+  ORDER_STATUS_CONFIRMED = 2;
+  ORDER_STATUS_CANCELLED = 3;
+}
+
+message OrderItem {
+  string product_id = 1;
+  int32 quantity = 2;
+  int64 unit_price_cents = 3;
+}
+
+message Order {
+  string id = 1;
+  string customer_id = 2;
+  OrderStatus status = 3;
+  int64 total_cents = 4;
+  repeated OrderItem items = 5;
+  string created_at = 6;
+}
+
+message CreateOrderItem {
+  string product_id = 1;
+  int32 quantity = 2;
+}
+
+message CreateOrderRequest {
+  string customer_id = 1;
+  repeated CreateOrderItem items = 2;
+}
+
+message GetOrderRequest {
+  string id = 1;
+}
+
+message ListOrdersRequest {
+  string customer_id = 1;
+}
+
+message ListOrdersResponse {
+  repeated Order orders = 1;
+}
+
+service OrderService {
+  rpc CreateOrder(CreateOrderRequest) returns (Order) {
+    option (google.api.http) = { post: "/v1/orders" body: "*" };
+  }
+  rpc GetOrder(GetOrderRequest) returns (Order) {
+    option (google.api.http) = { get: "/v1/orders/{id}" };
+  }
+  rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse) {
+    option (google.api.http) = { get: "/v1/orders" };
+  }
+}
+```
+
+ไฟล์ทั้งสองอยู่ใต้ `proto/` ตามโครงสร้าง `proto/shopmicro/<service>/v1/<service>.proto` ที่ [Repo Layout →](/shopmicro/th/setup/repo-layout/) จองพื้นที่ไว้ให้แล้ว และที่ [Protobuf Tooling →](/shopmicro/th/setup/proto-tooling/) ชี้ `buf.yaml`'s `modules: - path: proto` ไปหาไว้แล้ว
+
+## Why
+
+วิธีอื่นในการนิยาม API — เขียน Go handler ก่อน แล้วปล่อยให้รูปร่าง JSON ออกมาจาก struct อะไรก็ตามที่บังเอิญนิยามไว้ — ทำให้ **contract เป็นสิ่งที่มองไม่เห็นตรง ๆ (implicit)**: มันอยู่แค่ในโค้ด ในภาษาอะไรก็ตามที่เซอร์วิสนั้นเขียนอยู่ และวิธีเดียวที่ทีมอื่นหรือเซอร์วิสอื่นจะรู้ว่ามีอะไรเปลี่ยนคือการอ่าน diff ของ business logic **Schema-first** กลับด้านตรงนี้: ไฟล์ `.proto` **คือ** contract เขียนด้วยภาษาที่เป็นกลางทางภาษา (interface definition language หรือ IDL) และมันมีอยู่ **ก่อน** โค้ด handler ใด ๆ `buf generate` (บทถัดไป) จะดึง Go type, gRPC stub, REST gateway และเอกสาร OpenAPI ออกมาจากไฟล์เดียวนั้น — แบบ deterministic โดยไม่มีอะไรต้องเขียนมือให้ sync กันเอง
+
+การทำ versioning ถูกฝังไว้ในชื่อ package เองเลย: `shopmicro.catalog.v1` และ `shopmicro.order.v1` ส่วน `v1` นั้นกลายเป็นส่วนหนึ่งของ Go import path ที่ generate ออกมา (`.../gen/shopmicro/catalog/v1`) และเป็นชื่อ package ระดับ wire ที่ทุก message ถูกกำกับด้วย การเปลี่ยนแปลงที่ไม่ breaking — field ใหม่ที่เป็น optional, RPC ใหม่ — ลงตรงใน `v1` ได้เลย ส่วนการเปลี่ยนแปลงที่ breaking จริง ๆ (ลบ field, เปลี่ยน type, ปรับโครงสร้าง signature ของ RPC) จะได้ package `shopmicro.catalog.v2` ของตัวเองอยู่ **เคียงข้าง** `v1` ไม่ใช่แทนที่มันตรงนั้น — ผู้เรียกเดิมยังทำงานกับ `v1` ต่อไปได้ ในขณะที่ผู้เรียกใหม่ค่อย ๆ ย้ายไป `v2` ตามจังหวะของตัวเอง
+
+## Pros & cons
+
+**ข้อดี**
+
+- ไฟล์ `.proto` ไฟล์เดียวขับเคลื่อน Go type, gRPC client/server stub, REST gateway และเอกสาร OpenAPI — ไม่มี mapping layer ที่เขียนมือต้องคอย sync ([Code Generation →](/shopmicro/th/proto-grpc/codegen/) จะแสดงให้เห็นชัด ๆ ว่า `buf generate` ผลิตอะไรออกมาจากไฟล์สองไฟล์นี้)
+- ภาษาไหนก็ generate client จากไฟล์เดียวกันนี้ได้ — เซอร์วิส Go วันนี้ เครื่องมือ admin ในภาษาอื่นวันหน้า — จึงไม่มีสถานการณ์ "เอกสารบอกอย่าง โค้ดทำอีกอย่าง" มาเบี่ยงเบนกัน
+- Field number ทำให้ wire format เข้ากันได้ทั้งไปข้างหน้าและย้อนหลัง (forward/backward compatible): binary รุ่นเก่าข้าม field ที่ไม่รู้จักไปเงียบ ๆ ได้ ส่วน binary รุ่นใหม่จะเห็นค่า zero value สำหรับ field ที่ผู้ส่งรุ่นเก่าไม่เคยใส่มา
+- `buf lint` (ใช้ด้านล่าง) จับปัญหาการออกแบบ API ของ proto — ชื่อไม่ดี, option ที่ขาดหาย — ก่อนที่มันจะไปถึง code review เหมือนบทบาทที่ linter ทำให้กับโค้ดแอปพลิเคชัน
+
+**ข้อเสีย**
+
+- Contract-first หมายความว่าต้องออกแบบรูปร่าง message และ RPC ก่อนที่ business logic จะมีอยู่จริง — ยากกว่า "เขียน handler แล้วดูว่า JSON ออกมาเป็นอะไร" ตั้งแต่ต้นจริง ๆ และอาจทำให้การออกแบบ API แบบ exploratory จริง ๆ ช้าลง
+- มีขั้นตอน build สองขั้นแทนที่จะเป็นหนึ่ง: แก้ `.proto`, รัน `buf generate`, **แล้วค่อย** เขียนโค้ด Go กับ type ที่เพิ่ง generate ใหม่ — inner loop ช้ากว่าการแก้ Go struct ธรรมดาตรง ๆ
+- ระเบียบวินัยเรื่อง field number และการเปลี่ยนชื่อกลายเป็นข้อจำกัดถาวร: การเปลี่ยนเลข field หรือใช้ซ้ำ/ลบตัวเลขนั้นโดยไม่ประกาศ `reserved` จะทำให้ wire compatibility พังสำหรับใครก็ตามที่ยังรัน binary รุ่นเก่าอยู่
+
+## Set it up
+
+### 1. proto3 syntax, package และ import
+
+ทุกไฟล์เริ่มด้วยสี่บรรทัดเดียวกัน:
+
+```proto
+syntax = "proto3";
+package shopmicro.catalog.v1;
+import "google/api/annotations.proto";
+option go_package = "github.com/avetavos/shopmicro/gen/shopmicro/catalog/v1;catalogv1";
+```
+
+`syntax = "proto3";` เลือกภาษา protobuf เวอร์ชันปัจจุบัน (proto3 ไม่ใช่ proto2 รุ่นเก่า) — มันเปลี่ยน default field presence และกฎของ enum ซึ่งเป็นเหตุผลว่าทำไม enum `OrderStatus` ด้านล่างถึงต้องมี zero value ที่ชัดเจน `package shopmicro.catalog.v1;` ทำ namespace ให้ทุก message และ service ในไฟล์นี้ เพื่อให้ `shopmicro.catalog.v1.Product` ไม่มีวันชนกับ เช่น `shopmicro.order.v1.Product` ที่เซอร์วิสอื่นอาจนิยามไว้ `import` ดึง `google.api.http` เข้ามา ซึ่งเป็น annotation type ที่ block `service` ด้านล่างแนบเข้ากับแต่ละ RPC — นี่คือ dependency `deps: - buf.build/googleapis/googleapis` ที่ [Protobuf Tooling →](/shopmicro/th/setup/proto-tooling/) เพิ่มเข้าไปใน `buf.yaml` เพื่อการนี้โดยตรง
+
+### 2. `go_package` — ทั้ง path และชื่อ package
+
+`option go_package = "github.com/avetavos/shopmicro/gen/shopmicro/catalog/v1;catalogv1";` มีสองส่วน คั่นด้วย `;` ส่วนแรกคือ Go import path ที่ไฟล์ที่ generate จะไปอยู่ ส่วนที่สอง `catalogv1` override ชื่อ Go package ที่ไฟล์ที่ generate ประกาศ ถ้าไม่มี override นี้ `protoc-gen-go` จะตั้งชื่อ package เป็น segment สุดท้ายของ import path โดย default — คือ `v1` — และเพราะทั้ง `catalog/v1` และ `order/v1` ลงท้ายด้วย `v1` เหมือนกัน ไฟล์ไหนก็ตามที่ import generated package ทั้งสองตัวจะชนกันเรื่องชื่อ package ทันที การตั้งชื่อเป็น `catalogv1` และ `orderv1` ไว้ล่วงหน้าเลี่ยงปัญหานี้ไปได้ทั้งหมด
+
+### 3. Message, field และ field number
+
+```proto
+message Product {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  int64 price_cents = 4;
+  int32 stock = 5;
+}
+```
+
+`= 1`, `= 2`, ... คือ **field number** ไม่ใช่ค่า default — มันคือ tag ที่ protobuf เขียนลงบน wire แทนชื่อ field ซึ่งเป็นสิ่งที่ทำให้ binary format กระชับ และเป็นสิ่งที่ทำให้ผู้รับข้าม field ที่ไม่เข้าใจไปได้แทนที่จะ parse message ทั้งก้อนไม่สำเร็จ Field number 1–15 encode ด้วย byte เดียว ซึ่งเป็นเหตุผลว่าทำไม field ที่ถูกตั้งค่าบ่อยที่สุดบน message ที่ใช้งานหนักถึงคุ้มค่าที่จะจองเลขต่ำ ๆ ไว้ให้ กฎที่สำคัญที่สุดสำหรับ contract ที่ตั้งใจจะรักษาให้เสถียร: **ห้ามใช้ซ้ำหรือเปลี่ยนเลข field number ตัวใดตัวหนึ่งเมื่อมัน ship ไปแล้ว** — ถ้า field ถูกลบ ให้ประกาศเลขนั้นเป็น `reserved` เพื่อไม่ให้มันถูก reassign แบบเงียบ ๆ ไปให้กับอะไรบางอย่างที่ความหมายต่างไปจากเดิมกับ binary รุ่นเก่าที่ยังส่งเลขเก่าอยู่
+
+### 4. Enum `OrderStatus` และทำไมต้อง `_UNSPECIFIED = 0`
+
+```proto
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  ORDER_STATUS_PENDING = 1;
+  ORDER_STATUS_CONFIRMED = 2;
+  ORDER_STATUS_CANCELLED = 3;
+}
+```
+
+proto3 บังคับให้ทุก enum ต้องมีสมาชิกที่มีค่า zero เพราะ zero value นั้นทำหน้าที่เป็น **ค่า default** ให้กับ field ใด ๆ ของ enum type นั้นที่ไม่เคยถูกตั้งค่าไว้อย่างชัดเจนด้วย — message จาก client รุ่นเก่าที่มีมาก่อน field `status` จะมี หรือ Go zero-value `Order{}` ที่ยังไม่ได้ถูก assign status เลย ทั้งสองแบบจะอ่านค่ากลับมาเป็นสมาชิกตัวที่มีค่า `= 0` ถ้า `ORDER_STATUS_PENDING` เป็น `0` แทน order ที่ deserialize ไม่สำเร็จจริง ๆ หรือแค่ไม่เคยถูกตั้งค่า จะอ่านค่าออกมาเงียบ ๆ ว่า "pending" — แยกไม่ออกจาก order ที่ pending จริงและตั้งใจให้เป็นแบบนั้น การตั้งชื่อ zero value เป็น `_UNSPECIFIED` ทำให้ "สิ่งนี้ไม่เคยถูกตั้งค่า" เป็นสถานะที่มองเห็นได้ชัดเจนและตรวจสอบได้ แทนที่จะเป็นค่า default ที่เงียบและทำให้เข้าใจผิด
+
+### 5. `google.api.http` — annotation ที่ขับเคลื่อน REST gateway
+
+```proto
+rpc GetProduct(GetProductRequest) returns (Product) {
+  option (google.api.http) = { get: "/v1/products/{id}" };
+}
+rpc CreateProduct(CreateProductRequest) returns (Product) {
+  option (google.api.http) = { post: "/v1/products" body: "*" };
+}
+```
+
+แต่ละ `option (google.api.http) = { ... }` ถูกอ่านโดย plugin `grpc-ecosystem/gateway` ([Protobuf Tooling →](/shopmicro/th/setup/proto-tooling/)) เพื่อสร้าง reverse proxy จาก REST ไป gRPC ที่ [API Gateway →](/shopmicro/th/gateway/) จะรัน path template อย่าง `/v1/products/{id}` ผูก path segment `{id}` ตรงเข้ากับ field `id` ของ `GetProductRequest` ด้วยชื่อ — ไม่ต้อง parse มือเลย `post: "/v1/products"` ที่มี `body: "*"` หมายความว่า JSON body ที่ส่งเข้ามาทั้งก้อนถูก unmarshal ลงบนทุก field ของ `CreateProductRequest` ส่วน mapping แบบ `get` ไม่มี `body` เลย เพราะ request `GET` ไม่มี body — input ของมันมาจาก path template และ query parameter ทั้งหมด
+
+### 6. `CreateOrderItem` เทียบกับ `OrderItem` — การแยก message เป็นสองตัวโดยตั้งใจ
+
+```proto
+message OrderItem {
+  string product_id = 1;
+  int32 quantity = 2;
+  int64 unit_price_cents = 3;
+}
+
+message CreateOrderItem {
+  string product_id = 1;
+  int32 quantity = 2;
+}
+```
+
+`CreateOrderItem` — สิ่งที่ client ส่งเข้ามาใน `CreateOrderRequest` — มีแค่ `product_id` กับ `quantity` `OrderItem` — สิ่งที่ส่งกลับมาใน `Order` — เพิ่ม `unit_price_cents` เข้ามา field ที่สามนั้นตั้งใจ **ไม่** ใส่ไว้ใน request message: เซอร์วิส Order (โมดูล 4) จะดึงราคาปัจจุบันของแต่ละ product จากเซอร์วิส Catalog แล้วเติม `unit_price_cents` ให้เองเมื่อ order ถูกวางแล้ว ถ้า `CreateOrderItem` ให้ client ส่ง `unit_price_cents` ของตัวเองมาได้ ก็ไม่มีอะไรหยุด client จากการวาง order ที่ราคาเท่าไหร่ก็ได้ตามใจชอบ — ราคาต้องมาจากแหล่งที่ server เชื่อถือได้ ไม่ใช่จาก client input เลย เป็นหลักการเดียวกับที่บอกว่า field เกี่ยวกับเงินไม่ควรถูกรับมาตรง ๆ จาก request body โดยไม่ตรวจสอบ
+
+## Verify
+
+```bash
+buf lint
+```
+
+การรันคำสั่งนี้กับไฟล์ทั้งสองด้านบนจะแสดง violation สองตัวจาก ruleset `STANDARD` จริง ๆ:
+
+```txt
+catalog.proto:42:3:  "shopmicro.catalog.v1.Product" is used as the request or response type for multiple RPCs.
+catalog.proto:42:46: RPC response type "Product" should be named "GetProductResponse" or "CatalogServiceGetProductResponse".
+catalog.proto:45:3:  "shopmicro.catalog.v1.Product" is used as the request or response type for multiple RPCs.
+catalog.proto:45:52: RPC response type "Product" should be named "CreateProductResponse" or "CatalogServiceCreateProductResponse".
+order.proto:54:3:    "shopmicro.order.v1.Order" is used as the request or response type for multiple RPCs.
+order.proto:54:48:   RPC response type "Order" should be named "CreateOrderResponse" or "OrderServiceCreateOrderResponse".
+order.proto:57:3:    "shopmicro.order.v1.Order" is used as the request or response type for multiple RPCs.
+order.proto:57:42:   RPC response type "Order" should be named "GetOrderResponse" or "OrderServiceGetOrderResponse".
+```
+
+กฎ `RPC_REQUEST_RESPONSE_UNIQUE` และ `RPC_RESPONSE_STANDARD_NAME` ของ `STANDARD` เข้ารหัสข้อกำหนดที่เข้มงวด: ทุก RPC ควรคืน `*Response` wrapper type ที่มีชื่อเฉพาะของตัวเอง คอร์สนี้ตั้งใจไม่ทำตามข้อกำหนดนั้นตรงนี้ — `GetProduct` กับ `CreateProduct` คืนค่า resource `Product` เปล่า ๆ ทั้งคู่ และ `GetOrder`/`CreateOrder` คืนค่า resource `Order` เปล่า ๆ ทั้งคู่ เพราะ REST client ที่เรียกผ่าน gateway คาดหวัง resource จริง ๆ กลับมา ไม่ใช่ envelope type ที่มีอยู่แค่เพื่อทำตามกฎการตั้งชื่อ นี่เป็นสไตล์ที่ชอบธรรมและพบเห็นได้ทั่วไปสำหรับ gRPC API ที่ผู้บริโภคหลักคือ REST client ผ่าน grpc-gateway — แต่วิธีที่ถูกต้องคือประกาศมันอย่างชัดเจนใน `buf.yaml` ไม่ใช่แค่เพิกเฉยต่อ warning:
+
+```yaml
+lint:
+  use:
+    - STANDARD
+  except:
+    - RPC_REQUEST_RESPONSE_UNIQUE
+    - RPC_RESPONSE_STANDARD_NAME
+```
+
+พอตั้งค่านี้แล้ว:
+
+```bash
+buf lint
+```
+
+จะ exit ด้วยรหัส `0` และไม่มี output — workspace สะอาด และข้อยกเว้นทั้งสองตัวถูกบันทึกไว้ในฐานะการตัดสินใจออกแบบที่ตั้งใจ ไม่ใช่ warning ที่ถูกเพิกเฉยแบบเงียบ ๆ
+
+## Recap
+
+`proto/shopmicro/catalog/v1/catalog.proto` และ `proto/shopmicro/order/v1/order.proto` คือ contract แบบ schema-first ที่โมดูลถัดไปทุกตัวถูก generate จาก หรือเขียนขึ้นตรงกับมัน — proto3 syntax, package ที่ versioning ด้วย `v1`, `go_package` ที่ระบุทั้ง path และ alias อย่างชัดเจน, field number ที่รักษา wire format ให้เข้ากันได้ข้าม binary, enum `OrderStatus` ที่สมาชิก `_UNSPECIFIED = 0` ทำให้ "ไม่เคยถูกตั้งค่า" เป็นสถานะที่มองเห็นได้, annotation `google.api.http` ที่จะขับเคลื่อน REST gateway ในโมดูล 5 และการแยก `CreateOrderItem`/`OrderItem` โดยตั้งใจที่กันราคาออกจากมือ client `buf lint` แสดง violation จริง ๆ สองกฎของ `STANDARD` ต่อสไตล์ response type ที่เป็นมิตรกับ REST แบบนี้ — บันทึกไว้อย่างชัดเจนเป็น `except:` ใน `buf.yaml` ไม่ใช่เพิกเฉยแบบเงียบ ๆ ต่อไป [Code Generation →](/shopmicro/th/proto-grpc/codegen/) จะรัน `buf generate` กับไฟล์สองไฟล์นี้เป๊ะ ๆ แล้วพาทัวร์ทุกอย่างที่มันเขียนลงใน `gen/`

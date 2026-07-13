@@ -1,0 +1,138 @@
+---
+title: Code Generation
+description: "Run buf generate against the two proto contracts, tour the resulting gen/ tree, and meet the CatalogServiceServer/CatalogServiceClient interfaces every service and the gateway are built against."
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+The `gen/` tree — real, buildable Go code produced by running `buf generate` (the toolchain [Protobuf Tooling →](/shopmicro/en/setup/proto-tooling/) configured) against the two `.proto` files from [The Contracts →](/shopmicro/en/proto-grpc/contracts/). Nothing in `gen/` is hand-written; every file is a deterministic function of the `.proto` source plus `buf.gen.yaml`'s four plugins.
+
+## Why
+
+Four remote plugins were wired up in `buf.gen.yaml` back in Module 1, each producing a different downstream need from the identical `.proto` input: the Go message types your code will actually import, the gRPC client and server stubs a service implements and calls, the REST-to-gRPC reverse proxy the API Gateway runs, and an OpenAPI document for anyone who wants to browse the REST surface without reading a `.proto` file at all. Running one command against the two contracts from the previous lesson produces all of it, in one deterministic pass, with nothing hand-maintained to fall out of sync.
+
+## Pros & cons
+
+Whether `gen/` itself gets committed to Git is a real, recurring decision every buf-based project has to make — this course commits to one side of it, but both are legitimate.
+
+**Committing generated code**
+
+- **Pros:** a fresh clone builds immediately with `go build ./...` — no buf toolchain, no network access to the BSR needed just to compile; editor tooling (go-to-definition, autocomplete) works the instant the repo is cloned; `git diff` on a `.proto` change shows reviewers exactly what generated code it produced, which can catch an accidental breaking change during review.
+- **Cons:** generated files are large and numerous — a single field rename can touch hundreds of lines spread across `.pb.go`, `_grpc.pb.go`, `.pb.gw.go`, and `.swagger.json`; two unrelated `.proto` changes that happen to touch overlapping generated line ranges produce meaningless, noisy merge conflicts; nothing stops someone from editing a `.proto` and forgetting to regenerate, silently leaving committed `gen/` stale unless CI has an explicit check for it.
+
+**Generating in CI (not committing `gen/`)**
+
+- **Pros:** `gen/` is always in sync with `proto/` by construction — there's no "forgot to regenerate" state to drift into; pull requests only ever show `.proto` diffs, never generated-code noise.
+- **Cons:** every fresh clone and every CI job needs the buf toolchain plus either network access to the BSR or a warmed local plugin cache before it can build at all — a slower first build, and a hard failure if the BSR is ever unreachable.
+
+This course takes the second path: [Repo Layout →](/shopmicro/en/setup/repo-layout/) already `.gitignore`d `/gen/` specifically so it never gets committed — `buf generate` is treated as a required, one-command build step every contributor and every CI job runs before `go build ./...`, exactly like `go mod download`.
+
+## Set it up
+
+### 1. Run `buf generate`
+
+```bash
+buf generate
+```
+
+This reads `buf.gen.yaml`'s `inputs: - directory: proto`, resolves the four remote plugins (cached locally after the first run), and — because `clean: true` is set — wipes `gen/` before writing anything, so deleted or renamed messages never leave stale files behind.
+
+### 2. The resulting `gen/` tree
+
+```txt
+gen/
+└── shopmicro/
+    ├── catalog/
+    │   └── v1/
+    │       ├── catalog.pb.go
+    │       ├── catalog_grpc.pb.go
+    │       ├── catalog.pb.gw.go
+    │       └── catalog.swagger.json
+    └── order/
+        └── v1/
+            ├── order.pb.go
+            ├── order_grpc.pb.go
+            ├── order.pb.gw.go
+            └── order.swagger.json
+```
+
+Four files per `.proto`, one per plugin:
+
+- **`catalog.pb.go`** (`protocolbuffers/go`) — the Go structs for every `message`: `Product`, `ListProductsRequest`, `CreateProductRequest`, and so on, plus `Marshal`/`Unmarshal`/`Reset`/`String` and field getters. This is what every service imports to work with request/response data at all.
+- **`catalog_grpc.pb.go`** (`grpc/go`) — the `CatalogServiceClient` and `CatalogServiceServer` interfaces, `NewCatalogServiceClient`, `RegisterCatalogServiceServer`, and `UnimplementedCatalogServiceServer`.
+- **`catalog.pb.gw.go`** (`grpc-ecosystem/gateway`) — the reverse-proxy registration functions the API Gateway calls, driven entirely by the `google.api.http` annotations from the previous lesson.
+- **`catalog.swagger.json`** (`grpc-ecosystem/openapiv2`) — an OpenAPI v2 document describing the same REST surface, generated with zero hand-written API docs.
+
+### 3. The generated server interface — what a service implements
+
+```go
+type CatalogServiceServer interface {
+	ListProducts(context.Context, *ListProductsRequest) (*ListProductsResponse, error)
+	GetProduct(context.Context, *GetProductRequest) (*Product, error)
+	CreateProduct(context.Context, *CreateProductRequest) (*Product, error)
+	mustEmbedUnimplementedCatalogServiceServer()
+}
+```
+
+The Catalog service (Module 3) implements this interface on a plain struct and embeds `catalogv1.UnimplementedCatalogServiceServer` **by value, not by pointer** — the generated doc comment on that type is explicit about this, since embedding by pointer risks a nil-pointer dereference when a not-yet-implemented method is called. Embedding it also means adding a new RPC to the `.proto` later doesn't break every existing implementation's compilation: unimplemented methods fall through to `UnimplementedCatalogServiceServer`'s version, which returns a `codes.Unimplemented` gRPC error at runtime instead of a compile error. The service then registers itself with:
+
+```go
+catalogv1.RegisterCatalogServiceServer(grpcServer, catalogImpl)
+```
+
+### 4. The generated client — who calls it
+
+```go
+type CatalogServiceClient interface {
+	ListProducts(ctx context.Context, in *ListProductsRequest, opts ...grpc.CallOption) (*ListProductsResponse, error)
+	GetProduct(ctx context.Context, in *GetProductRequest, opts ...grpc.CallOption) (*Product, error)
+	CreateProduct(ctx context.Context, in *CreateProductRequest, opts ...grpc.CallOption) (*Product, error)
+}
+
+func NewCatalogServiceClient(cc grpc.ClientConnInterface) CatalogServiceClient
+```
+
+Two consumers use this: the grpc-gateway reverse proxy in `catalog.pb.gw.go` (via `RegisterCatalogServiceHandlerFromEndpoint`, which dials the Catalog service and wraps it in a `CatalogServiceClient` internally), and any other service that needs to call Catalog directly over gRPC — the Order service (Module 4) looking up a product's current price is exactly that case. That caller dials a connection and constructs the client itself:
+
+```go
+conn, err := grpc.NewClient("catalog:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
+client := catalogv1.NewCatalogServiceClient(conn)
+```
+
+### 5. Importing generated packages from service code
+
+```go
+import (
+	catalogv1 "github.com/avetavos/shopmicro/gen/shopmicro/catalog/v1"
+)
+```
+
+The generated file's actual `package catalogv1` declaration already matches this alias — [The Contracts →](/shopmicro/en/proto-grpc/contracts/) set `go_package`'s `;catalogv1` suffix precisely so the package wouldn't default to `v1` (the import path's last segment) and collide with `order/v1`'s generated package. Writing the alias explicitly in the `import` line is still good practice: the path segment `v1` doesn't visually match the identifier `catalogv1` a reader will see used throughout the file, so spelling it out avoids anyone having to check the generated source to find out what a bare `v1.Product` would even mean.
+
+## Verify
+
+Confirm every expected file exists:
+
+```bash
+find gen -type f | sort
+```
+
+You should see the eight files listed above — four under `gen/shopmicro/catalog/v1/`, four under `gen/shopmicro/order/v1/`. Spot-check the server interface directly:
+
+```bash
+grep -n "CatalogServiceServer interface" gen/shopmicro/catalog/v1/catalog_grpc.pb.go
+```
+
+Then confirm the whole module still compiles — generated code is real Go source, so it's covered by the same `go build ./...` every other lesson in this course verifies with:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+## Recap
+
+`buf generate` turned the two `.proto` contracts into eight files under `gen/`: `.pb.go` (Go message types), `_grpc.pb.go` (`CatalogServiceServer`/`CatalogServiceClient` — the interface a service implements and the interface its callers use), `.pb.gw.go` (the REST-to-gRPC reverse proxy the API Gateway will run), and `.swagger.json` (auto-generated OpenAPI docs) — one set per service. This course keeps `gen/` out of Git and treats `buf generate` as a required build step, trading a slower first build for a tree that's always in sync with `proto/` by construction; committing `gen/` instead is a legitimate alternative when a fast, toolchain-free clone-and-build matters more. Next, [Catalog Service →](/shopmicro/en/catalog-service/) is where `CatalogServiceServer` gets its first real implementation.

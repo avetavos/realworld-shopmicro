@@ -1,0 +1,138 @@
+---
+title: Code Generation
+description: "รัน buf generate กับ proto contract ทั้งสองไฟล์ พาทัวร์ต้นไม้ gen/ ที่ได้ และรู้จัก interface CatalogServiceServer/CatalogServiceClient ที่ทุกเซอร์วิสและ gateway ถูกสร้างขึ้นมาใช้งาน"
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+ต้นไม้ `gen/` — Go code จริงที่ build ได้ ผลิตขึ้นจากการรัน `buf generate` (toolchain ที่ [Protobuf Tooling →](/shopmicro/th/setup/proto-tooling/) ตั้งค่าไว้) กับไฟล์ `.proto` ทั้งสองจาก [The Contracts →](/shopmicro/th/proto-grpc/contracts/) ไม่มีอะไรใน `gen/` ที่เขียนมือ ทุกไฟล์เป็นผลลัพธ์แบบ deterministic ของ `.proto` source บวกกับ plugin ทั้งสี่ตัวใน `buf.gen.yaml`
+
+## Why
+
+Plugin ระยะไกลสี่ตัวถูกต่อสายไว้ใน `buf.gen.yaml` ตั้งแต่โมดูล 1 แต่ละตัวผลิตความต้องการปลายทางที่ต่างกันออกมาจาก `.proto` input เดียวกัน: Go message type ที่โค้ดของคุณจะ import ใช้งานจริง, gRPC client และ server stub ที่เซอร์วิสหนึ่ง implement และเรียกใช้, reverse proxy จาก REST ไป gRPC ที่ API Gateway จะรัน และเอกสาร OpenAPI สำหรับใครก็ตามที่อยากดู REST surface โดยไม่ต้องอ่านไฟล์ `.proto` เลย การรันคำสั่งเดียวกับ contract ทั้งสองจากบทที่แล้วผลิตทุกอย่างนั้นออกมาในครั้งเดียวแบบ deterministic โดยไม่มีอะไรที่ต้องดูแลรักษามือให้ตรงกัน
+
+## Pros & cons
+
+การที่ `gen/` เองจะถูก commit เข้า Git หรือไม่เป็นการตัดสินใจจริงที่เกิดซ้ำในทุกโปรเจกต์ที่ใช้ buf — คอร์สนี้เลือกฝั่งหนึ่ง แต่ทั้งสองฝั่งล้วนชอบธรรม
+
+**Commit generated code เข้า Git**
+
+- **ข้อดี:** clone ใหม่ build ได้ทันทีด้วย `go build ./...` — ไม่ต้องมี buf toolchain ไม่ต้องมี network access ไป BSR แค่เพื่อ compile; เครื่องมือ editor (go-to-definition, autocomplete) ทำงานได้ทันทีที่ clone repo เสร็จ; `git diff` บนการเปลี่ยน `.proto` แสดงให้ reviewer เห็นเป๊ะ ๆ ว่ามัน generate code อะไรออกมา ซึ่งช่วยจับ breaking change ที่เกิดโดยไม่ตั้งใจได้ตอน review
+- **ข้อเสีย:** ไฟล์ที่ generate ใหญ่และเยอะ — การเปลี่ยนชื่อ field เดียวอาจกระทบหลายร้อยบรรทัดกระจายอยู่ใน `.pb.go`, `_grpc.pb.go`, `.pb.gw.go` และ `.swagger.json`; การเปลี่ยน `.proto` สองอย่างที่ไม่เกี่ยวข้องกันแต่บังเอิญไปแตะช่วงบรรทัด generated code ที่ทับกัน ทำให้เกิด merge conflict ที่ไร้ความหมายและน่ารำคาญ; ไม่มีอะไรหยุดใครก็ตามจากการแก้ `.proto` แล้วลืม regenerate ทำให้ `gen/` ที่ commit ไว้ค้างเก่าแบบเงียบ ๆ นอกจาก CI จะมี check ที่ตรวจเรื่องนี้ตรง ๆ
+
+**Generate ใน CI (ไม่ commit `gen/`)**
+
+- **ข้อดี:** `gen/` sync กับ `proto/` เสมอโดยธรรมชาติของโครงสร้าง — ไม่มีสถานะ "ลืม regenerate" ให้เบี่ยงเบนไปได้; pull request แสดงแค่ diff ของ `.proto` เท่านั้น ไม่มี noise จาก generated code เลย
+- **ข้อเสีย:** ทุก clone ใหม่และทุก CI job ต้องมี buf toolchain บวกกับ network access ไป BSR หรือ local plugin cache ที่ warm ไว้แล้ว ก่อนที่มันจะ build ได้เลย — build ครั้งแรกช้าลง และล้มเหลวทันทีถ้า BSR เข้าไม่ถึง
+
+คอร์สนี้เลือกทางที่สอง: [Repo Layout →](/shopmicro/th/setup/repo-layout/) `.gitignore` `/gen/` ไว้ตั้งแต่แรกโดยตั้งใจ เพื่อไม่ให้มันถูก commit เลย — `buf generate` ถูกปฏิบัติเป็นขั้นตอน build ที่จำเป็นและเป็นคำสั่งเดียว ที่ผู้ร่วมพัฒนาทุกคนและ CI job ทุกตัวต้องรันก่อน `go build ./...` เหมือนกับ `go mod download` เป๊ะ ๆ
+
+## Set it up
+
+### 1. รัน `buf generate`
+
+```bash
+buf generate
+```
+
+คำสั่งนี้อ่าน `inputs: - directory: proto` ของ `buf.gen.yaml` resolve plugin ระยะไกลทั้งสี่ตัว (cache ไว้ในเครื่องหลังรันครั้งแรก) และเพราะตั้ง `clean: true` ไว้ มันจะล้าง `gen/` ก่อนเขียนอะไรลงไป เพื่อไม่ให้ message ที่ถูกลบหรือเปลี่ยนชื่อทิ้งไฟล์เก่าค้างไว้
+
+### 2. ต้นไม้ `gen/` ที่ได้
+
+```txt
+gen/
+└── shopmicro/
+    ├── catalog/
+    │   └── v1/
+    │       ├── catalog.pb.go
+    │       ├── catalog_grpc.pb.go
+    │       ├── catalog.pb.gw.go
+    │       └── catalog.swagger.json
+    └── order/
+        └── v1/
+            ├── order.pb.go
+            ├── order_grpc.pb.go
+            ├── order.pb.gw.go
+            └── order.swagger.json
+```
+
+สี่ไฟล์ต่อ `.proto` หนึ่งไฟล์ต่อ plugin หนึ่งตัว:
+
+- **`catalog.pb.go`** (`protocolbuffers/go`) — Go struct สำหรับทุก `message`: `Product`, `ListProductsRequest`, `CreateProductRequest` และอื่น ๆ พร้อม `Marshal`/`Unmarshal`/`Reset`/`String` และ field getter นี่คือสิ่งที่ทุกเซอร์วิส import มาใช้ทำงานกับข้อมูล request/response เลย
+- **`catalog_grpc.pb.go`** (`grpc/go`) — interface `CatalogServiceClient` และ `CatalogServiceServer`, `NewCatalogServiceClient`, `RegisterCatalogServiceServer` และ `UnimplementedCatalogServiceServer`
+- **`catalog.pb.gw.go`** (`grpc-ecosystem/gateway`) — ฟังก์ชัน register reverse-proxy ที่ API Gateway เรียกใช้ ขับเคลื่อนทั้งหมดด้วย annotation `google.api.http` จากบทที่แล้ว
+- **`catalog.swagger.json`** (`grpc-ecosystem/openapiv2`) — เอกสาร OpenAPI v2 ที่อธิบาย REST surface เดียวกัน generate ออกมาโดยไม่มีเอกสาร API ที่เขียนมือเลย
+
+### 3. Server interface ที่ generate — สิ่งที่เซอร์วิส implement
+
+```go
+type CatalogServiceServer interface {
+	ListProducts(context.Context, *ListProductsRequest) (*ListProductsResponse, error)
+	GetProduct(context.Context, *GetProductRequest) (*Product, error)
+	CreateProduct(context.Context, *CreateProductRequest) (*Product, error)
+	mustEmbedUnimplementedCatalogServiceServer()
+}
+```
+
+เซอร์วิส Catalog (โมดูล 3) implement interface นี้บน struct ธรรมดา และ embed `catalogv1.UnimplementedCatalogServiceServer` **แบบ by value ไม่ใช่ by pointer** — doc comment ที่ generate มาบน type นั้นชัดเจนเรื่องนี้ เพราะ embed แบบ pointer เสี่ยงต่อ nil-pointer dereference เมื่อ method ที่ยังไม่ได้ implement ถูกเรียก การ embed นี้ยังหมายความว่าการเพิ่ม RPC ใหม่เข้า `.proto` ในภายหลังจะไม่ทำให้การ compile ของ implementation ที่มีอยู่เดิมพังไปทั้งหมด: method ที่ยังไม่ implement จะ fall through ไปที่เวอร์ชันของ `UnimplementedCatalogServiceServer` ซึ่งคืน gRPC error `codes.Unimplemented` ตอน runtime แทนที่จะเป็น compile error จากนั้นเซอร์วิสจะลงทะเบียนตัวเองด้วย:
+
+```go
+catalogv1.RegisterCatalogServiceServer(grpcServer, catalogImpl)
+```
+
+### 4. Client ที่ generate — ใครเป็นคนเรียกใช้
+
+```go
+type CatalogServiceClient interface {
+	ListProducts(ctx context.Context, in *ListProductsRequest, opts ...grpc.CallOption) (*ListProductsResponse, error)
+	GetProduct(ctx context.Context, in *GetProductRequest, opts ...grpc.CallOption) (*Product, error)
+	CreateProduct(ctx context.Context, in *CreateProductRequest, opts ...grpc.CallOption) (*Product, error)
+}
+
+func NewCatalogServiceClient(cc grpc.ClientConnInterface) CatalogServiceClient
+```
+
+มีสองฝ่ายที่ใช้ตัวนี้: reverse proxy ของ grpc-gateway ใน `catalog.pb.gw.go` (ผ่าน `RegisterCatalogServiceHandlerFromEndpoint` ซึ่ง dial ไปหาเซอร์วิส Catalog แล้วห่อมันด้วย `CatalogServiceClient` ให้เองภายใน) และเซอร์วิสอื่นใด ๆ ที่ต้องเรียก Catalog ตรง ๆ ผ่าน gRPC — เซอร์วิส Order (โมดูล 4) ที่ต้องดึงราคาปัจจุบันของ product คือกรณีนี้เป๊ะ ๆ ผู้เรียกนั้น dial connection แล้วสร้าง client เองแบบนี้:
+
+```go
+conn, err := grpc.NewClient("catalog:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
+client := catalogv1.NewCatalogServiceClient(conn)
+```
+
+### 5. Import generated package จากโค้ดของเซอร์วิส
+
+```go
+import (
+	catalogv1 "github.com/avetavos/shopmicro/gen/shopmicro/catalog/v1"
+)
+```
+
+`package catalogv1` ที่ประกาศไว้จริงในไฟล์ที่ generate ตรงกับ alias นี้อยู่แล้ว — [The Contracts →](/shopmicro/th/proto-grpc/contracts/) ตั้ง suffix `;catalogv1` ของ `go_package` ไว้ก็เพื่อไม่ให้ package default ไปเป็น `v1` (segment สุดท้ายของ import path) แล้วชนกับ generated package ของ `order/v1` การเขียน alias ชัดเจนไว้ในบรรทัด `import` ก็ยังเป็น practice ที่ดี: segment ของ path คือ `v1` ซึ่งไม่ตรงกับตัว identifier `catalogv1` ที่ผู้อ่านจะเห็นถูกใช้ตลอดทั้งไฟล์ การสะกดมันออกมาชัด ๆ ช่วยไม่ให้ใครต้องไปเช็ค generated source เพื่อรู้ว่า `v1.Product` เปล่า ๆ หมายถึงอะไรกันแน่
+
+## Verify
+
+ยืนยันว่าไฟล์ที่คาดหวังทุกไฟล์มีอยู่จริง:
+
+```bash
+find gen -type f | sort
+```
+
+คุณควรเห็นแปดไฟล์ตามที่ระบุไว้ด้านบน — สี่ไฟล์ใต้ `gen/shopmicro/catalog/v1/` สี่ไฟล์ใต้ `gen/shopmicro/order/v1/` ตรวจสอบ server interface ตรง ๆ:
+
+```bash
+grep -n "CatalogServiceServer interface" gen/shopmicro/catalog/v1/catalog_grpc.pb.go
+```
+
+จากนั้นยืนยันว่าทั้ง module ยัง compile ได้ — generated code เป็น Go source จริง จึงถูกครอบคลุมด้วย `go build ./...` เดียวกันกับที่ทุกบทในคอร์สนี้ใช้ยืนยัน:
+
+```bash
+go build ./...
+```
+
+ไม่มี output แปลว่าสำเร็จ
+
+## Recap
+
+`buf generate` เปลี่ยน contract `.proto` ทั้งสองให้กลายเป็นแปดไฟล์ใต้ `gen/`: `.pb.go` (Go message type), `_grpc.pb.go` (`CatalogServiceServer`/`CatalogServiceClient` — interface ที่เซอร์วิส implement กับ interface ที่ผู้เรียกมันใช้), `.pb.gw.go` (reverse proxy จาก REST ไป gRPC ที่ API Gateway จะรัน) และ `.swagger.json` (เอกสาร OpenAPI ที่ generate อัตโนมัติ) — หนึ่งชุดต่อเซอร์วิส คอร์สนี้เก็บ `gen/` ไว้นอก Git และปฏิบัติ `buf generate` เป็นขั้นตอน build ที่จำเป็น แลก build ครั้งแรกที่ช้าลงกับต้นไม้ที่ sync กับ `proto/` เสมอโดยธรรมชาติของโครงสร้าง การ commit `gen/` แทนก็เป็นทางเลือกที่ชอบธรรมเมื่อการ clone-and-build ที่เร็วและไม่ต้องมี toolchain สำคัญกว่า ต่อไป [Catalog Service →](/shopmicro/th/catalog-service/) คือที่ที่ `CatalogServiceServer` จะได้ implementation จริงตัวแรกของมัน
