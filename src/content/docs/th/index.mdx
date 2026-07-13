@@ -1,5 +1,87 @@
 ---
 title: ShopMicro
+description: คอร์สเรียนแบบลงมือทำจริง สองภาษา ที่คุณจะได้สร้าง ShopMicro ระบบ e-commerce แบบ microservices ที่ขับเคลื่อนด้วย event ด้วยภาษา Go พร้อม gRPC, grpc-gateway, Kafka, RabbitMQ, PostgreSQL, order saga และการ deploy ขึ้น Kubernetes ด้วย Helm
+template: splash
+hero:
+  tagline: สร้าง ShopMicro ระบบ e-commerce แบบ microservices ที่ขับเคลื่อนด้วย event ด้วยภาษา Go ทั้งห้าเซอร์วิสคุยกันแบบ synchronous ผ่าน gRPC (พร้อม REST ผ่าน grpc-gateway) และแบบ asynchronous ผ่าน Kafka และ RabbitMQ มี PostgreSQL แยกต่อเซอร์วิส order saga บน outbox pattern และ deploy ขึ้น Kubernetes ด้วย Helm
+  actions:
+    - text: เริ่มที่นี่
+      link: /shopmicro/th/introduction/
+      icon: right-arrow
+      variant: primary
+    - text: ข้ามไปที่ Order Saga
+      link: /shopmicro/th/saga/
+      icon: rocket
 ---
 
-นี่คือหน้าแรกชั่วคราวสำหรับคู่มือโปรเจกต์จริง ShopMicro
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## สิ่งที่คุณจะได้สร้าง
+
+<CardGrid>
+  <Card title="Introduction" icon="open-book">
+    รู้จัก ShopMicro ว่าทำไมต้องสร้าง คอร์สนี้จัดโครงสร้างยังไง และสุดท้ายคุณจะได้อะไร [เปิดดู →](/shopmicro/th/introduction/)
+  </Card>
+  <Card title="Setup & Tooling" icon="setting">
+    ติดตั้ง Go, Docker และเครื่องมือที่เหลือ พร้อมวางโครงสร้าง monorepo [เปิดดู →](/shopmicro/th/setup/)
+  </Card>
+  <Card title="Protobuf & gRPC" icon="puzzle">
+    นิยาม contract ของเซอร์วิสด้วย Protobuf และ generate gRPC stub ของ Go [เปิดดู →](/shopmicro/th/proto-grpc/)
+  </Card>
+  <Card title="Catalog Service" icon="list-format">
+    สร้าง gRPC server ของ Catalog ที่มี PostgreSQL เป็นฐานข้อมูลของตัวเอง [เปิดดู →](/shopmicro/th/catalog-service/)
+  </Card>
+  <Card title="Order Service" icon="list-format">
+    สร้าง gRPC server ของ Order ที่สร้างคำสั่งซื้อและส่ง event ออกมา [เปิดดู →](/shopmicro/th/order-service/)
+  </Card>
+  <Card title="API Gateway" icon="server">
+    เปิดเซอร์วิสให้เป็น REST ผ่าน grpc-gateway ภายใต้จุดเข้าเดียว [เปิดดู →](/shopmicro/th/gateway/)
+  </Card>
+  <Card title="Kafka (Event Stream)" icon="random">
+    ส่งและรับ event log ที่ replay ได้ ด้วย producer และ consumer ของ Kafka [เปิดดู →](/shopmicro/th/kafka/)
+  </Card>
+  <Card title="RabbitMQ (Work Queues)" icon="bars">
+    ส่งงานผ่าน exchange และ queue ของ RabbitMQ เพื่อประมวลผลแบบ asynchronous [เปิดดู →](/shopmicro/th/rabbitmq/)
+  </Card>
+  <Card title="Payment Service" icon="approve-check">
+    รับ order event และประมวลผลการชำระเงินในเซอร์วิสเฉพาะทาง [เปิดดู →](/shopmicro/th/payment-service/)
+  </Card>
+  <Card title="Order Saga" icon="random">
+    ประสานงานคำสั่งซื้อที่ข้ามหลายเซอร์วิสด้วย saga และ outbox pattern [เปิดดู →](/shopmicro/th/saga/)
+  </Card>
+  <Card title="Notification Service" icon="comment-alt">
+    ตอบสนองต่อ domain event และแจ้งเตือนลูกค้าจาก consumer ที่แยกออกมา [เปิดดู →](/shopmicro/th/notification-service/)
+  </Card>
+  <Card title="Resilience" icon="warning">
+    เพิ่ม timeout, retry และ backoff เพื่อให้ระบบทนต่อความล้มเหลวบางส่วนได้ [เปิดดู →](/shopmicro/th/resilience/)
+  </Card>
+  <Card title="Testing" icon="approve-check">
+    คลุมทุกเซอร์วิสด้วย table-driven unit test และ integration test [เปิดดู →](/shopmicro/th/testing/)
+  </Card>
+  <Card title="Docker & Compose" icon="server">
+    ทำ container ให้ทุกเซอร์วิส และรันทั้งสแตกด้วยคำสั่งเดียว [เปิดดู →](/shopmicro/th/docker/)
+  </Card>
+  <Card title="Kubernetes (Helm)" icon="cloud-download">
+    แพ็กและ deploy ทั้งระบบขึ้น Kubernetes ด้วย Helm chart [เปิดดู →](/shopmicro/th/kubernetes/)
+  </Card>
+  <Card title="Wrap-up" icon="star">
+    ทบทวนสิ่งที่คุณสร้างมา และก้าวต่อไปของ ShopMicro [เปิดดู →](/shopmicro/th/wrap-up/)
+  </Card>
+</CardGrid>
+
+## คู่มือนี้ทำงานยังไง
+
+<CardGrid>
+  <Card title="Real, copy-pasteable code" icon="code-branch">
+    ทุกโค้ดในคอร์สนี้เป็นโค้ด Go จริงที่รันได้ คัดลอกไปใช้ในโปรเจกต์ของคุณได้เลย ไม่มี pseudo-code
+  </Card>
+  <Card title="Adapts the Learn Hub courses" icon="laptop">
+    ต่อยอดจากแพทเทิร์นของคอร์ส Go และ microservices ใน Learn Hub มาประยุกต์ใช้กับโปรเจกต์จริงแบบครบวงจร
+  </Card>
+  <Card title="Bilingual EN / ไทย" icon="translate">
+    มีทั้งภาษาอังกฤษและไทย สลับได้ตลอดจากแถบด้านบน
+  </Card>
+  <Card title="You build it by following along" icon="rocket">
+    นี่คือคอร์สแบบลงมือทำ คุณจะได้เขียนโค้ดเองทีละขั้นตอน ไม่ใช่แค่อ่านผ่าน ๆ
+  </Card>
+</CardGrid>

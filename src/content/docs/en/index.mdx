@@ -1,5 +1,87 @@
 ---
 title: ShopMicro
+description: A hands-on, bilingual course where you build ShopMicro, an event-driven e-commerce microservices system in Go with gRPC, grpc-gateway, Kafka, RabbitMQ, PostgreSQL, an order saga, and a Helm-packaged Kubernetes deploy.
+template: splash
+hero:
+  tagline: Build ShopMicro, an event-driven e-commerce microservices system in Go. Five services talk synchronously over gRPC (plus grpc-gateway REST) and asynchronously via Kafka and RabbitMQ, with PostgreSQL per service, an order saga on the outbox pattern, and a Helm-packaged Kubernetes deploy.
+  actions:
+    - text: Start here
+      link: /shopmicro/en/introduction/
+      icon: right-arrow
+      variant: primary
+    - text: Jump to the Order Saga
+      link: /shopmicro/en/saga/
+      icon: rocket
 ---
 
-This is a placeholder landing page for the ShopMicro real-world project guide.
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## What you'll build
+
+<CardGrid>
+  <Card title="Introduction" icon="open-book">
+    Why ShopMicro, how the course is structured, and what you'll have built by the end. [Open →](/shopmicro/en/introduction/)
+  </Card>
+  <Card title="Setup & Tooling" icon="setting">
+    Install Go, Docker, and the rest of the toolchain, and lay out the monorepo. [Open →](/shopmicro/en/setup/)
+  </Card>
+  <Card title="Protobuf & gRPC" icon="puzzle">
+    Define service contracts in Protobuf and generate Go gRPC stubs. [Open →](/shopmicro/en/proto-grpc/)
+  </Card>
+  <Card title="Catalog Service" icon="list-format">
+    Build the Catalog gRPC server backed by its own PostgreSQL database. [Open →](/shopmicro/en/catalog-service/)
+  </Card>
+  <Card title="Order Service" icon="list-format">
+    Build the Order gRPC server that places orders and emits events. [Open →](/shopmicro/en/order-service/)
+  </Card>
+  <Card title="API Gateway" icon="server">
+    Expose the services as REST through grpc-gateway behind one entry point. [Open →](/shopmicro/en/gateway/)
+  </Card>
+  <Card title="Kafka (Event Stream)" icon="random">
+    Publish and consume a replayable event log with Kafka producers and consumers. [Open →](/shopmicro/en/kafka/)
+  </Card>
+  <Card title="RabbitMQ (Work Queues)" icon="bars">
+    Route work through RabbitMQ exchanges and queues for asynchronous processing. [Open →](/shopmicro/en/rabbitmq/)
+  </Card>
+  <Card title="Payment Service" icon="approve-check">
+    Consume order events and process payments in a dedicated service. [Open →](/shopmicro/en/payment-service/)
+  </Card>
+  <Card title="Order Saga" icon="random">
+    Coordinate the multi-service order flow with a saga and the outbox pattern. [Open →](/shopmicro/en/saga/)
+  </Card>
+  <Card title="Notification Service" icon="comment-alt">
+    React to domain events and notify customers from a standalone consumer. [Open →](/shopmicro/en/notification-service/)
+  </Card>
+  <Card title="Resilience" icon="warning">
+    Add timeouts, retries, and backoff so the system survives partial failure. [Open →](/shopmicro/en/resilience/)
+  </Card>
+  <Card title="Testing" icon="approve-check">
+    Cover the services with table-driven unit tests and integration tests. [Open →](/shopmicro/en/testing/)
+  </Card>
+  <Card title="Docker & Compose" icon="server">
+    Containerize every service and bring the whole stack up with one command. [Open →](/shopmicro/en/docker/)
+  </Card>
+  <Card title="Kubernetes (Helm)" icon="cloud-download">
+    Package and deploy the whole system to Kubernetes with a Helm chart. [Open →](/shopmicro/en/kubernetes/)
+  </Card>
+  <Card title="Wrap-up" icon="star">
+    Review what you built and where to take ShopMicro next. [Open →](/shopmicro/en/wrap-up/)
+  </Card>
+</CardGrid>
+
+## How this guide works
+
+<CardGrid>
+  <Card title="Real, copy-pasteable code" icon="code-branch">
+    Every snippet is real, runnable Go code you can copy straight into your project — no pseudo-code.
+  </Card>
+  <Card title="Adapts the Learn Hub courses" icon="laptop">
+    Built on patterns from the Learn Hub Go and microservices courses, applied to one real project end to end.
+  </Card>
+  <Card title="Bilingual EN / ไทย" icon="translate">
+    Available in English and ไทย — switch anytime from the top bar.
+  </Card>
+  <Card title="You build it by following along" icon="rocket">
+    This is a build-along guide: you write the code yourself, step by step, not just read about it.
+  </Card>
+</CardGrid>

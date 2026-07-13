@@ -1,0 +1,17 @@
+---
+title: Introduction
+description: "What ShopMicro is, the event-driven microservices architecture you'll build, the prerequisites to install, and the roadmap of the wider Real-World Projects series."
+sidebar:
+  order: 0
+---
+
+Welcome. In this course you build **ShopMicro**, an event-driven e-commerce microservices system in Go, from an empty repo to a Helm-packaged Kubernetes deploy. Five services — API Gateway, Catalog, Order, Payment, and Notification — talk synchronously over gRPC (plus grpc-gateway REST) and asynchronously via Kafka and RabbitMQ, each with its own PostgreSQL database, tied together by an order saga built on the outbox pattern.
+
+## In this module
+
+- [Overview](/shopmicro/en/introduction/overview/) — what ShopMicro is, the feature list, and the map from each module to the Learn Hub course it adapts.
+- [Architecture](/shopmicro/en/introduction/architecture/) — the system design, the synchronous and event-driven paths, and why each part of the stack was chosen.
+- [Prerequisites](/shopmicro/en/introduction/prerequisites/) — the tools to install on macOS, with verification commands.
+- [Roadmap](/shopmicro/en/introduction/roadmap/) — the Real-World Projects series and where ShopMicro fits.
+
+Start with the [Overview →](/shopmicro/en/introduction/overview/)
