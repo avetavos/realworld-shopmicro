@@ -1,0 +1,138 @@
+---
+title: Topics, Partitions & Consumer Groups
+description: "The concepts Producer & Consumer used without naming — topics vs partitions, why messages are keyed by aggregate_id, what a consumer group actually is, offsets and at-least-once vs at-most-once, and creating/inspecting topics with kafka-topics.sh."
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+No new code — [Producer & Consumer →](/shopmicro/en/kafka/producer-consumer/) already wrote a working `Publisher` and `Consumer` and used four Kafka concepts without explaining any of them: **partitions**, **keys**, **consumer groups**, and **offsets**. This lesson names each one, then creates and inspects the `orders` and `payments` topics explicitly with `kafka-topics.sh`, instead of leaning on `AllowAutoTopicCreation` the way the previous lesson's demo did.
+
+## Why
+
+A Kafka **topic** is a named stream — `orders`, `payments` — but a topic is not itself an ordered log; it's a set of one or more **partitions**, and each partition *is* an ordered, append-only log. Kafka's ordering guarantee is scoped to a single partition: messages within one partition are strictly ordered, but there is no ordering guarantee at all *across* partitions of the same topic. That single fact is why `Publisher.Publish` takes a `key` — `&kafka.Hash{}` hashes that key to pick a partition, and messages sharing a key always land on the same one. [The Transactional Outbox →](/shopmicro/en/order-service/outbox/) already named the consequence: keying every event by `aggregate_id` (an order's own id) means every event about the same order — `order.created`, then later `order.confirmed` or `order.cancelled` — lands on the same partition and is therefore guaranteed to arrive at a consumer in the order it happened. Events about *different* orders can land on different partitions and offer no ordering guarantee relative to each other — and that's fine, because nothing in this system depends on cross-order ordering, only per-order ordering.
+
+A **consumer group** is the unit Kafka uses to track "how far has this group of consumers read." Every `Consumer` in this course is constructed with a `groupID`, and that `groupID` is the whole answer to "does this service see every message, or does it split the work with some other service?" Two consumers with the **same** `groupID` split a topic's partitions between them — each partition is owned by exactly one member of the group at a time, so adding more consumers (up to the partition count) increases throughput, not coverage. Two consumers with **different** `groupID`s each get their *own* complete, independent read of the topic — every message, regardless of what the other group has already consumed. That's why every service in this system uses its own `groupID` (its service name is enough): Payment and Notification both need to see every `order.created` event, and they only can if they're in separate consumer groups. Within a single service, running more instances that share one `groupID` is exactly how you scale that service's consumption horizontally.
+
+An **offset** is a per-partition, per-group cursor — "the next message this group hasn't read yet, in this partition." `CommitMessages` in [Producer & Consumer →](/shopmicro/en/kafka/producer-consumer/) advances that cursor. Crucially, committing an offset does not delete the message — Kafka's log keeps every message for its configured retention period (or forever, with infinite retention) regardless of who has read it or how many times. That's **replayability**, and it's the single biggest thing that separates Kafka from a traditional message queue like [RabbitMQ →](/shopmicro/en/rabbitmq/) (Module 7): a queue typically removes a message once it's acknowledged, so there is nothing left to replay. A Kafka consumer group can have its offset reset backward — deliberately or by creating a brand-new group that starts at the beginning of the log — and read the entire history again from scratch. A new service joining this system months from now could create a new consumer group on `orders` and rebuild its own view of every order ever created, entirely from the log, without a single API call to any other service.
+
+## Pros & cons
+
+**More partitions per topic** vs. **fewer partitions**
+
+- **Pros:** more partitions means more independent units of parallelism — up to the partition count, adding consumers to a group increases real throughput, since each consumer owns a disjoint subset of partitions.
+- **Cons:** ordering is only ever guaranteed *within* a partition, so more partitions means more separate "ordering domains" to reason about, not one global order; and partition count is expensive to change after the fact — increasing it later can change which partition a given key hashes to, silently breaking the "same key always lands on the same partition" guarantee for keys already in flight.
+
+**A separate consumer group per service** vs. **one shared consumer group across every service**
+
+- **Pros:** every service is guaranteed a complete, independent view of the topic, which is exactly the requirement — Payment and Notification must both see every `order.created` event, not split them between each other.
+- **Cons:** N services now means N independent read positions to monitor for lag; a shared group would be simpler to observe as a single unit, but it would also be *wrong* here — a shared group hands each message to only **one** member, so Payment and Notification would each silently receive only half the events, a correctness bug that a naive "just give both services the same `groupID`" mistake would introduce immediately.
+
+## Set it up
+
+Create both topics explicitly, with three partitions each — enough to see partition-level behavior without any real load:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create \
+  --topic orders --partitions 3 --replication-factor 1
+
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create \
+  --topic payments --partitions 3 --replication-factor 1
+```
+
+```txt
+Created topic orders.
+Created topic payments.
+```
+
+Inspect a topic's partition layout:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --describe --topic orders
+```
+
+```txt
+Topic: orders	TopicId: ...	PartitionCount: 3	ReplicationFactor: 1	Configs:
+	Topic: orders	Partition: 0	Leader: 1	Replicas: 1	Isr: 1
+	Topic: orders	Partition: 1	Leader: 1	Replicas: 1	Isr: 1
+	Topic: orders	Partition: 2	Leader: 1	Replicas: 1	Isr: 1
+```
+
+`ReplicationFactor: 1` is a single-node-broker-only setting — [Infra & Compose →](/shopmicro/en/setup/infra-compose/) already noted this KRaft container is not a production cluster; real Kafka would use a replication factor of 3 across separate brokers so a single node failure doesn't lose data.
+
+## Verify
+
+List consumer groups after running [Producer & Consumer →](/shopmicro/en/kafka/producer-consumer/)'s demo consumer at least once:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --list
+```
+
+```txt
+kafkademo
+```
+
+Describe that group to see its current offset per partition, and its lag (how many messages remain unread):
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe --group kafkademo
+```
+
+```txt
+GROUP      TOPIC   PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+kafkademo  orders  0          0               0               0
+kafkademo  orders  1          1               1               0
+kafkademo  orders  2          0               0               0
+```
+
+`LAG: 0` on every partition means the group has read everything currently in the log. Now see replayability directly: stop the consumer (`Ctrl-C`, if it's still running), then reset the group's offset back to the beginning of the log —
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --group kafkademo --topic orders \
+  --reset-offsets --to-earliest --execute
+```
+
+```txt
+GROUP      TOPIC   PARTITION  NEW-OFFSET
+kafkademo  orders  0          0
+kafkademo  orders  1          0
+kafkademo  orders  2          0
+```
+
+— and run the consumer again:
+
+```bash
+go run ./cmd/kafkademo/consume
+```
+
+```txt
+consumed: id=demo-1 type=order.created aggregate_id=order-abc payload={"order_id":"order-abc","total_cents":2598}
+```
+
+The same event, consumed a second time, with no new publish — nothing was deleted by the first read. That's the log, not a queue.
+
+Then confirm the module still builds:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+Check your understanding:
+
+- If two services both need to see every `order.created` event, why must they use different `groupID`s rather than sharing one?
+- Why does keying every event by `aggregate_id` guarantee per-order ordering, but not ordering across different orders?
+- What does `LAG: 0` on a partition mean, and what would a growing `LAG` over time indicate about that consumer group?
+- After a message has been consumed and its offset committed, why is it still possible to read that same message again later?
+
+## Recap
+
+A topic is a set of ordered-log **partitions**, and Kafka only guarantees ordering *within* a partition — never across them — which is why `Publisher.Publish`'s `key` argument matters: `&kafka.Hash{}` sends messages with the same key to the same partition, and keying by `aggregate_id` is what gives every order's events guaranteed per-order ordering. A **consumer group** (`groupID`) is the unit of both scaling and isolation: members of the *same* group split a topic's partitions to parallelize work, while *different* groups each get an independent, complete copy of the stream — which is exactly why every service in this system runs its own group. An **offset** is a per-partition, per-group read cursor, and committing it never deletes the underlying message — Kafka retains the log regardless of what's been read, which is **replayability**: a new consumer group can always start from the beginning and rebuild its view of history from scratch, something a traditional queue like [RabbitMQ →](/shopmicro/en/rabbitmq/) generally can't offer once a message is acknowledged and gone. `kafka-topics.sh --create`/`--describe` and `kafka-consumer-groups.sh --list`/`--describe`/`--reset-offsets` are the operational tools for inspecting and manipulating exactly these concepts directly against the broker. Next, [Outbox & Relay →](/shopmicro/en/kafka/outbox-relay/) puts all of this to work for real: the relay that drains Module 4's `outbox` table and finally closes the transactional outbox pattern.

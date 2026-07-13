@@ -1,0 +1,356 @@
+---
+title: Outbox & Relay
+description: "services/order/internal/outbox/relay.go — ตัวที่ poll outbox row ที่ยังไม่ publish แล้วส่งไป Kafka topic orders แล้ว mark ว่า publish แล้ว ต่อเป็น goroutine ใน main.go ของ order ปิด transactional outbox pattern: DB transaction บวก relay ให้ at-least-once publish ที่เชื่อถือได้โดยไม่ต้องมี distributed transaction"
+sidebar:
+  order: 3
+---
+
+## What we're building
+
+`services/order/internal/outbox/relay.go` — `Relay` ที่ poll ตาราง `outbox` หาแถวที่ยังไม่มีอะไร publish publish แต่ละแถวไป Kafka topic `orders` ผ่าน `Publisher` ของ [Producer & Consumer →](/shopmicro/th/kafka/producer-consumer/) แล้ว mark แถวนั้นว่า publish แล้วเมื่อ Kafka ยืนยันการเขียนสำเร็จ จากนั้นเปลี่ยนแปลงเล็ก ๆ ที่ `services/order/cmd/main.go`: สร้าง `Publisher` กับ `Relay` แล้วเริ่มมันเป็น goroutine เบื้องหลังควบคู่ไปกับ gRPC server
+
+นี่คือส่วนที่ [The Transactional Outbox →](/shopmicro/th/order-service/outbox/) ระบุชื่อไว้แต่ยังไม่ได้สร้าง: `OrderRepo.Create` กับ `OrderRepo.UpdateStatus` (Module 4) เขียน `outbox` row ที่ถูกต้องและเป็นอะตอมิกมาตั้งแต่คำสั่งซื้อแรกเกิดขึ้นแล้ว — ทุกแถวแค่นั่งรออยู่ตรงนั้นด้วย `published_at` ที่ยังเป็น `null` เพราะยังไม่มีอะไรมาอ่านตารางนี้เลย หลังจากบทนี้ มีแล้ว นั่นคือ pattern ทั้งหมด ปิดสมบูรณ์ในที่สุด: database transaction เขียนข้อเท็จจริงว่า event ควรจะเกิดขึ้น แล้ว process แยกต่างหากโดยสิ้นเชิง — relay ตัวนี้ — ทำให้มันเกิดขึ้นจริง ตามตารางเวลาของตัวเอง โดยไม่มีฝั่งไหนต้องการให้อีกฝั่งขึ้นอยู่ในเวลาเดียวกันเลย
+
+## Why
+
+ทวนปัญหาที่บทนี้แก้อย่างรวดเร็วในประโยคเดียว: ไม่มีทางเขียนคำสั่งซื้อลง PostgreSQL แล้ว publish `order.created` ไป Kafka พร้อมกันแบบอะตอมิกได้ ดังนั้น [The Transactional Outbox →](/shopmicro/th/order-service/outbox/) เลือกเขียนแค่ลง PostgreSQL — คำสั่งซื้อ รายการสินค้าของมัน และ `outbox` row ที่อธิบาย event — แล้วเลื่อนการ publish ไปเป็น process แยกต่างหาก บทนี้*คือ*process แยกนั้น `Relay.Run` poll ด้วย `time.Ticker` และแต่ละ tick เรียก `drain` ซึ่งรัน query เดียวกับที่บทเรื่อง outbox แสดงไว้ล่วงหน้าเป๊ะ ๆ: `select ... from outbox where published_at is null order by created_at limit 100` — partial index เดียวกับที่สร้างไว้ตั้งแต่ตอนนั้น (`create index on outbox (published_at) where published_at is null`) คือสิ่งที่ทำให้ query นี้ยังเร็วอยู่ไม่ว่าจะมีแถวที่ publish แล้วสะสมมากแค่ไหน
+
+Polling คือทางเลือกที่ตั้งใจและเรียบง่าย เหนือกว่าอะไรที่ reactive อย่าง Postgres `LISTEN`/`NOTIFY` หรือเครื่องมือ change-data-capture (Debezium อ่าน write-ahead log): มันต้องการ infrastructure ใหม่เป็นศูนย์นอกเหนือจาก database กับ Kafka client ที่เซอร์วิสนี้มีอยู่แล้ว และมันเสื่อมสภาพลงอย่างนุ่มนวล — ถ้า relay ล่มไปสิบนาที มันแค่กลับมาทำงานต่อจากจุดที่ค้างไว้ทันทีที่ restart เพราะ `published_at is null` คือ state ทั้งหมดที่มันต้องใช้กู้คืน
+
+มีสองเรื่องเกี่ยวกับ correctness ที่ควรพูดให้ชัด เพราะพลาดง่ายแบบแนบเนียน:
+
+- **Idempotency** `publish` ส่งไป Kafka *ก่อน* แล้วค่อยรัน `update outbox set published_at = now()` ถ้า relay crash หลังจาก Kafka ยืนยันการเขียนแล้วแต่ก่อนที่ `UPDATE` นั้นจะ commit แถวนั้นจะยังดูเหมือนยังไม่ publish ตอน poll รอบถัดไปของ relay และถูก publish ซ้ำ — เป็นการแลกแบบ at-least-once เดียวกันเป๊ะกับที่ `Consumer` ของ [Producer & Consumer →](/shopmicro/th/kafka/producer-consumer/) ทำด้วย manual commit ทางฝั่งอ่าน `events.Event.ID` ถูกตั้งจากคอลัมน์ `id` ของ outbox row เอง ซึ่งไม่เคยเปลี่ยนไม่ว่าจะ republish กี่ครั้ง — ดังนั้น consumer ทางปลายทางที่ dedupe บน `Event.ID` (ข้ามการประมวลผลถ้า id นี้เคยถูกจัดการไปแล้ว) จะจัดการ `order.created` ที่ redeliver มาอย่างถูกต้องว่าเป็น no-op ไม่ใช่คำสั่งซื้อที่สอง
+- **Ordering** `publish` เรียก `pub.Publish(ctx, topic, row.AggregateID, value)` — `aggregate_id` เดียวกับที่เป็น partition key ของ outbox row กลายเป็น key ของ Kafka message ดังนั้นการรับประกันของ [Topics, Partitions & Consumer Groups →](/shopmicro/th/kafka/topics-groups/) จึงใช้ได้โดยตรง: ทุก event เกี่ยวกับคำสั่งซื้อเดียวกันลง partition เดียวกัน และมาถึง consumer ตามลำดับที่มันเกิดขึ้น ไม่ว่า `select ... order by created_at` ของ relay จะประมวลผลแถวจากคำสั่งซื้อ*ต่างกัน*ตามลำดับไหนก็ตาม
+
+## Pros & cons
+
+**Polling (`time.Ticker`, ช่วงเวลาคงที่)** เทียบกับ **change-data-capture (Debezium อ่าน replication stream ของ Postgres)**
+
+- **Pros:** ไม่มี infrastructure ใหม่ — ticker กับ `SELECT` คือกลไกทั้งหมด ทดสอบง่ายมาก คิดตามง่ายมาก และทนทานต่อการที่ relay เอง restart หรือตามหลังโดยธรรมชาติ
+- **Cons:** publish latency ถูกจำกัดด้วยช่วงเวลา poll ไม่ใช่ทันทีแบบที่ตัวอ่าน replication-stream ทำได้; relay ยัง query Postgres ต่อเนื่องแม้ตอนที่ outbox ว่างเปล่า ซึ่งเป็นต้นทุนคงที่เล็ก ๆ ที่ดีไซน์แบบ reactive ล้วน ๆ จะไม่ต้องจ่าย
+
+**ช่วงเวลา 2 วินาที กับ batch 100 แถว** เทียบกับ **ช่วงเวลานานกว่าและ batch ใหญ่กว่า**
+
+- **Pros ของค่าที่เล็ก/เร็วที่ใช้ตรงนี้:** worst-case publish latency ต่ำกว่า (event มองเห็นได้สำหรับ consumer ภายในประมาณ 2 วินาทีหลังถูกเขียน) และ batch 100 แถวทำให้งานของแต่ละ poll ถูกจำกัดและคาดเดาได้
+- **Cons:** round trip ไปทั้ง Postgres และ Kafka บ่อยกว่าต่อหน่วยเวลา เมื่อเทียบกับ poll ที่ช้ากว่า สำหรับปริมาณการเขียนระดับคอร์สที่แทบไม่เคยเติม batch 100 แถวได้เต็มด้วยซ้ำ การ tune สำหรับ production จะปรับทั้งสองค่าตามปริมาณ event จริง — เซอร์วิสที่มี throughput สูงอาจ poll ถี่น้อยลงด้วย batch ที่ใหญ่กว่ามากเพื่อลด overhead ของ round trip แลกกับ worst-case latency ที่สูงขึ้น
+
+## Set it up
+
+### 1. `services/order/internal/outbox/relay.go`
+
+```go
+// Package outbox implements the relay half of the transactional outbox
+// pattern: it polls the outbox table for rows nothing has published yet,
+// pushes each one to Kafka, and marks it published.
+package outbox
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"github.com/avetavos/shopmicro/pkg/events"
+	"github.com/avetavos/shopmicro/pkg/kafka"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+const (
+	pollInterval = 2 * time.Second
+	batchSize    = 100
+)
+
+// Relay polls the outbox table and publishes unpublished rows to Kafka.
+type Relay struct {
+	db  *pgxpool.Pool
+	pub *kafka.Publisher
+}
+
+// New returns a Relay that reads unpublished rows from db and publishes
+// them through pub.
+func New(db *pgxpool.Pool, pub *kafka.Publisher) *Relay {
+	return &Relay{db: db, pub: pub}
+}
+
+type outboxRow struct {
+	ID          string
+	AggregateID string
+	EventType   string
+	Payload     json.RawMessage
+}
+
+// Run polls the outbox table every pollInterval until ctx is cancelled,
+// publishing every unpublished row it finds and marking each one published
+// once Kafka acknowledges the write. Started as a goroutine from main; it
+// only returns when ctx.Done() fires.
+func (r *Relay) Run(ctx context.Context) {
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := r.drain(ctx); err != nil {
+				log.Printf("outbox: drain: %v", err)
+			}
+		}
+	}
+}
+
+// drain publishes up to batchSize unpublished outbox rows, oldest first.
+func (r *Relay) drain(ctx context.Context) error {
+	rows, err := r.db.Query(ctx, `
+		select id, aggregate_id, event_type, payload
+		from outbox
+		where published_at is null
+		order by created_at
+		limit $1`, batchSize)
+	if err != nil {
+		return fmt.Errorf("outbox: query unpublished rows: %w", err)
+	}
+	defer rows.Close()
+
+	var batch []outboxRow
+	for rows.Next() {
+		var row outboxRow
+		if err := rows.Scan(&row.ID, &row.AggregateID, &row.EventType, &row.Payload); err != nil {
+			return fmt.Errorf("outbox: scan row: %w", err)
+		}
+		batch = append(batch, row)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("outbox: iterate rows: %w", err)
+	}
+
+	for _, row := range batch {
+		if err := r.publish(ctx, row); err != nil {
+			// Leave published_at untouched so the next poll retries this
+			// row — the same at-least-once contract the Kafka Consumer's
+			// manual commit gives on the read side.
+			log.Printf("outbox: publish row %s: %v", row.ID, err)
+			continue
+		}
+	}
+
+	return nil
+}
+
+// publish builds an events.Event from row, sends it to the topic matching
+// its event_type, and marks the row published once Kafka acknowledges the
+// write.
+func (r *Relay) publish(ctx context.Context, row outboxRow) error {
+	ev := events.Event{
+		ID:          row.ID,
+		Type:        row.EventType,
+		AggregateID: row.AggregateID,
+		Payload:     row.Payload,
+		OccurredAt:  time.Now().UTC(),
+	}
+
+	value, err := json.Marshal(ev)
+	if err != nil {
+		return fmt.Errorf("marshal event: %w", err)
+	}
+
+	topic := topicFor(row.EventType)
+	if err := r.pub.Publish(ctx, topic, row.AggregateID, value); err != nil {
+		return fmt.Errorf("publish to %s: %w", topic, err)
+	}
+
+	tag, err := r.db.Exec(ctx, `update outbox set published_at = now() where id = $1`, row.ID)
+	if err != nil {
+		return fmt.Errorf("mark published: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("mark published: no outbox row with id %s", row.ID)
+	}
+
+	return nil
+}
+
+// topicFor routes an outbox event_type to its Kafka topic. Every
+// "order.*" event type (order.created, order.confirmed, order.cancelled)
+// goes to the "orders" topic.
+func topicFor(eventType string) string {
+	if strings.HasPrefix(eventType, "order.") {
+		return "orders"
+	}
+	return eventType
+}
+```
+
+เซฟไฟล์นี้เป็น `services/order/internal/outbox/relay.go` `Event.ID` มาจาก `row.ID` — คอลัมน์ `id` ของตาราง outbox เอง สร้างขึ้นครั้งเดียวตอน insert โดย `OrderRepo.Create`/`UpdateStatus` — ไม่เคยถูกสร้างใหม่ตรงนี้เลย ซึ่งเป็นสิ่งที่ทำให้มันเป็น dedupe key ที่เสถียรไม่ว่าจะ republish แถวเดิมกี่ครั้งก็ตาม
+
+### 2. เชื่อม relay เข้ากับ `services/order/cmd/main.go`
+
+```go
+// Command order runs the Order gRPC server.
+package main
+
+import (
+	"context"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+
+	catalogv1 "github.com/avetavos/shopmicro/gen/shopmicro/catalog/v1"
+	orderv1 "github.com/avetavos/shopmicro/gen/shopmicro/order/v1"
+	"github.com/avetavos/shopmicro/pkg/config"
+	"github.com/avetavos/shopmicro/pkg/kafka"
+	"github.com/avetavos/shopmicro/pkg/pg"
+	"github.com/avetavos/shopmicro/services/order/internal/outbox"
+	"github.com/avetavos/shopmicro/services/order/internal/repo"
+	"github.com/avetavos/shopmicro/services/order/internal/server"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/reflection"
+)
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dbURL := config.Get("ORDER_DB_URL", "postgres://shopmicro:shopmicro@localhost:5432/orders?sslmode=disable")
+	grpcAddr := config.Get("ORDER_GRPC_ADDR", ":50052")
+	catalogAddr := config.Get("CATALOG_GRPC_ADDR", ":50051")
+	brokers := strings.Split(config.Get("KAFKA_BROKERS", "localhost:9092"), ",")
+
+	pool, err := pg.NewPool(ctx, dbURL)
+	if err != nil {
+		log.Fatalf("order: connect to postgres: %v", err)
+	}
+	defer pool.Close()
+
+	publisher := kafka.NewPublisher(brokers)
+	defer publisher.Close()
+
+	relay := outbox.New(pool, publisher)
+	go relay.Run(ctx)
+	log.Println("order: outbox relay started")
+
+	catalogConn, err := grpc.NewClient(catalogAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("order: dial catalog at %s: %v", catalogAddr, err)
+	}
+	defer catalogConn.Close()
+	catalogClient := catalogv1.NewCatalogServiceClient(catalogConn)
+
+	lis, err := net.Listen("tcp", grpcAddr)
+	if err != nil {
+		log.Fatalf("order: listen on %s: %v", grpcAddr, err)
+	}
+
+	orderRepo := repo.New(pool)
+	orderServer := server.New(orderRepo, catalogClient)
+
+	grpcServer := grpc.NewServer()
+	orderv1.RegisterOrderServiceServer(grpcServer, orderServer)
+	reflection.Register(grpcServer)
+
+	go func() {
+		log.Printf("order: gRPC server listening on %s", grpcAddr)
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("order: serve: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Println("order: shutting down")
+	cancel()
+	grpcServer.GracefulStop()
+}
+```
+
+เซฟไฟล์นี้ทับ `services/order/cmd/main.go` มีสามส่วนที่เปลี่ยนจากเวอร์ชันของ [The gRPC Server →](/shopmicro/th/order-service/grpc-server/) นอกเหนือจากการเชื่อม `repo`/`server` ที่ [The Order Repository →](/shopmicro/th/order-service/order-repo/) เพิ่มไว้แล้ว:
+
+- **`context.WithCancel` แทน `context.Background()`** `relay.Run(ctx)` รันเป็น goroutine เบื้องหลัง และเหมือนกับ goroutine ที่รันยาวทุกตัวในคอร์สนี้ มันต้องมีวิธีหยุด — `cancel()` ที่ถูกเรียกทันทีก่อน `grpcServer.GracefulStop()` คือสิ่งที่ทำให้ `ctx.Done()` ทำงานภายใน `select` ของ `Relay.Run` จบ loop การ poll ของมันอย่างสะอาดตอน shutdown แทนที่จะรั่วไหลค้างอยู่
+- **`kafka.NewPublisher(brokers)`** ปิดด้วย `defer publisher.Close()` ทันทีหลังสร้าง — รูปแบบ cleanup-ทันทีหลังสร้างแบบไม่มีเงื่อนไขเดียวกับที่ `defer pool.Close()` และ `defer catalogConn.Close()` ใช้อยู่แล้ว
+- **`go relay.Run(ctx)`** เริ่มก่อนที่ gRPC server จะเริ่ม serve ลำดับสำคัญแค่นิดเดียวตรงนี้: relay ที่ poll ตาราง `outbox` ที่ว่างเปล่า (หรือยังไม่ migrate) ไม่เป็นอันตรายอะไร ดังนั้นจึงไม่มีข้อบังคับเข้มงวดว่ามันต้องเริ่มหลังจาก database pool ถูกยืนยันว่าสุขภาพดีแล้ว — `pg.NewPool` เช็คเรื่องนั้นไปแล้วไม่กี่บรรทัดก่อนหน้า และจะเรียก `log.Fatalf` ถ้ามันล้มเหลว
+
+## Verify
+
+เปิด Postgres กับ Kafka แล้วตรวจสอบว่า topic `orders` กับ `payments` จาก [Topics, Partitions & Consumer Groups →](/shopmicro/th/kafka/topics-groups/) มีอยู่แล้ว:
+
+```bash
+cd deploy/compose && docker compose up -d postgres kafka
+```
+
+รัน Catalog แล้วรัน Order:
+
+```bash
+go run ./services/catalog/cmd
+```
+
+```bash
+go run ./services/order/cmd
+```
+
+```txt
+order: outbox relay started
+order: gRPC server listening on :50052
+```
+
+อีกเทอร์มินัลหนึ่ง เริ่ม demo consumer ของ [Producer & Consumer →](/shopmicro/th/kafka/producer-consumer/) ที่คอยดู topic `orders`:
+
+```bash
+go run ./cmd/kafkademo/consume
+```
+
+สร้างสินค้าหนึ่งชิ้น แล้วสั่งซื้อ เหมือนกับที่ส่วน Verify ของ [The Order Repository →](/shopmicro/th/order-service/order-repo/) ทำ:
+
+```bash
+grpcurl -plaintext -d '{"name":"Coffee Mug","description":"350ml ceramic mug","price_cents":1299,"stock":50}' \
+  localhost:50051 shopmicro.catalog.v1.CatalogService/CreateProduct
+```
+
+```bash
+grpcurl -plaintext -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}' \
+  localhost:50052 shopmicro.order.v1.OrderService/CreateOrder
+```
+
+ภายในประมาณสองวินาที — หนึ่งรอบ poll ของ relay — เทอร์มินัลของ consumer จะพิมพ์ event ที่ relay เพิ่ง publish:
+
+```txt
+consumed: id=3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90 type=order.created aggregate_id=3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90 payload={"order_id":"3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90","customer_id":"cust-1","total_cents":2598,"items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2,"unit_price_cents":1299}]}
+```
+
+ยืนยันว่า outbox row ที่ [The Transactional Outbox →](/shopmicro/th/order-service/outbox/) ทิ้งไว้ด้วย `published_at` ว่างเปล่า ตอนนี้มี timestamp จริงแล้ว:
+
+```bash
+psql "$ORDER_DB_URL" -c "select aggregate_id, event_type, published_at from outbox order by created_at desc limit 5;"
+```
+
+```txt
+             aggregate_id             | event_type    | published_at
+---------------------------------------+---------------+-------------------------------
+ 3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90 | order.created | 2026-07-14 10:15:32.481022+00
+```
+
+จากนั้นยืนยันว่า module ยัง build ผ่าน:
+
+```bash
+go build ./...
+```
+
+ไม่มี output แปลว่าสำเร็จ
+
+ตรวจสอบความเข้าใจของคุณ:
+
+- ถ้า relay crash หลังจาก Kafka ยืนยันการ publish แล้วแต่ก่อนที่ `UPDATE ... SET published_at = now()` จะ commit จะเกิดอะไรขึ้นตอน poll รอบถัดไปของ relay และอะไรที่ป้องกันไม่ให้มันสร้างคำสั่งซื้อซ้ำ?
+- ทำไม `Event.ID` ถึงถูกตั้งจากคอลัมน์ `id` ของ outbox row แทนที่จะสร้างใหม่สด ๆ ภายใน `publish`?
+- ทำไม `publish` ถึงใช้ `row.AggregateID` — ไม่ใช่ `row.ID` — เป็น key ของ Kafka message?
+- ความต่างที่สังเกตได้ระหว่างช่วง poll 2 วินาทีกับ 30 วินาทีคืออะไร?
+
+## Recap
+
+`Relay.Run` ของ `services/order/internal/outbox/relay.go` tick ทุก `pollInterval` และแต่ละ tick `drain` จะ select แถวสูงสุด `batchSize` แถวที่ `published_at is null` publish แต่ละแถวผ่าน `pkg/kafka.Publisher` — key ด้วย `aggregate_id` ดังนั้นการรับประกันลำดับภายใน partition ของ [Topics, Partitions & Consumer Groups →](/shopmicro/th/kafka/topics-groups/) จึงยังคงอยู่ — แล้ว mark แถวว่า publish แล้วก็ต่อเมื่อ Kafka ยืนยันการเขียนสำเร็จเท่านั้น `services/order/cmd/main.go` ตอนนี้สร้าง `Publisher` สร้าง `Relay` แล้วเริ่มมันด้วย `go relay.Run(ctx)` โดยใช้ `context.Context` ที่ cancel ได้ เพื่อให้ loop การ poll ของ relay หยุดอย่างสะอาดตอน shutdown ควบคู่ไปกับ gRPC server นี่คือการปิด loop ที่ [The Transactional Outbox →](/shopmicro/th/order-service/outbox/) เปิดไว้ตั้งแต่ Module 4: `pgx.Tx` ทำให้ "คำสั่งซื้อถูกสร้างแล้ว" กับ "event จะถูก publish ในที่สุด" เป็นอะตอมิก และ relay ตัวนี้คือ "ในที่สุด" นั้น — แยกขาดจากการเขียนดั้งเดิม retry ได้ไม่จำกัด และถูกต้องแม้ตอน crash เพราะ `Event.ID` (คอลัมน์ `id` ของ outbox row เอง) ให้ consumer ทางปลายทางทุกตัวมี key ที่เสถียรไว้ dedupe event ที่ republish ได้ นั่นคือ Module 6 เสร็จสมบูรณ์ — Order ประกาศทุก `order.created`, `order.confirmed`, และ `order.cancelled` ไป Kafka อย่างน่าเชื่อถือ ไม่มีอะไรค้างอยู่ในฐานข้อมูลแบบยังไม่ publish อีกต่อไป ต่อไป [RabbitMQ →](/shopmicro/th/rabbitmq/) (Module 7) แนะนำโมเดลการส่งข้อความแบบที่สอง — work queue แทนที่จะเป็น log ที่ replay ได้ — สำหรับงานประเภทที่ต้องการให้ worker แค่คนเดียวจัดการมัน ไม่ใช่ทุกเซอร์วิสที่สนใจ

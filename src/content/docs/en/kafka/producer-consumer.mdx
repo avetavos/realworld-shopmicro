@@ -1,0 +1,322 @@
+---
+title: Producer & Consumer
+description: "pkg/events.Event, the JSON envelope every Kafka message in this system carries, and pkg/kafka's Publisher/Consumer wrapping segmentio/kafka-go — manual-commit at-least-once delivery, verified with a tiny produce-then-consume demo against Module 1's Kafka broker."
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+`pkg/events/event.go` — a single `Event` struct that is the JSON envelope of *every* message this system ever publishes to Kafka, no matter which service produces or consumes it. And `pkg/kafka/kafka.go` — a `Publisher` and a `Consumer`, both thin wrappers around `segmentio/kafka-go`, so every service produces and consumes that envelope the same way instead of each one configuring its own `kafka.Writer`/`kafka.Reader` from scratch. Both packages are shared code: [The Transactional Outbox →](/shopmicro/en/order-service/outbox/) already named the relay that will use `Publisher` (built next lesson), and Payment, Notification, and Order Saga — Modules 8, 9, and 10 — will all use `Consumer` to react to these same events.
+
+To prove the wrapper actually works against a real broker before anything else depends on it, this lesson also writes two tiny, throwaway programs — `cmd/kafkademo/produce` and `cmd/kafkademo/consume` — that publish one event and consume it back, against the Kafka container [Infra & Compose →](/shopmicro/en/setup/infra-compose/) already stood up in Module 1.
+
+## Why
+
+Every service in this system eventually needs to either publish or consume Kafka messages — Order (this module), Payment, Notification, and the Order Saga all do. Without a shared envelope, each service would invent its own JSON shape for "what happened," and a consumer written by one team would need to know the exact quirks of whatever shape a different team's producer chose. `events.Event` fixes that: one struct, one JSON shape, used identically everywhere. `ID` uniquely identifies the event (and, in [Outbox & Relay →](/shopmicro/en/kafka/outbox-relay/), becomes the key idempotent consumers dedupe on), `Type` is the event name (`order.created`, `payment.succeeded`, and so on), `AggregateID` is the id of the entity the event is about, `Payload` is the event-specific data as raw JSON, and `OccurredAt` is when it happened.
+
+The `Consumer`'s `Run` method commits offsets manually — `CommitMessages` only runs after `handle` returns successfully, never before. That single ordering choice is what makes this system's Kafka consumers **at-least-once**, not **at-most-once**: if a consumer crashes between finishing `handle` and the commit landing, Kafka has no record that this message was processed, and redelivers it after restart. That is a deliberate trade, not an oversight — the alternative (commit first, then process) is *at-most-once*, and a crash between them silently loses the event forever. Losing an `order.created` or `payment.succeeded` event is far worse than occasionally processing one twice, which is why every consumer built on top of `Consumer.Run` must be idempotent — a requirement [Architecture →](/shopmicro/en/introduction/architecture/) named from the very first module.
+
+## Pros & cons
+
+**A shared `pkg/kafka` wrapper** vs. **each service configuring `kafka.Writer`/`kafka.Reader` directly**
+
+- **Pros:** every producer gets the same `Balancer`, `RequiredAcks`, and topic-creation behavior without copy-pasting configuration into five services; every consumer gets the same fetch → handle → commit loop, so "how do we guarantee at-least-once here" is answered once, in one file, instead of once per service (with the risk that one service gets it subtly wrong).
+- **Cons:** a single shared abstraction now has to be general enough for every consumer's needs — `Consumer.Run` takes a `handle` callback rather than exposing `kafka-go`'s full `Reader` API, so a service that genuinely needs a feature the wrapper doesn't expose (say, per-partition assignment callbacks) has to either extend the wrapper or fall back to `kafka-go` directly for that one case.
+
+**Manual commit (`CommitMessages` after `handle` succeeds)** vs. **kafka-go's built-in auto-commit (`CommitInterval` on `ReaderConfig`)**
+
+- **Pros:** the commit only ever happens after the message has been fully handled, so a crash mid-processing always results in redelivery, never silent loss — the guarantee this system's idempotency requirement is built around.
+- **Cons:** every consumer now genuinely must be idempotent, since the same message really can arrive twice; auto-commit is simpler to reason about for handlers that don't care about that distinction (at the cost of the small at-most-once window where offset commit races ahead of processing).
+
+## Set it up
+
+### 1. `pkg/events/event.go`
+
+```go
+// Package events defines the JSON envelope every Kafka message in this
+// system carries. Every producer marshals one, every consumer unmarshals
+// one — no service ever hand-rolls its own message shape.
+package events
+
+import (
+	"encoding/json"
+	"time"
+)
+
+// Event is the JSON envelope of every message published to any topic in
+// this system.
+type Event struct {
+	ID          string          `json:"id"`
+	Type        string          `json:"type"`
+	AggregateID string          `json:"aggregate_id"`
+	Payload     json.RawMessage `json:"payload"`
+	OccurredAt  time.Time       `json:"occurred_at"`
+}
+```
+
+Save this as `pkg/events/event.go`. `Payload` is `json.RawMessage`, not a concrete struct — `events.Event` doesn't know or care what any particular event's payload looks like; it just carries the already-marshaled bytes through, and each consumer unmarshals `Payload` into whatever struct that event type actually needs.
+
+### 2. `pkg/kafka/kafka.go`
+
+```go
+// Package kafka wraps segmentio/kafka-go's Writer and Reader behind a
+// small, project-specific Publisher/Consumer pair, so every service
+// produces and consumes the events.Event envelope the same way.
+package kafka
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+
+	"github.com/avetavos/shopmicro/pkg/events"
+	kafkago "github.com/segmentio/kafka-go"
+)
+
+// Publisher writes messages to Kafka.
+type Publisher struct {
+	w *kafkago.Writer
+}
+
+// NewPublisher returns a Publisher connected to brokers. Balancer: &Hash{}
+// routes messages sharing the same key to the same partition;
+// AllowAutoTopicCreation lets a topic come into existence on first publish;
+// RequiredAcks: RequireAll waits for every in-sync replica to acknowledge
+// the write before WriteMessages returns.
+func NewPublisher(brokers []string) *Publisher {
+	return &Publisher{
+		w: &kafkago.Writer{
+			Addr:                   kafkago.TCP(brokers...),
+			Balancer:               &kafkago.Hash{},
+			AllowAutoTopicCreation: true,
+			RequiredAcks:           kafkago.RequireAll,
+		},
+	}
+}
+
+// Publish writes value to topic, keyed by key. Messages with the same key
+// always land on the same partition, which is why callers key by an
+// aggregate's id (an order's id, say) — every event about that aggregate
+// stays in the one place Kafka guarantees ordering: within a partition.
+func (p *Publisher) Publish(ctx context.Context, topic, key string, value []byte) error {
+	if err := p.w.WriteMessages(ctx, kafkago.Message{
+		Topic: topic,
+		Key:   []byte(key),
+		Value: value,
+	}); err != nil {
+		return fmt.Errorf("kafka: publish to %s: %w", topic, err)
+	}
+	return nil
+}
+
+// Close flushes any pending writes and closes the underlying connection.
+func (p *Publisher) Close() error {
+	return p.w.Close()
+}
+
+// Consumer reads events.Event envelopes from a single topic as part of a
+// consumer group.
+type Consumer struct {
+	r *kafkago.Reader
+}
+
+// NewConsumer returns a Consumer that reads topic as part of groupID.
+// Give every service its own groupID (its service name is enough) — Kafka
+// delivers every message on topic to every distinct group at least once,
+// so each service sees the full stream regardless of what any other
+// service's consumers are doing. Multiple processes sharing the same
+// groupID split the topic's partitions between them instead.
+func NewConsumer(brokers []string, groupID, topic string) *Consumer {
+	return &Consumer{
+		r: kafkago.NewReader(kafkago.ReaderConfig{
+			Brokers:  brokers,
+			GroupID:  groupID,
+			Topic:    topic,
+			MinBytes: 10e3, // 10KB
+			MaxBytes: 10e6, // 10MB
+		}),
+	}
+}
+
+// Run fetches messages from topic in a loop, unmarshals each into an
+// events.Event, and passes it to handle. A message's offset is committed
+// with CommitMessages only after handle returns nil — this is manual-commit,
+// at-least-once delivery: if the process crashes after handle succeeds but
+// before the commit lands, Kafka redelivers the same message on restart, so
+// handle must be idempotent. If handle (or unmarshalling) fails, Run logs
+// the error and moves on without committing, so the same message is
+// redelivered on the next FetchMessage rather than silently dropped. Run
+// blocks until ctx is cancelled, at which point FetchMessage returns ctx's
+// error.
+func (c *Consumer) Run(ctx context.Context, handle func(context.Context, events.Event) error) error {
+	for {
+		msg, err := c.r.FetchMessage(ctx)
+		if err != nil {
+			return fmt.Errorf("kafka: fetch message: %w", err)
+		}
+
+		var ev events.Event
+		if err := json.Unmarshal(msg.Value, &ev); err != nil {
+			log.Printf("kafka: unmarshal event at %s/%d/%d: %v", msg.Topic, msg.Partition, msg.Offset, err)
+			continue
+		}
+
+		if err := handle(ctx, ev); err != nil {
+			log.Printf("kafka: handle event %s (%s): %v — will redeliver", ev.ID, ev.Type, err)
+			continue
+		}
+
+		if err := c.r.CommitMessages(ctx, msg); err != nil {
+			return fmt.Errorf("kafka: commit message: %w", err)
+		}
+	}
+}
+
+// Close closes the underlying reader.
+func (c *Consumer) Close() error {
+	return c.r.Close()
+}
+```
+
+Save this as `pkg/kafka/kafka.go`, and pull in the client library:
+
+```bash
+go get github.com/segmentio/kafka-go
+```
+
+### 3. A tiny produce → consume demo
+
+Two throwaway programs, not part of any service, that exist purely to prove `Publisher` and `Consumer` work against a real broker.
+
+```go
+// Command produce publishes a single demo events.Event to the "orders"
+// topic — nothing wired into any service, just proof that Publisher works
+// end to end against a running Kafka broker.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"strings"
+	"time"
+
+	"github.com/avetavos/shopmicro/pkg/config"
+	"github.com/avetavos/shopmicro/pkg/events"
+	"github.com/avetavos/shopmicro/pkg/kafka"
+)
+
+func main() {
+	brokers := strings.Split(config.Get("KAFKA_BROKERS", "localhost:9092"), ",")
+
+	pub := kafka.NewPublisher(brokers)
+	defer pub.Close()
+
+	ev := events.Event{
+		ID:          "demo-1",
+		Type:        "order.created",
+		AggregateID: "order-abc",
+		Payload:     json.RawMessage(`{"order_id":"order-abc","total_cents":2598}`),
+		OccurredAt:  time.Now().UTC(),
+	}
+
+	value, err := json.Marshal(ev)
+	if err != nil {
+		log.Fatalf("marshal event: %v", err)
+	}
+
+	if err := pub.Publish(context.Background(), "orders", ev.AggregateID, value); err != nil {
+		log.Fatalf("publish: %v", err)
+	}
+
+	log.Println("published:", ev.ID)
+}
+```
+
+Save this as `cmd/kafkademo/produce/main.go`.
+
+```go
+// Command consume reads events.Event messages from the "orders" topic and
+// prints each one — nothing wired into any service, just proof that
+// Consumer.Run's fetch/handle/commit loop works end to end.
+package main
+
+import (
+	"context"
+	"log"
+	"strings"
+
+	"github.com/avetavos/shopmicro/pkg/config"
+	"github.com/avetavos/shopmicro/pkg/events"
+	"github.com/avetavos/shopmicro/pkg/kafka"
+)
+
+func main() {
+	brokers := strings.Split(config.Get("KAFKA_BROKERS", "localhost:9092"), ",")
+
+	consumer := kafka.NewConsumer(brokers, "kafkademo", "orders")
+	defer consumer.Close()
+
+	err := consumer.Run(context.Background(), func(ctx context.Context, ev events.Event) error {
+		log.Printf("consumed: id=%s type=%s aggregate_id=%s payload=%s", ev.ID, ev.Type, ev.AggregateID, string(ev.Payload))
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("consumer: %v", err)
+	}
+}
+```
+
+Save this as `cmd/kafkademo/consume/main.go`. Both default to `KAFKA_BROKERS=localhost:9092`, the same variable and default [Repo Layout →](/shopmicro/en/setup/repo-layout/)'s `.env.example` already documents.
+
+## Verify
+
+Make sure Module 1's Kafka container is up:
+
+```bash
+cd deploy/compose && docker compose up -d kafka
+```
+
+In one terminal, start the consumer first, so it's already subscribed when the message is published:
+
+```bash
+go run ./cmd/kafkademo/consume
+```
+
+In a second terminal, publish the demo event:
+
+```bash
+go run ./cmd/kafkademo/produce
+```
+
+```txt
+published: demo-1
+```
+
+Back in the consumer's terminal:
+
+```txt
+consumed: id=demo-1 type=order.created aggregate_id=order-abc payload={"order_id":"order-abc","total_cents":2598}
+```
+
+`AllowAutoTopicCreation` means the `orders` topic didn't need to exist beforehand — the first publish created it. Stop the consumer with `Ctrl-C`.
+
+Then confirm the module still builds:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+Check your understanding:
+
+- Why does `Event.Payload` use `json.RawMessage` instead of a concrete struct type?
+- What would change if `Consumer.Run` called `CommitMessages` *before* calling `handle`, instead of after?
+- If `handle` returns an error, why does `Run` skip the commit and move on, rather than returning the error immediately and stopping the whole consumer?
+
+## Recap
+
+`pkg/events.Event` is the one JSON envelope every Kafka message in this system carries — `ID`, `Type`, `AggregateID`, `Payload`, `OccurredAt` — so no two services ever invent their own incompatible shape for "what happened." `pkg/kafka.Publisher` wraps a `kafka.Writer` configured with `&kafka.Hash{}` (key-based partitioning), `AllowAutoTopicCreation`, and `RequiredAcks: RequireAll`. `pkg/kafka.Consumer` wraps a `kafka.Reader` and exposes `Run`, whose fetch → handle → commit loop only calls `CommitMessages` after `handle` succeeds — manual-commit, **at-least-once** delivery, which is exactly why every consumer built on top of it must be idempotent. `cmd/kafkademo/produce` and `cmd/kafkademo/consume` proved both halves work against the real Kafka broker from Module 1, publishing and consuming one event end to end. Next, [Topics, Partitions & Consumer Groups →](/shopmicro/en/kafka/topics-groups/) explains the concepts this lesson used without naming — partitions, keys, consumer groups, and the log's replayability — before [Outbox & Relay →](/shopmicro/en/kafka/outbox-relay/) puts `Publisher` to work for real, closing the outbox pattern [The Transactional Outbox →](/shopmicro/en/order-service/outbox/) started.
