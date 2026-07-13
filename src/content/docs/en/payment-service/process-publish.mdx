@@ -1,0 +1,270 @@
+---
+title: Process & Publish
+description: "services/payment/internal/processor/processor.go — Processor.Handle, the deterministic decision that turns an order.created event into a payment.succeeded or payment.failed event published to Kafka's \"payments\" topic, and why stateless determinism gives natural idempotency under at-least-once redelivery. Verified with a small order (succeeds) and a large one over the $5,000 limit (fails)."
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+`services/payment/internal/processor/processor.go` — a `Processor` whose `Handle` method is the real logic [Consuming Orders →](/shopmicro/en/payment-service/consume-order/)'s placeholder closure stood in for: given an `order.created` event, decide deterministically whether that order's payment succeeds or fails, build a new `events.Event` carrying the result, and publish it to Kafka's `"payments"` topic. Then a small change to `services/payment/cmd/main.go`: construct a `Processor` and wire `consumer.Run(ctx, proc.Handle)` in place of last lesson's placeholder.
+
+There's no gateway integration here — no Stripe, no card network call. Payment's decision is a single, fixed rule: approve anything at or under $5,000, reject anything over it. That's deliberately simple, and the point of this lesson isn't the rule itself — it's what falls out of a decision being **pure** (same input always produces the same output, no I/O, no randomness) in a system where every event might be delivered more than once.
+
+## Why
+
+[Producer & Consumer →](/shopmicro/en/kafka/producer-consumer/) established that `Consumer.Run` is manual-commit, **at-least-once**: if Payment crashes after `Handle` finishes but before the offset commits, Kafka redelivers the exact same `order.created` event on restart. Every consumer built on that guarantee must be idempotent — reprocessing the same message can't be allowed to double-charge a customer or emit two contradictory results. `Processor.Handle` gets that idempotency for free, without a single line of code dedicated to it, because it's **stateless and deterministic**: it reads nothing but the incoming event, decides using only `OrderCreated.TotalCents`, and writes nothing to a database. Redeliver the same `order.created` event ten times, and `Handle` computes the exact same `Result` and republishes the exact same outcome every time — there is no state anywhere that a duplicate delivery could corrupt, because there's no state at all.
+
+The one detail that makes that safe for *downstream* consumers too, not just for Payment itself, is `ID: e.ID + ":payment"`. The new `payment.succeeded`/`payment.failed` event's id is derived from the source `order.created` event's own `e.ID`, never generated fresh (no `uuid.New()` here). That means a redelivered `order.created` — same `e.ID` every time — always produces a `payment.*` event with the exact same derived id, too. A downstream consumer that dedupes on `events.Event.ID` (exactly the pattern [Outbox & Relay →](/shopmicro/en/kafka/outbox-relay/) already established for the outbox relay's own redeliveries) correctly treats the second `payment.succeeded` for the same order as a no-op it's already handled, not a second, contradictory payment result.
+
+A real payment gateway can't get away with this. Charging a card is not pure — it's an external side effect with its own latency, failure modes, and money actually moving — so a production Payment service would front that call with a **persisted `payments` table**: one row per order, a unique constraint on `order_id` (or an explicit idempotency key sent to the gateway), checked *before* calling out. On redelivery, the handler finds the existing row, sees the payment was already attempted, and returns the stored result instead of charging twice. This lesson's stateless design is the simplest version of "make redelivery safe" that a real gateway integration would layer a persistence-based dedupe on top of, not a replacement for it — the callout is explicit in the Pros & cons below.
+
+## Pros & cons
+
+**Stateless, deterministic decision (this lesson)** vs. **a persisted `payments` table with dedupe** (the real-world approach)
+
+- **Pros:** zero infrastructure — no database, no migration, no connection pool, nothing to run out of disk or need backups; idempotency is a *consequence* of the design rather than something that has to be separately implemented and tested; genuinely correct for any rule that only needs to look at the incoming event itself.
+- **Cons:** doesn't generalize to anything with real side effects — the moment "decide" becomes "call a card network," repeating that call on redelivery genuinely double-charges unless something *else* remembers it already happened. It also can't express a rule that depends on anything beyond the single event in front of it — a real fraud check against a customer's payment history, a running total against a spending limit, or "did we already refund this order" all need state Payment doesn't have here.
+
+**Deriving the result event's id from the source event's id** (`e.ID + ":payment"`) vs. **generating a fresh id for every published event** (`uuid.New()`)
+
+- **Pros:** the derived id is itself deterministic — the same `order.created` always produces the same `payment.*` id, giving every downstream consumer a free, correct dedupe key against Payment's own redeliveries, with no coordination between Payment and its consumers beyond "dedupe on `Event.ID`," a rule [Outbox & Relay →](/shopmicro/en/kafka/outbox-relay/) already taught.
+- **Cons:** a fresh id per publish would look more "normal" for an event that's conceptually a new fact ("payment succeeded" is arguably its own event, not a re-statement of "order created") and would never collide if, for some reason, two genuinely different orders' ids ever produced the same derived string — a risk that's actually zero here since `e.ID` is already globally unique, but worth naming as the general trade-off between derived and freshly-generated ids.
+
+## Set it up
+
+### 1. `services/payment/internal/processor/processor.go`
+
+```go
+// Package processor implements Payment's business logic: given an
+// order.created event, decide deterministically whether that order's
+// payment succeeds or fails, and publish the result to Kafka's "payments"
+// topic.
+package processor
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/avetavos/shopmicro/pkg/events"
+	"github.com/avetavos/shopmicro/pkg/kafka"
+)
+
+// limitCents is the largest order Payment approves. Orders over $5,000
+// fail with Reason "amount exceeds limit".
+const limitCents = 500000
+
+// OrderCreated is the payload of an "order.created" event, as published by
+// Order's outbox relay.
+type OrderCreated struct {
+	OrderID    string `json:"order_id"`
+	CustomerID string `json:"customer_id"`
+	TotalCents int64  `json:"total_cents"`
+}
+
+// Result is the payload of a "payment.succeeded" or "payment.failed"
+// event.
+type Result struct {
+	OrderID     string `json:"order_id"`
+	AmountCents int64  `json:"amount_cents"`
+	Reason      string `json:"reason,omitempty"`
+}
+
+// Processor decides each order's payment outcome and publishes it.
+type Processor struct {
+	pub *kafka.Publisher
+}
+
+// New returns a Processor that publishes results through pub.
+func New(pub *kafka.Publisher) *Processor {
+	return &Processor{pub: pub}
+}
+
+// Handle implements the Consumer.Run handle signature. It ignores every
+// event.Type except "order.created", decides that order's payment outcome
+// deterministically from TotalCents alone, and publishes a
+// "payment.succeeded" or "payment.failed" event to the "payments" topic,
+// keyed by OrderID.
+func (p *Processor) Handle(ctx context.Context, e events.Event) error {
+	if e.Type != "order.created" {
+		return nil
+	}
+
+	var oc OrderCreated
+	if err := json.Unmarshal(e.Payload, &oc); err != nil {
+		return fmt.Errorf("processor: unmarshal order.created payload: %w", err)
+	}
+
+	eventType := "payment.succeeded"
+	result := Result{OrderID: oc.OrderID, AmountCents: oc.TotalCents}
+	if oc.TotalCents > limitCents {
+		eventType = "payment.failed"
+		result.Reason = "amount exceeds limit"
+	}
+
+	payload, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("processor: marshal result: %w", err)
+	}
+
+	out := events.Event{
+		ID:          e.ID + ":payment",
+		Type:        eventType,
+		AggregateID: oc.OrderID,
+		Payload:     payload,
+		OccurredAt:  time.Now().UTC(),
+	}
+
+	value, err := json.Marshal(out)
+	if err != nil {
+		return fmt.Errorf("processor: marshal event: %w", err)
+	}
+
+	if err := p.pub.Publish(ctx, "payments", oc.OrderID, value); err != nil {
+		return fmt.Errorf("processor: publish %s: %w", eventType, err)
+	}
+
+	return nil
+}
+```
+
+Save this as `services/payment/internal/processor/processor.go`. `p.pub.Publish(ctx, "payments", oc.OrderID, value)` keys the message by `oc.OrderID` — the same `aggregate_id` [Outbox & Relay →](/shopmicro/en/kafka/outbox-relay/) keys `order.*` events by — so [Topics, Partitions & Consumer Groups →](/shopmicro/en/kafka/topics-groups/)'s per-partition ordering guarantee holds for an order's payment result the same way it holds for its order events.
+
+### 2. Wire `Processor` into `services/payment/cmd/main.go`
+
+```go
+// Command payment runs the Payment service: a Kafka consumer that reacts
+// to order events, decides each order's payment outcome, and publishes the
+// result back to Kafka.
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+
+	"github.com/avetavos/shopmicro/pkg/config"
+	"github.com/avetavos/shopmicro/pkg/kafka"
+	"github.com/avetavos/shopmicro/services/payment/internal/processor"
+)
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	brokers := strings.Split(config.Get("KAFKA_BROKERS", "localhost:9092"), ",")
+
+	publisher := kafka.NewPublisher(brokers)
+	defer publisher.Close()
+
+	consumer := kafka.NewConsumer(brokers, "payment", "orders")
+	defer consumer.Close()
+
+	proc := processor.New(publisher)
+
+	go func() {
+		if err := consumer.Run(ctx, proc.Handle); err != nil {
+			log.Printf("payment: consumer stopped: %v", err)
+		}
+	}()
+
+	log.Println("payment: consumer started, group=payment topic=orders")
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Println("payment: shutting down")
+	cancel()
+}
+```
+
+Save this over `services/payment/cmd/main.go`. The only change from [Consuming Orders →](/shopmicro/en/payment-service/consume-order/): `proc := processor.New(publisher)` replaces the placeholder `handle` closure, and `consumer.Run(ctx, proc.Handle)` passes `Processor.Handle` directly — it already has the exact `func(context.Context, events.Event) error` signature `Consumer.Run` expects, so nothing else about the wiring changes.
+
+## Verify
+
+Bring up Postgres and Kafka, and run Catalog, Order, the gateway, and Payment:
+
+```bash
+cd deploy/compose && docker compose up -d postgres kafka
+```
+
+```bash
+go run ./services/catalog/cmd
+```
+
+```bash
+go run ./services/order/cmd
+```
+
+```bash
+go run ./gateway/cmd
+```
+
+```bash
+go run ./services/payment/cmd
+```
+
+In a fifth terminal, watch the `"payments"` topic directly:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic payments --from-beginning
+```
+
+Create a small order — the same Coffee Mug flow from [Consuming Orders →](/shopmicro/en/payment-service/consume-order/), well under the $5,000 limit:
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
+```
+
+The console consumer prints the result within moments:
+
+```txt
+{"id":"3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90:payment","type":"payment.succeeded","aggregate_id":"3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90","payload":{"order_id":"3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90","amount_cents":2598},"occurred_at":"2026-07-14T09:15:40Z"}
+```
+
+Now create an expensive product and order enough of it to cross the limit:
+
+```bash
+curl -s -X POST localhost:8080/v1/products \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Server Rack","description":"42U enterprise rack","price_cents":600000,"stock":5}'
+```
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"7b23f5a1-4c9d-4e8a-b2a5-1e3f4a9b21c8","quantity":1}]}'
+```
+
+```txt
+{"id":"9e4a2c11-8b3d-4f7a-a1c6-3d8b1e5a7c40:payment","type":"payment.failed","aggregate_id":"9e4a2c11-8b3d-4f7a-a1c6-3d8b1e5a7c40","payload":{"order_id":"9e4a2c11-8b3d-4f7a-a1c6-3d8b1e5a7c40","amount_cents":600000,"reason":"amount exceeds limit"},"occurred_at":"2026-07-14T09:16:12Z"}
+```
+
+`600000` cents is $6,000 — over the `limitCents` threshold — so `Handle` published `payment.failed` with a `reason`, exactly as the smaller Coffee Mug order published `payment.succeeded` with none. Stop the console consumer and Payment with `Ctrl-C` in each terminal.
+
+Then confirm the module still builds:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+Check your understanding:
+
+- If Payment crashes right after publishing `payment.succeeded` but before committing the `order.created` offset, what does the next poll redeliver, and what does the *second* `payment.succeeded` event's `id` look like compared to the first?
+- Why is deriving the result event's `ID` from the source event's `ID` (`e.ID + ":payment"`) safer for downstream idempotency than calling a fresh id generator inside `Handle`?
+- A real payment gateway integration can't be pure the way this lesson's `Handle` is. What's the minimum a production version would need to add to stay safe under the same at-least-once redelivery?
+
+## Recap
+
+`services/payment/internal/processor/processor.go`'s `Processor.Handle` ignores every event except `order.created`, decides an order's outcome from `TotalCents` alone — `payment.succeeded` at or under $5,000, `payment.failed` with `reason: "amount exceeds limit"` above it — and publishes the result to Kafka's `"payments"` topic, keyed by `OrderID` for the same per-order ordering guarantee `"orders"` already relies on. `services/payment/cmd/main.go` now wires `processor.New(publisher)` and passes `proc.Handle` straight to `consumer.Run`, replacing [Consuming Orders →](/shopmicro/en/payment-service/consume-order/)'s placeholder. Because `Handle` is stateless and deterministic, it's idempotent for free under `Consumer.Run`'s at-least-once redelivery — no persistence, no dedupe table, just the same input always producing the same output, including the same derived event `ID` a downstream consumer can dedupe on. A real gateway integration would need to trade that simplicity for a persisted `payments` table and an explicit dedupe key, since charging a card is a side effect this lesson's design was never meant to make safe on its own. That closes Module 8 — Payment reliably turns every `order.created` into a `payment.succeeded` or `payment.failed` fact on the `"payments"` topic. Next, [Notification →](/shopmicro/en/notification-service/) (Module 9) consumes that same topic and enqueues a RabbitMQ send-job instead of emailing inline, and [Order Saga →](/shopmicro/en/saga/) (Module 10) consumes it too, to move each order to `CONFIRMED` or `CANCELLED`.

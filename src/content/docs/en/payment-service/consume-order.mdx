@@ -1,0 +1,174 @@
+---
+title: Consuming Orders
+description: "services/payment/cmd/main.go — Payment's composition root: a kafka.Publisher, a kafka.Consumer in its own \"payment\" consumer group reading the \"orders\" topic, and a placeholder handler that filters for event.Type == \"order.created\" and logs what it sees, with graceful shutdown on SIGINT/SIGTERM. Verified by creating an order through the gateway and watching Payment log that it consumed the event."
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+`services/payment/cmd/main.go` — the Payment service's composition root, the same shape every `cmd/main.go` in this course has followed since [The gRPC Server →](/shopmicro/en/catalog-service/grpc-server/): construct dependencies, start the work, shut down gracefully on `SIGINT`/`SIGTERM`. Payment is a different kind of process from anything built so far, though — it isn't a gRPC server at all, and it isn't triggered by an incoming request. It's a `kafka.Consumer` in its own `"payment"` consumer group, reading the `"orders"` topic [Producer & Consumer →](/shopmicro/en/kafka/producer-consumer/) and [Outbox & Relay →](/shopmicro/en/kafka/outbox-relay/) already built and wired — Payment's whole job starts the moment an `order.created` event lands there.
+
+This lesson wires the consumer, a `kafka.Publisher` (constructed now, used for real next lesson), and a placeholder `handle` closure that proves the wiring works: it filters for `event.Type == "order.created"` and logs the ones it sees. [Process & Publish →](/shopmicro/en/payment-service/process-publish/) replaces that closure with `internal/processor.Processor.Handle`, which actually decides the payment's outcome and publishes it — the exact same "wire the dependency now, write the real logic next lesson" split [The gRPC Server →](/shopmicro/en/order-service/grpc-server/) used for Order's Catalog client.
+
+## Why
+
+Payment is event-driven and stateless — no database, no `pkg/pg` pool anywhere in this service. That's a deliberate design choice worth naming up front, because every prior service in this course (Catalog, Order) has centered on a database and gRPC has been the only way anything talked to anything else. Payment doesn't expose an RPC for "charge this order" that Order calls synchronously the way Order calls Catalog for a price — instead, Order's outbox relay publishes `order.created`, and Payment, subscribed to that same topic under its own consumer group, reacts on its own schedule. Neither service needs the other to be up at the moment an order is placed; Payment can be redeployed, restarted, or briefly down, and every `order.created` it missed is still sitting in Kafka's log the moment it comes back, because [Topics, Partitions & Consumer Groups →](/shopmicro/en/kafka/topics-groups/) already established that committing an offset never deletes the underlying message.
+
+`NewConsumer(brokers, "payment", "orders")` is the whole answer to "does Payment see every order, independently of what any other service does with the same topic." [Topics, Partitions & Consumer Groups →](/shopmicro/en/kafka/topics-groups/) named this rule without a second consumer to prove it: two consumers in the *same* consumer group split a topic's partitions between them, but two consumers in *different* groups each get their own complete, independent read of the entire stream. Payment's `groupID` is `"payment"` — nothing else in this system will ever share it — so Payment sees every single `order.created` event that has ever been published, in full, regardless of whether Notification (Module 9) or Order's own saga (Module 10) have consumed it, are still catching up, or don't exist yet. That's the guarantee this lesson's Verify section proves: Payment sees the event the moment it's published, with zero coordination with Order beyond both processes agreeing on the topic name.
+
+The other new piece is the filter itself. [Outbox & Relay →](/shopmicro/en/kafka/outbox-relay/)'s `topicFor` routes *every* `order.*` event type — `order.created`, `order.confirmed`, `order.cancelled` — to the same `"orders"` topic. Payment's own consumer group receives all of them, but Payment only has a job to do when an order is first created; `order.confirmed` and `order.cancelled` are somebody else's concern. `if e.Type != "order.created" { return nil }` is that entire decision — return `nil` (not an error) so the offset still commits and the event is never redelivered, it's just deliberately ignored.
+
+## Pros & cons
+
+**Payment reacts to `order.created` over Kafka** vs. **Order calls Payment synchronously over gRPC** (the way Order calls Catalog for pricing)
+
+- **Pros:** Order never depends on Payment being reachable to finish placing an order — an outage or a slow deploy in Payment can't turn into an outage in Order, the way [The gRPC Server →](/shopmicro/en/order-service/grpc-server/) explicitly accepted that risk for Catalog. Adding a second, third, or tenth service that also needs to react to every new order (Notification, the order saga) costs Order nothing — none of them touch Order's code, they just subscribe to the same topic.
+- **Cons:** there's no request/response — Order genuinely doesn't know whether Payment approved or rejected the charge at the moment `CreateOrder` returns, only later, when Payment's own result event arrives. A course (or product) that needs the caller to see the payment outcome synchronously, in the same HTTP response, would need gRPC here instead, or a client that polls/subscribes for the result separately.
+
+**Filtering `event.Type` inside one shared `"orders"` topic** vs. **a separate topic per event type** (`order.created`, `order.confirmed`, `order.cancelled` each on their own topic)
+
+- **Pros:** one topic keeps every event about an order in a single, strictly-ordered log per partition — [Outbox & Relay →](/shopmicro/en/kafka/outbox-relay/) already leans on that for partitioning by `aggregate_id`, and a new consumer that wants an order's full history (every status change, in order) reads one topic, not three. It also means adding a new `order.*` event type later needs zero new topic-provisioning or consumer wiring anywhere — every existing consumer already receives it and just needs a new `case` (or, here, a filter that continues to ignore it).
+- **Cons:** every consumer of `"orders"`, including Payment, receives and has to deserialize and filter out event types it doesn't care about — a small constant cost per message that a topic-per-type split would avoid, since a consumer could subscribe only to the exact topic whose events it wants. At this system's scale that cost is negligible; a much higher-throughput system with wildly different consumption patterns per event type might reasonably split them.
+
+## Set it up
+
+### 1. `services/payment/cmd/main.go`
+
+```go
+// Command payment runs the Payment service: a Kafka consumer that reacts
+// to order events. This lesson wires the consumer and publisher; the next
+// lesson replaces the placeholder handler below with the real decision and
+// publish logic in internal/processor.
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+
+	"github.com/avetavos/shopmicro/pkg/config"
+	"github.com/avetavos/shopmicro/pkg/events"
+	"github.com/avetavos/shopmicro/pkg/kafka"
+)
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	brokers := strings.Split(config.Get("KAFKA_BROKERS", "localhost:9092"), ",")
+
+	publisher := kafka.NewPublisher(brokers)
+	defer publisher.Close()
+
+	consumer := kafka.NewConsumer(brokers, "payment", "orders")
+	defer consumer.Close()
+
+	// Lesson-1 snapshot: internal/processor doesn't exist yet, so handle is
+	// a placeholder that only proves the consumer is wired correctly — it
+	// filters for "order.created" and logs it. Process & Publish replaces
+	// this closure with processor.Processor.Handle, which decides the
+	// order's payment outcome and publishes it through publisher.
+	handle := func(ctx context.Context, e events.Event) error {
+		if e.Type != "order.created" {
+			return nil
+		}
+		log.Printf("payment: consumed order.created id=%s aggregate_id=%s", e.ID, e.AggregateID)
+		return nil
+	}
+
+	go func() {
+		if err := consumer.Run(ctx, handle); err != nil {
+			log.Printf("payment: consumer stopped: %v", err)
+		}
+	}()
+
+	log.Println("payment: consumer started, group=payment topic=orders")
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Println("payment: shutting down")
+	cancel()
+}
+```
+
+Save this as `services/payment/cmd/main.go`. `consumer.Run` blocks until `ctx` is cancelled, so it runs in its own goroutine — the same "start the long-running loop as a goroutine, let `cancel()` unwind it on shutdown" pattern [Outbox & Relay →](/shopmicro/en/kafka/outbox-relay/)'s `go relay.Run(ctx)` established. `publisher` is constructed and deferred-closed here even though `handle` doesn't call it yet, matching how [The gRPC Server →](/shopmicro/en/order-service/grpc-server/) dialed Order's Catalog client a full lesson before `CreateOrder` used it — the dependency is wired now, the logic that needs it lands next.
+
+## Verify
+
+Bring up Postgres and Kafka, and run Catalog, Order, and the gateway exactly as [REST Mapping →](/shopmicro/en/gateway/rest-mapping/) left them running:
+
+```bash
+cd deploy/compose && docker compose up -d postgres kafka
+```
+
+```bash
+go run ./services/catalog/cmd
+```
+
+```bash
+go run ./services/order/cmd
+```
+
+```bash
+go run ./gateway/cmd
+```
+
+In a fourth terminal, start Payment:
+
+```bash
+go run ./services/payment/cmd
+```
+
+```txt
+payment: consumer started, group=payment topic=orders
+```
+
+Create a product and place an order over REST, exactly as [REST Mapping →](/shopmicro/en/gateway/rest-mapping/)'s Verify section does:
+
+```bash
+curl -s -X POST localhost:8080/v1/products \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Coffee Mug","description":"350ml ceramic mug","price_cents":1299,"stock":50}'
+```
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
+```
+
+Back in Payment's terminal, within moments of the order being created:
+
+```txt
+payment: consumed order.created id=3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90 aggregate_id=3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90
+```
+
+Payment saw this the instant Order's outbox relay published it — no call from Order to Payment happened anywhere in this flow. Stop Payment with `Ctrl-C` and confirm the shutdown log:
+
+```txt
+payment: shutting down
+```
+
+Then confirm the module still builds:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+Check your understanding:
+
+- If Notification (Module 9) starts its own `kafka.NewConsumer(brokers, "notification", "orders")` tomorrow, does it need Payment's cooperation to see every past and future `order.created` event? Why or why not?
+- Why does `handle` return `nil` — not an error — for an `order.confirmed` or `order.cancelled` event, instead of, say, logging a warning and skipping the commit?
+- What would change about Payment's guarantees if it shared its consumer group (`"payment"`) with a second Payment instance versus a completely different service?
+
+## Recap
+
+`services/payment/cmd/main.go` builds a `kafka.Publisher`, a `kafka.Consumer` in its own `"payment"` consumer group reading the `"orders"` topic, and runs a placeholder handler in a goroutine, shutting down cleanly on `SIGINT`/`SIGTERM` via a cancellable `context.Context` — the exact pattern every long-running goroutine in this course follows. The handler's filter, `if e.Type != "order.created" { return nil }`, is necessary because [Outbox & Relay →](/shopmicro/en/kafka/outbox-relay/) routes every `order.*` event type to this same topic, and Payment only cares about the first one. Because `"payment"` is a consumer group nothing else in this system shares, Payment gets a complete, independent view of every order ever created — verified by creating an order through the gateway and watching Payment's log react within moments, with no direct call from Order to Payment anywhere in the path. Next, [Process & Publish →](/shopmicro/en/payment-service/process-publish/) replaces the placeholder with `internal/processor.Processor`: the deterministic decision that turns each `order.created` into a `payment.succeeded` or `payment.failed` event on the `"payments"` topic.
