@@ -1,0 +1,127 @@
+---
+title: Acks, Retry & Dead Letters
+description: "The manual-ack and dead-letter machinery Exchanges & Queues already wired up but didn't yet prove under failure: autoAck=false, prefetch/Qos for fair dispatch, x-dead-letter-exchange args, why Nack(requeue=false) beats Nack(requeue=true), delayed-retry options, and at-least-once delivery. Verified by forcing a handler to fail and watching the message land in notification.send.dead."
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+No new code — [Exchanges & Queues →](/shopmicro/en/rabbitmq/exchanges-queues/) already wrote `Client.Connect`'s `Qos` call, `DeclareTopology`'s dead-letter arguments, and `Client.Consume`'s ack/nack logic, and used all three without explaining why they're shaped the way they are. This lesson names each one, then uses `cmd/rabbitmqdemo/consume`'s `-fail` flag — added but unused in the previous lesson — to force a delivery to fail and watch it actually arrive in `notification.send.dead`.
+
+## Why
+
+`Consume` calls `ch.Consume` with `autoAck` set to `false`. That single flag is the difference between two entirely different delivery models: with `autoAck=true`, RabbitMQ considers a message handled the instant it hands the bytes to the client library, before a single line of `handle` has run — a crash between delivery and processing loses the message with no trace. With `autoAck=false`, a message stays **unacknowledged** — still logically in the queue, just invisible to other consumers — until this code explicitly calls `Ack` or `Nack`. If the process crashes with unacked deliveries outstanding, RabbitMQ notices the connection drop and redelivers them to another consumer. That is what makes this system's RabbitMQ jobs **at-least-once**, the same guarantee [Producer & Consumer →](/shopmicro/en/kafka/producer-consumer/)'s manual-commit Kafka consumers made, for the identical reason: losing a `notification.send` job silently is worse than occasionally sending the same notification twice, which is why [Architecture →](/shopmicro/en/introduction/architecture/)'s idempotent-consumer requirement applies here just as much as it does to Kafka.
+
+`Connect` calls `ch.Qos(prefetchCount, 0, false)` with `prefetchCount` set to 10. Prefetch caps how many unacked deliveries a single consumer can hold at once — RabbitMQ stops pushing new messages to a consumer once it's holding that many unacked ones, and only resumes once some are acked or nacked. Without a limit, RabbitMQ pushes messages to whichever consumer it can reach fastest, which in practice means one already-busy consumer can end up holding thousands of unacked messages while an idle consumer sitting right next to it gets nothing — the opposite of the load-balancing "competing consumers" behavior [Exchanges & Queues →](/shopmicro/en/rabbitmq/exchanges-queues/) named as RabbitMQ's whole reason to exist. A small prefetch (10, or even 1) trades a little per-consumer throughput for genuinely fair dispatch across every worker consuming the same queue.
+
+Now the failure path. When `handle` returns an error, `Consume` calls `d.Nack(false, false)` — the second argument, `requeue`, is `false`. It would be simpler to write `Nack(false, true)` and requeue the message for the *same* queue to try again immediately. Don't: if the failure is something the message itself will always trigger — malformed JSON, a downstream API that will reject this exact payload forever, a `nil` field the handler never checks for — `requeue=true` hands the exact same poison message straight back to the front of the queue, some consumer fetches it again, fails again, requeues it again, forever. That loop burns CPU and floods logs while producing zero progress, and with a small prefetch it can also block every *other* message queued behind the poison one, since the consumer stuck retrying never gets to see them. `requeue=false` combined with `DeclareTopology`'s dead-letter arguments (`x-dead-letter-exchange: shopmicro.dlx`, `x-dead-letter-routing-key: notification.send`) routes a nacked message to `notification.send.dead` instead — out of the retry loop entirely, sitting somewhere a human or a separate reprocessing tool can look at it, while every message behind it keeps flowing normally.
+
+That said, dead-lettering on the very first failure is the simplest possible policy, not the only reasonable one — a transient failure (the downstream email provider timed out once) really might succeed on a second attempt seconds later, and permanently dead-lettering it after one failure throws that job away for good. Two production patterns worth knowing, neither implemented in `pkg/amqp` today: **TTL + DLX cycling**, where a nacked message is dead-lettered into a *holding* queue with a short message TTL and no consumer, and that holding queue's own dead-letter arguments point back at the original exchange — when the TTL expires, RabbitMQ dead-letters it *again*, which lands it back in `notification.send` for another attempt, giving a delay-then-retry without any application code polling anything; and a **retry-count header**, where a consumer reads the `x-death` header RabbitMQ automatically attaches on every dead-letter hop (it records how many times and why) or maintains its own counter, and only truly gives up — dead-lettering to a queue nothing ever retries — after N attempts. Either is a deliberate, separate piece of infrastructure to add on top of the straight one-strike dead-lettering this lesson verifies; `notification.send` doesn't need it yet, but a future queue with flakier downstream dependencies might.
+
+## Pros & cons
+
+**`Nack(false, false)` → dead-letter queue** (what `Consume` does) vs. **`Nack(false, true)` → requeue**
+
+- **Pros:** a message that will never succeed gets removed from the live queue after exactly one failed attempt, so it can never block or starve the messages behind it, and it lands somewhere visible (`notification.send.dead`) instead of vanishing into an invisible retry loop.
+- **Cons:** a message that failed for a purely transient reason (a downstream timeout) is dead-lettered on the very first attempt too, with no automatic retry — recovering it means a human or a separate tool has to notice it in the dead-letter queue and republish it, unless TTL+DLX cycling or a retry-count header is added specifically to give transient failures a few automatic attempts first.
+
+**Small prefetch (10)** vs. **large or unlimited prefetch**
+
+- **Pros:** small prefetch keeps dispatch fair across every competing consumer of the same queue — no single consumer can hoard work while others sit idle — and it caps how much in-flight, not-yet-acked work a single crashed consumer can lose track of at once.
+- **Cons:** a small prefetch means more round trips between broker and consumer relative to a large one, capping a single consumer's maximum throughput slightly below what it could sustain with a bigger buffer of pre-fetched work — a real trade against fairness, not a free lunch.
+
+## Set it up
+
+Nothing new to write — the two pieces this lesson is about are already sitting in `pkg/amqp/amqp.go` from [Exchanges & Queues →](/shopmicro/en/rabbitmq/exchanges-queues/). Worth re-reading them with this lesson's framing in mind:
+
+```go
+if err := ch.Qos(prefetchCount, 0, false); err != nil {
+	ch.Close()
+	conn.Close()
+	return nil, fmt.Errorf("amqp: set qos: %w", err)
+}
+```
+
+```go
+for d := range deliveries {
+	if err := handle(context.Background(), d.Body); err != nil {
+		log.Printf("amqp: handle delivery from %s: %v — dead-lettering", queue, err)
+		if nackErr := d.Nack(false, false); nackErr != nil {
+			return fmt.Errorf("amqp: nack delivery: %w", nackErr)
+		}
+		continue
+	}
+
+	if err := d.Ack(false); err != nil {
+		return fmt.Errorf("amqp: ack delivery: %w", err)
+	}
+}
+```
+
+And the flag `cmd/rabbitmqdemo/consume/main.go` already declared but didn't need until now:
+
+```go
+fail := flag.Bool("fail", false, "always fail, forcing every delivery to be dead-lettered")
+```
+
+## Verify
+
+Make sure Module 1's RabbitMQ container is up:
+
+```bash
+cd deploy/compose && docker compose up -d rabbitmq
+```
+
+Start a consumer that always fails:
+
+```bash
+go run ./cmd/rabbitmqdemo/consume -fail
+```
+
+In a second terminal, publish a demo job — the same publisher from the previous lesson, unchanged:
+
+```bash
+go run ./cmd/rabbitmqdemo/publish
+```
+
+```txt
+published: notification.send
+```
+
+Back in the failing consumer's terminal, `handle` runs, logs the message, returns an error, and `Consume` nacks it without requeueing:
+
+```txt
+consumed from notification.send: {"to":"customer@example.com","message":"Your order has shipped"}
+amqp: handle delivery from notification.send: simulated handler failure — dead-lettering
+```
+
+Stop that consumer with `Ctrl-C`. The message is no longer on `notification.send` — it's on `notification.send.dead`. Drain the dead-letter queue with the same program, pointed at the dead queue instead:
+
+```bash
+go run ./cmd/rabbitmqdemo/consume -queue notification.send.dead
+```
+
+```txt
+consumed from notification.send.dead: {"to":"customer@example.com","message":"Your order has shipped"}
+```
+
+The exact job that failed on `notification.send` really did arrive on `notification.send.dead`, byte for byte. You can confirm the same thing visually in the management UI at [http://localhost:15672](http://localhost:15672) → **Queues and Streams** → `notification.send.dead` → **Get messages**, which is the same inspection a production operator would do to decide whether to fix and republish a dead-lettered job.
+
+Then confirm the module still builds:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+Check your understanding:
+
+- Why would changing `Nack(false, false)` to `Nack(false, true)` in `Consume` risk an infinite loop for a message that always fails, but not for one that fails only once?
+- What problem does a retry-count header or TTL+DLX cycling solve that straight one-strike dead-lettering doesn't?
+- Why does a small `prefetchCount` matter more when a queue has multiple competing consumers than when it only ever has one?
+
+## Recap
+
+`autoAck=false` plus explicit `Ack`/`Nack` is what makes RabbitMQ jobs in this system **at-least-once**, exactly like Kafka's manual-commit consumers — and exactly why every handler built on `Consume` must be idempotent. `Qos(prefetchCount, 0, false)` caps how many unacked deliveries one consumer can hold, keeping dispatch fair across every competing consumer of the same queue. `Nack(false, false)` sends a failed delivery to `notification.send.dead` via the dead-letter arguments `DeclareTopology` already set — deliberately not `requeue=true`, which would risk looping a poison message forever instead of surfacing it. TTL+DLX cycling and retry-count headers are the two standard ways to add automatic delayed retries on top of this, for queues where transient failures are common enough to be worth a few automatic attempts before giving up for good — not implemented here, but worth knowing before Notification (Module 10) needs them. This closes Module 7: [Payment Service →](/shopmicro/en/payment-service/) and [Notification Service →](/shopmicro/en/notification-service/) both build real services on top of `pkg/kafka` and `pkg/amqp`, exactly as they stand today.

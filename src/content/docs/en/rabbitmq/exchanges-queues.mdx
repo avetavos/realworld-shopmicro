@@ -1,0 +1,391 @@
+---
+title: Exchanges & Queues
+description: "pkg/amqp.Client — Connect, DeclareTopology, Publish, and a first Consume, wrapping rabbitmq/amqp091-go. The AMQP 0.9.1 model (connections, channels, exchanges, queues, bindings, routing keys) and the core distinction between RabbitMQ's work queue and Kafka's replayable log. Verified with a tiny publish-then-consume demo against Module 1's RabbitMQ broker."
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+`pkg/amqp/amqp.go` — a `Client` wrapping `rabbitmq/amqp091-go`'s `Connection` and `Channel`, with `Connect` (dial plus a fair-dispatch prefetch setting), `DeclareTopology` (the exchange, queues, and bindings every service that touches this queue shares), `Publish`, and `Consume`. This is shared code: [Architecture →](/shopmicro/en/introduction/architecture/) already named the shape — "Notification enqueuing a RabbitMQ send-job for a worker" — and the Notification service (Module 10) will use `Consume` unmodified to run that exact `notification.send` job queue.
+
+To prove the wrapper works against a real broker before anything else depends on it, this lesson also writes two tiny, throwaway programs — `cmd/rabbitmqdemo/publish` and `cmd/rabbitmqdemo/consume` — that publish one job and consume it back, against the RabbitMQ container [Infra & Compose →](/shopmicro/en/setup/infra-compose/) already stood up in Module 1.
+
+## Why
+
+AMQP 0.9.1 (the protocol RabbitMQ speaks) has a small, fixed vocabulary. A **connection** is one TCP link to the broker; a **channel** is a lightweight virtual connection multiplexed over it — real client code opens one connection and one or a few channels, never a connection per operation. An **exchange** is where a publisher actually sends messages; it never touches a queue directly. A **queue** is where messages wait for a consumer to fetch them. A **binding** links an exchange to a queue, with a **routing key** the exchange uses to decide which bound queue(s) a given message should go to. `DeclareTopology` declares one **direct** exchange, `shopmicro`, and binds the `notification.send` queue to it under the routing key `notification.send` — a direct exchange forwards a message to every queue whose binding key is an *exact* match for the message's routing key, which is exactly "send this job to this queue," nothing fancier. (RabbitMQ also has **topic** exchanges, which match routing keys against wildcard patterns like `order.*`, and **fanout** exchanges, which ignore the routing key and broadcast to every bound queue — neither is what a single named job queue needs.)
+
+That queue is a **work queue**, and it behaves fundamentally differently from the Kafka topics [Producer & Consumer →](/shopmicro/en/kafka/producer-consumer/) built in Module 6. In RabbitMQ, one message is delivered to **exactly one** consumer — if two worker processes both call `Consume` on `notification.send`, RabbitMQ splits the queue's messages between them (**competing consumers**), and adding a third worker increases throughput by giving each worker fewer messages, not by duplicating work. A queue also **removes** a message once it's acknowledged — there is nothing left to replay, and a brand-new consumer that starts up tomorrow sees only whatever hasn't been consumed yet, never history. Kafka is the opposite on both counts: every distinct consumer group sees **every** message on a topic regardless of what any other group has done, and a committed offset doesn't delete anything, so a new consumer group can replay the entire log from the beginning. Neither model is strictly better — they answer different questions. "Has every interested party seen this event, possibly including services that don't exist yet?" is Kafka's question, which is why `order.created` is a Kafka event that Payment, Notification, and Order's own saga all independently consume. "Is there a job that needs to be done exactly once, by whichever worker is free?" is RabbitMQ's question, which is why "send this one notification" is a RabbitMQ job, not a Kafka event — nobody else needs to see it, and once it's sent it's done.
+
+## Pros & cons
+
+**RabbitMQ work queue** (this module) vs. **Kafka log** ([Module 6 →](/shopmicro/en/kafka/))
+
+- **Pros:** a message is removed once handled, so there's no risk of a slow or buggy extra consumer group quietly reprocessing it forever; competing consumers give simple horizontal scaling for a job queue — add workers, each does less; per-message acknowledgment (next lesson) gives fine-grained retry and dead-lettering per job.
+- **Cons:** no replay — a consumer that was down when a job was published, or a brand-new consumer added later, has permanently missed it; broadcasting the same message to multiple independent consumers requires an explicit fan-out exchange plus one queue per consumer, rather than Kafka's "every consumer group already sees everything" default.
+
+**A direct exchange** (used here) vs. **topic or fanout exchanges**
+
+- **Pros:** exact routing-key matching is the simplest possible rule to reason about — "this job goes to this queue," full stop — with no pattern-matching cost and no risk of a wildcard binding accidentally catching a routing key it shouldn't.
+- **Cons:** a direct exchange can't express "route anything starting with `notification.`" (that needs a topic exchange) or "give a copy to every subscriber" (that needs fanout) — if `pkg/amqp` ever grows a second job type that some queues want and others don't, a direct exchange's exact-match binding is the least flexible of RabbitMQ's routing options.
+
+## Set it up
+
+### 1. `pkg/amqp/amqp.go`
+
+```go
+// Package amqp wraps rabbitmq/amqp091-go's Connection and Channel behind a
+// small, project-specific Client, so every service that publishes or
+// consumes work-queue jobs — starting with Notification's notification.send
+// queue — does it the same way: one exchange, manual acks, and a
+// dead-letter queue for messages a handler can't process.
+package amqp
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	amqp091 "github.com/rabbitmq/amqp091-go"
+)
+
+const (
+	exchangeName      = "shopmicro"
+	dlxName           = "shopmicro.dlx"
+	notificationQueue = "notification.send"
+	deadQueue         = "notification.send.dead"
+	prefetchCount     = 10
+)
+
+// Client wraps a single AMQP connection and the one channel opened on it.
+type Client struct {
+	conn *amqp091.Connection
+	ch   *amqp091.Channel
+}
+
+// Connect dials url, opens one channel on the connection, and sets that
+// channel's prefetch (Qos) to prefetchCount unacknowledged deliveries at a
+// time. Prefetch is what makes competing consumers fair: a consumer
+// holding prefetchCount unacked messages stops receiving more until it
+// acks or nacks what it already has, instead of one slow worker hoarding
+// the whole queue while idle workers starve.
+func Connect(url string) (*Client, error) {
+	conn, err := amqp091.Dial(url)
+	if err != nil {
+		return nil, fmt.Errorf("amqp: dial: %w", err)
+	}
+
+	ch, err := conn.Channel()
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("amqp: open channel: %w", err)
+	}
+
+	if err := ch.Qos(prefetchCount, 0, false); err != nil {
+		ch.Close()
+		conn.Close()
+		return nil, fmt.Errorf("amqp: set qos: %w", err)
+	}
+
+	return &Client{conn: conn, ch: ch}, nil
+}
+
+// DeclareTopology declares the exchange, queues, and bindings every service
+// in this system shares: a durable direct exchange ("shopmicro") that
+// routes by exact routing key; the "notification.send" work queue, bound to
+// that exchange under its own name as the routing key, with dead-letter
+// arguments pointing at a second exchange ("shopmicro.dlx"); and
+// "notification.send.dead", bound to the dead-letter exchange, which
+// receives any message the main queue dead-letters. Safe to call every
+// time a service starts — declaring an already-existing exchange or queue
+// with identical arguments is a no-op.
+func (c *Client) DeclareTopology() error {
+	if err := c.ch.ExchangeDeclare(
+		exchangeName,
+		amqp091.ExchangeDirect,
+		true,  // durable
+		false, // autoDelete
+		false, // internal
+		false, // noWait
+		nil,   // args
+	); err != nil {
+		return fmt.Errorf("amqp: declare exchange %s: %w", exchangeName, err)
+	}
+
+	if err := c.ch.ExchangeDeclare(
+		dlxName,
+		amqp091.ExchangeDirect,
+		true,
+		false,
+		false,
+		false,
+		nil,
+	); err != nil {
+		return fmt.Errorf("amqp: declare exchange %s: %w", dlxName, err)
+	}
+
+	if _, err := c.ch.QueueDeclare(
+		notificationQueue,
+		true,  // durable
+		false, // autoDelete
+		false, // exclusive
+		false, // noWait
+		amqp091.Table{
+			"x-dead-letter-exchange":    dlxName,
+			"x-dead-letter-routing-key": notificationQueue,
+		},
+	); err != nil {
+		return fmt.Errorf("amqp: declare queue %s: %w", notificationQueue, err)
+	}
+
+	if err := c.ch.QueueBind(
+		notificationQueue,
+		notificationQueue, // routing key
+		exchangeName,
+		false, // noWait
+		nil,   // args
+	); err != nil {
+		return fmt.Errorf("amqp: bind queue %s: %w", notificationQueue, err)
+	}
+
+	if _, err := c.ch.QueueDeclare(
+		deadQueue,
+		true,
+		false,
+		false,
+		false,
+		nil,
+	); err != nil {
+		return fmt.Errorf("amqp: declare queue %s: %w", deadQueue, err)
+	}
+
+	if err := c.ch.QueueBind(
+		deadQueue,
+		notificationQueue, // matches the main queue's x-dead-letter-routing-key
+		dlxName,
+		false,
+		nil,
+	); err != nil {
+		return fmt.Errorf("amqp: bind queue %s: %w", deadQueue, err)
+	}
+
+	return nil
+}
+
+// Publish sends body to the shopmicro exchange, routed to whichever queue
+// is bound under routingKey. DeliveryMode: Persistent tells RabbitMQ to
+// write the message to disk, so it survives a broker restart — a durable
+// exchange and durable queue alone aren't enough without this; a
+// non-persistent message published into a durable queue is still lost if
+// the broker restarts before it's consumed.
+func (c *Client) Publish(ctx context.Context, routingKey string, body []byte) error {
+	err := c.ch.PublishWithContext(ctx, exchangeName, routingKey,
+		false, // mandatory
+		false, // immediate
+		amqp091.Publishing{
+			ContentType:  "application/json",
+			DeliveryMode: amqp091.Persistent,
+			Body:         body,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("amqp: publish to %s (routing key %s): %w", exchangeName, routingKey, err)
+	}
+	return nil
+}
+
+// Consume starts delivering messages from queue and passes each one's body
+// to handle. autoAck is false: a message is only removed from the queue
+// once this code explicitly acknowledges it. If handle returns nil, the
+// delivery is acked. If handle returns an error, the delivery is nacked
+// with requeue=false, which — because DeclareTopology set this queue's
+// dead-letter arguments — routes it to notification.send.dead instead of
+// looping (see the next lesson for why requeue=false is the right choice
+// here). Consume blocks until the delivery channel closes.
+func (c *Client) Consume(queue string, handle func(context.Context, []byte) error) error {
+	deliveries, err := c.ch.Consume(
+		queue,
+		"",    // consumer tag: let the server generate one
+		false, // autoAck
+		false, // exclusive
+		false, // noLocal
+		false, // noWait
+		nil,   // args
+	)
+	if err != nil {
+		return fmt.Errorf("amqp: consume %s: %w", queue, err)
+	}
+
+	for d := range deliveries {
+		if err := handle(context.Background(), d.Body); err != nil {
+			log.Printf("amqp: handle delivery from %s: %v — dead-lettering", queue, err)
+			if nackErr := d.Nack(false, false); nackErr != nil {
+				return fmt.Errorf("amqp: nack delivery: %w", nackErr)
+			}
+			continue
+		}
+
+		if err := d.Ack(false); err != nil {
+			return fmt.Errorf("amqp: ack delivery: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// Close closes the channel, then the connection.
+func (c *Client) Close() {
+	c.ch.Close()
+	c.conn.Close()
+}
+```
+
+Save this as `pkg/amqp/amqp.go`, and pull in the client library:
+
+```bash
+go get github.com/rabbitmq/amqp091-go
+```
+
+### 2. A tiny publish → consume demo
+
+Two throwaway programs, not part of any service, that exist purely to prove `Client` works end to end against a real broker.
+
+```go
+// Command publish sends a single demo notification job to the
+// "notification.send" queue — nothing wired into any service, just proof
+// that Client.Publish works end to end against a running RabbitMQ broker.
+package main
+
+import (
+	"context"
+	"log"
+
+	"github.com/avetavos/shopmicro/pkg/amqp"
+	"github.com/avetavos/shopmicro/pkg/config"
+)
+
+func main() {
+	url := config.Get("RABBITMQ_URL", "amqp://shopmicro:shopmicro@localhost:5672/")
+
+	client, err := amqp.Connect(url)
+	if err != nil {
+		log.Fatalf("connect: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.DeclareTopology(); err != nil {
+		log.Fatalf("declare topology: %v", err)
+	}
+
+	body := []byte(`{"to":"customer@example.com","message":"Your order has shipped"}`)
+
+	if err := client.Publish(context.Background(), "notification.send", body); err != nil {
+		log.Fatalf("publish: %v", err)
+	}
+
+	log.Println("published: notification.send")
+}
+```
+
+Save this as `cmd/rabbitmqdemo/publish/main.go`.
+
+```go
+// Command consume drains a queue with Client.Consume and prints each
+// delivery's body — nothing wired into any service, just proof that the
+// fetch/handle/ack (or nack-to-dead-letter) loop works end to end. Pass
+// -fail to always return an error from handle instead of nil, simulating a
+// handler that can never process its job; the next lesson uses this flag
+// to prove the dead-letter path really works.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+
+	"github.com/avetavos/shopmicro/pkg/amqp"
+	"github.com/avetavos/shopmicro/pkg/config"
+)
+
+func main() {
+	queue := flag.String("queue", "notification.send", "queue to consume from")
+	fail := flag.Bool("fail", false, "always fail, forcing every delivery to be dead-lettered")
+	flag.Parse()
+
+	url := config.Get("RABBITMQ_URL", "amqp://shopmicro:shopmicro@localhost:5672/")
+
+	client, err := amqp.Connect(url)
+	if err != nil {
+		log.Fatalf("connect: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.DeclareTopology(); err != nil {
+		log.Fatalf("declare topology: %v", err)
+	}
+
+	err = client.Consume(*queue, func(_ context.Context, body []byte) error {
+		log.Printf("consumed from %s: %s", *queue, string(body))
+		if *fail {
+			return fmt.Errorf("simulated handler failure")
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("consume: %v", err)
+	}
+}
+```
+
+Save this as `cmd/rabbitmqdemo/consume/main.go`. Both default to `RABBITMQ_URL=amqp://shopmicro:shopmicro@localhost:5672/`, the same variable and default [Repo Layout →](/shopmicro/en/setup/repo-layout/)'s `.env.example` already documents.
+
+## Verify
+
+Make sure Module 1's RabbitMQ container is up:
+
+```bash
+cd deploy/compose && docker compose up -d rabbitmq
+```
+
+In one terminal, start the consumer first, so it's already subscribed when the job is published:
+
+```bash
+go run ./cmd/rabbitmqdemo/consume
+```
+
+In a second terminal, publish the demo job:
+
+```bash
+go run ./cmd/rabbitmqdemo/publish
+```
+
+```txt
+published: notification.send
+```
+
+Back in the consumer's terminal:
+
+```txt
+consumed from notification.send: {"to":"customer@example.com","message":"Your order has shipped"}
+```
+
+Stop the consumer with `Ctrl-C`. Then open the management UI at [http://localhost:15672](http://localhost:15672) (login `shopmicro` / `shopmicro`), click **Queues and Streams**, and confirm both `notification.send` and `notification.send.dead` exist, each durable, with `notification.send` back at 0 messages (the demo job was acked and removed) and `notification.send.dead` empty — nothing has failed yet.
+
+Then confirm the module still builds:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+Check your understanding:
+
+- Why does a direct exchange fit a single named job queue better than a topic or fanout exchange would?
+- If two `cmd/rabbitmqdemo/consume` processes both consumed from `notification.send` at once, what would happen to a stream of published jobs?
+- Why does Kafka's `orders` topic let a brand-new consumer group replay every past `order.created` event, while `notification.send` never lets a new consumer see a job that's already been acked?
+
+## Recap
+
+`pkg/amqp.Client` wraps one AMQP connection and channel. `Connect` dials `RABBITMQ_URL` and sets prefetch to 10 for fair dispatch across competing consumers. `DeclareTopology` declares the durable direct exchange `shopmicro`, the `notification.send` work queue (bound to it, with dead-letter arguments already pointing at `shopmicro.dlx`), and `notification.send.dead` (bound to the dead-letter exchange) — all as one idempotent setup call. `Publish` sends a persistent message keyed by routing key; `Consume` fetches, hands each delivery to a caller-supplied `handle`, and acks or nacks based on the result. `cmd/rabbitmqdemo/publish` and `cmd/rabbitmqdemo/consume` proved the happy path works end to end against the real broker from Module 1. The core lesson: RabbitMQ's `notification.send` is a work queue — one job, one consumer, message gone once acked — the deliberate opposite of Kafka's replayable log. Next, [Acks, Retry & Dead Letters →](/shopmicro/en/rabbitmq/acks-retry-dlq/) looks closely at the manual-ack and dead-letter machinery this lesson already wired up but didn't yet prove under failure, before [Payment Service →](/shopmicro/en/payment-service/) and [Notification Service →](/shopmicro/en/notification-service/) put both `pkg/kafka` and `pkg/amqp` to work for real.
