@@ -1,0 +1,303 @@
+---
+title: The Product API
+description: "Implement ListProducts/GetProduct/CreateProduct บน Server ตัวจริงที่ผูกกับ ProductRepo, map repo.Product ไปเป็น catalogv1.Product, ตรวจสอบ input, และคืนค่า codes.NotFound/codes.InvalidArgument — ยืนยันแบบ end-to-end ด้วย grpcurl"
+sidebar:
+  order: 3
+---
+
+## What we're building
+
+`services/catalog/internal/server/server.go` — `Server` type ตัวจริงที่ implement ทั้งสามเมธอดของ `CatalogServiceServer` โดยผูกกับ `ProductRepo` จาก [The Postgres Repository →](/shopmicro/th/catalog-service/postgres-repo/) และการอัปเดต `services/catalog/cmd/main.go` ที่ต่อสายมันเข้าไป แทนที่ `placeholderServer` จาก [The gRPC Server →](/shopmicro/th/catalog-service/grpc-server/) เมื่อจบบทนี้ `CreateProduct`, `GetProduct`, และ `ListProducts` จะทำงานได้จริงแบบ end-to-end กับแถวข้อมูลจริงใน PostgreSQL
+
+## Why
+
+gRPC handler มีสองหน้าที่ที่มักจะปนกันได้ง่ายแต่จริง ๆ แล้วแยกกัน: การแปลระหว่างรูปร่างบน wire (`catalogv1.Product`) กับรูปร่างของ domain (`repo.Product`) และการตัดสินใจว่า error จาก repository *หมายถึง* อะไรสำหรับผู้เรียก `ProductRepo.Get` ที่คืนค่า `pgx.ErrNoRows` ที่ถูกห่อไว้เป็นข้อเท็จจริงเกี่ยวกับฐานข้อมูล; `Server.GetProduct` ที่ตัดสินใจว่าข้อเท็จจริงนั้นหมายถึง "คืนค่า `codes.NotFound`" เป็นการตัดสินใจเกี่ยวกับ API contract — และมันควรอยู่ที่นี่ ไม่ใช่ใน repository เพราะผู้ใช้ `ProductRepo` รายอื่น (เช่น batch job ในอนาคต) อาจอยากปฏิบัติกับ "ไม่พบสินค้านี้" ต่างไปจาก gRPC client โดยสิ้นเชิง การตรวจสอบ input ก็อยู่ที่นี่ด้วยเหตุผลเดียวกัน: `codes.InvalidArgument` เป็นวิธีปฏิเสธ input ที่ไม่ถูกต้องแบบเฉพาะของ gRPC และ repository ไม่ควรต้องรู้เลยว่า gRPC มีอยู่จริง
+
+## Pros & cons
+
+**ฟังก์ชัน mapping `toProto` โดยเฉพาะ แทนที่จะใช้ `repo.Product` เป็น wire type ไปเลย**
+
+- **Pros:** รูปร่างของแถวในฐานข้อมูลกับรูปร่างบน wire เป็นอิสระที่จะแยกทางกันได้ — `repo.Product.CreatedAt` ไม่มีที่ไปใน `catalogv1.Product` ตอนนี้ และก็ไม่เป็นไร เพราะฟังก์ชัน mapping เป็นจุดเดียวที่ตัดสินว่าอะไรข้ามขอบเขตไปได้; การเพิ่ม field ในฝั่งหนึ่งไม่ทำให้ output JSON/wire ของอีกฝั่งเปลี่ยนไปเงียบ ๆ
+- **Cons:** มันคือนิยาม struct ที่สองและฟังก์ชันเล็ก ๆ ที่ต้องคอยดูแลให้ตรงกันด้วยมือ — สำหรับ resource ที่เรียบง่ายขนาดนี้ นี่คือ boilerplate เชิงกลไกไม่กี่บรรทัดที่ code generator น่าจะสร้างแทนได้
+
+**ตรวจสอบ input ในชั้น `Server` ไม่ใช่ชั้น `ProductRepo`**
+
+- **Pros:** กฎการตรวจสอบที่เจาะจงกับ API contract *นี้* (`InvalidArgument` ของ gRPC client) ไม่รั่วไหลเข้าไปใน repository ที่ผู้เรียกรายอื่นอาจนำไปใช้ซ้ำด้วยกฎที่ต่างกัน; SQL ของ repository ยังคงโฟกัสอยู่ที่ "อ่าน/เขียนตารางนี้ยังไง" ล้วน ๆ ไม่ใช่ "input นี้รับได้ไหม"
+- **Cons:** ถ้ามี entry point ที่สองเข้าสู่ตารางเดียวกันในอนาคต (เช่น เครื่องมือ admin แบบ REST ที่เรียก `ProductRepo` โดยตรง) มันจะต้อง implement การตรวจสอบแบบเดียวกันซ้ำ — ไม่มีที่เดียวที่ทั้งสองจะใช้ร่วมกันได้อัตโนมัติ เว้นแต่การตรวจสอบนั้นจะถูกแยกออกไปเป็น package ของตัวเองในภายหลัง
+
+## Set it up
+
+### 1. `Server`
+
+```go
+// Package server implements catalogv1.CatalogServiceServer against a
+// ProductRepo.
+package server
+
+import (
+	"context"
+	"errors"
+
+	catalogv1 "github.com/avetavos/shopmicro/gen/shopmicro/catalog/v1"
+	"github.com/avetavos/shopmicro/services/catalog/internal/repo"
+	"github.com/jackc/pgx/v5"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+// Server implements catalogv1.CatalogServiceServer.
+type Server struct {
+	catalogv1.UnimplementedCatalogServiceServer
+	repo *repo.ProductRepo
+}
+
+// New returns a Server backed by productRepo.
+func New(productRepo *repo.ProductRepo) *Server {
+	return &Server{repo: productRepo}
+}
+
+// ListProducts returns a page of products.
+func (s *Server) ListProducts(ctx context.Context, req *catalogv1.ListProductsRequest) (*catalogv1.ListProductsResponse, error) {
+	page, pageSize := req.GetPage(), req.GetPageSize()
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 20
+	}
+
+	products, total, err := s.repo.List(ctx, int(page), int(pageSize))
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list products: %v", err)
+	}
+
+	resp := &catalogv1.ListProductsResponse{Total: int32(total)}
+	for _, p := range products {
+		resp.Products = append(resp.Products, toProto(p))
+	}
+	return resp, nil
+}
+
+// GetProduct returns a single product by id.
+func (s *Server) GetProduct(ctx context.Context, req *catalogv1.GetProductRequest) (*catalogv1.Product, error) {
+	if req.GetId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "id is required")
+	}
+
+	p, err := s.repo.Get(ctx, req.GetId())
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, status.Error(codes.NotFound, "product not found")
+		}
+		return nil, status.Errorf(codes.Internal, "get product: %v", err)
+	}
+	return toProto(*p), nil
+}
+
+// CreateProduct creates a new product.
+func (s *Server) CreateProduct(ctx context.Context, req *catalogv1.CreateProductRequest) (*catalogv1.Product, error) {
+	if req.GetName() == "" {
+		return nil, status.Error(codes.InvalidArgument, "name is required")
+	}
+	if req.GetPriceCents() < 0 {
+		return nil, status.Error(codes.InvalidArgument, "price_cents must be non-negative")
+	}
+	if req.GetStock() < 0 {
+		return nil, status.Error(codes.InvalidArgument, "stock must be non-negative")
+	}
+
+	p, err := s.repo.Create(ctx, req.GetName(), req.GetDescription(), req.GetPriceCents(), req.GetStock())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "create product: %v", err)
+	}
+	return toProto(*p), nil
+}
+
+func toProto(p repo.Product) *catalogv1.Product {
+	return &catalogv1.Product{
+		Id:          p.ID,
+		Name:        p.Name,
+		Description: p.Description,
+		PriceCents:  p.PriceCents,
+		Stock:       p.Stock,
+	}
+}
+```
+
+บันทึกไฟล์นี้เป็น `services/catalog/internal/server/server.go` สังเกตว่า `Server` embed `catalogv1.UnimplementedCatalogServiceServer` แบบ value เหมือนที่ placeholder ทำไว้ทุกประการ — นั่นไม่ใช่ของที่หลงเหลืออยู่ แต่เป็นการรับประกัน forward-compatibility แบบเดียวกันจาก [Code Generation →](/shopmicro/th/proto-grpc/codegen/): ถ้ามีการเพิ่ม RPC ตัวที่สี่เข้าไปใน `catalog.proto` วันไหน `Server` นี้ก็ยัง compile ผ่านอยู่ (ตกลงไปที่ `codes.Unimplemented` สำหรับ method ใหม่) แทนที่จะ build ไม่ผ่านจนกว่า implementation ทุกตัวจะถูกอัปเดต
+
+รายละเอียดเรื่อง mapping กับการตรวจสอบที่ควรพูดถึง:
+
+- **`ListProducts` ใส่ค่า default ให้ `page`/`pageSize` แทนที่จะปฏิเสธค่าศูนย์** client ที่ไม่ส่งทั้งสองค่ามา (ค่า zero value ของ field `int32` ที่ไม่ได้ตั้งค่าใน proto3) จะได้หน้า 1 ขนาด 20 แทนที่จะเจอ error — ค่า default ที่เป็นมิตรกว่าสำหรับ operation แบบอ่านอย่างเดียวที่ไม่ทำลายอะไร เมื่อเทียบกับการตรวจสอบที่เข้มงวดของ `CreateProduct`
+- **`GetProduct` และ `CreateProduct` ตรวจสอบ *ก่อน* ที่จะแตะ repository** การเช็ค `req.GetId() == ""` ก่อนหมายความว่า ID ว่างเปล่าจะไม่มีวันไปถึง SQL query เลย — มันถูกปฏิเสธในฐานะ client error (`InvalidArgument`) ไม่ใช่ "ไม่พบแถว" แบบ `NotFound` ซึ่งจะสื่อผิด ๆ ว่าสินค้าที่มี ID ว่างเปล่านั้นอาจมีอยู่จริงได้
+- **`errors.Is(err, pgx.ErrNoRows)` ไม่ใช่ `err == pgx.ErrNoRows`** `ProductRepo.Get` ห่อ error ด้วย `fmt.Errorf("...: %w", err)` ดังนั้นการเทียบด้วย `==` ตรง ๆ จะเป็น false เสมอ — `errors.Is` แกะ chain เพื่อหา sentinel error ตัวจริงที่อยู่ข้างใน
+- **error จาก repository ที่ไม่ใช่ "ไม่พบ" จะกลายเป็น `codes.Internal` ไม่ใช่ `codes.NotFound`** ฐานข้อมูลล่มจริง ๆ กับ "สินค้านี้ไม่มีอยู่จริง" เป็นความล้มเหลวคนละแบบที่มีความหมายต่างกันสำหรับ client — การรวมทั้งสองไว้ใน status code เดียวกันจะทำให้ `codes.NotFound` เป็นสัญญาณที่เชื่อถือไม่ได้
+
+### 2. ต่อสาย `Server` เข้ากับ `main.go`
+
+```go
+// Command catalog runs the Catalog gRPC server.
+package main
+
+import (
+	"context"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+
+	catalogv1 "github.com/avetavos/shopmicro/gen/shopmicro/catalog/v1"
+	"github.com/avetavos/shopmicro/pkg/config"
+	"github.com/avetavos/shopmicro/pkg/pg"
+	"github.com/avetavos/shopmicro/services/catalog/internal/repo"
+	"github.com/avetavos/shopmicro/services/catalog/internal/server"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
+)
+
+func main() {
+	ctx := context.Background()
+
+	dbURL := config.Get("CATALOG_DB_URL", "postgres://shopmicro:shopmicro@localhost:5432/catalog?sslmode=disable")
+	grpcAddr := config.Get("CATALOG_GRPC_ADDR", ":50051")
+
+	pool, err := pg.NewPool(ctx, dbURL)
+	if err != nil {
+		log.Fatalf("catalog: connect to postgres: %v", err)
+	}
+	defer pool.Close()
+
+	lis, err := net.Listen("tcp", grpcAddr)
+	if err != nil {
+		log.Fatalf("catalog: listen on %s: %v", grpcAddr, err)
+	}
+
+	productRepo := repo.New(pool)
+	catalogServer := server.New(productRepo)
+
+	grpcServer := grpc.NewServer()
+	catalogv1.RegisterCatalogServiceServer(grpcServer, catalogServer)
+	reflection.Register(grpcServer)
+
+	go func() {
+		log.Printf("catalog: gRPC server listening on %s", grpcAddr)
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("catalog: serve: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Println("catalog: shutting down")
+	grpcServer.GracefulStop()
+}
+```
+
+บันทึกทับ `services/catalog/cmd/main.go` การเปลี่ยนแปลงเดียวจากเวอร์ชันของ [The gRPC Server →](/shopmicro/th/catalog-service/grpc-server/): `productRepo := repo.New(pool)` และ `catalogServer := server.New(productRepo)` ตอนนี้สร้าง dependency chain ตัวจริง และ `RegisterCatalogServiceServer` ลงทะเบียน `catalogServer` แทน `&placeholderServer{}` ส่วนที่เหลือทั้งหมด — listener, การลงทะเบียน reflection, goroutine, การจัดการ signal — ไม่เปลี่ยนแปลงเลย เพราะไม่มีส่วนไหนเลยที่เคยเกี่ยวข้องกับ placeholder ตั้งแต่แรก
+
+## Verify
+
+รัน server ตัวจริง:
+
+```bash
+go run ./services/catalog/cmd
+```
+
+จาก terminal อีกอัน สร้างสินค้าสักชิ้น:
+
+```bash
+grpcurl -plaintext -d '{"name":"Coffee Mug","description":"350ml ceramic mug","price_cents":1299,"stock":50}' \
+  localhost:50051 shopmicro.catalog.v1.CatalogService/CreateProduct
+```
+
+```json
+{
+  "id": "8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21",
+  "name": "Coffee Mug",
+  "description": "350ml ceramic mug",
+  "priceCents": "1299",
+  "stock": 50
+}
+```
+
+สังเกตว่า `priceCents` กลับมาเป็น JSON **string** `"1299"` ไม่ใช่ตัวเลข `1299` — นั่นคือ mapping มาตรฐานของ protobuf JSON สำหรับ `int64` เพราะตัวเลข JSON ไม่สามารถแทนค่าจำนวนเต็ม 64 บิตได้ทุกค่าอย่างปลอดภัย `id` จะเป็น UUID ที่ต่างกันทุกครั้งที่คุณรันคำสั่งนี้ คัดลอกมันไว้สำหรับคำสั่งถัดไป
+
+ดึงข้อมูลกลับมาด้วย id (แทนที่ด้วย `id` จาก response ของ `CreateProduct` ของคุณเอง):
+
+```bash
+grpcurl -plaintext -d '{"id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21"}' \
+  localhost:50051 shopmicro.catalog.v1.CatalogService/GetProduct
+```
+
+```json
+{
+  "id": "8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21",
+  "name": "Coffee Mug",
+  "description": "350ml ceramic mug",
+  "priceCents": "1299",
+  "stock": 50
+}
+```
+
+List สินค้าและยืนยันว่าตัวที่คุณเพิ่งสร้างปรากฏอยู่ โดย `total` สะท้อนจำนวนแถวจริง:
+
+```bash
+grpcurl -plaintext -d '{"page":1,"pageSize":10}' \
+  localhost:50051 shopmicro.catalog.v1.CatalogService/ListProducts
+```
+
+```json
+{
+  "products": [
+    {
+      "id": "8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21",
+      "name": "Coffee Mug",
+      "description": "350ml ceramic mug",
+      "priceCents": "1299",
+      "stock": 50
+    }
+  ],
+  "total": 1
+}
+```
+
+ยืนยัน `codes.NotFound` สำหรับ id ที่ไม่มีอยู่จริง:
+
+```bash
+grpcurl -plaintext -d '{"id":"00000000-0000-0000-0000-000000000000"}' \
+  localhost:50051 shopmicro.catalog.v1.CatalogService/GetProduct
+```
+
+```txt
+ERROR:
+  Code: NotFound
+  Message: product not found
+```
+
+และ `codes.InvalidArgument` สำหรับ field ที่จำเป็นแต่ขาดหายไป:
+
+```bash
+grpcurl -plaintext -d '{"description":"no name given"}' \
+  localhost:50051 shopmicro.catalog.v1.CatalogService/CreateProduct
+```
+
+```txt
+ERROR:
+  Code: InvalidArgument
+  Message: name is required
+```
+
+สุดท้าย ยืนยันว่าทั้ง module ยัง build ผ่านอยู่:
+
+```bash
+go build ./...
+```
+
+ไม่มี output แปลว่าสำเร็จ
+
+## Recap
+
+`Server` ใน `services/catalog/internal/server/server.go` implement ทั้งสามเมธอดของ `CatalogServiceServer` โดยผูกกับ `ProductRepo`: `ListProducts` ใส่ค่า default ให้ field สำหรับ paging ที่ไม่ได้ตั้งค่ามาแทนที่จะปฏิเสธ, `GetProduct` และ `CreateProduct` ตรวจสอบ input ด้วย `status.Error(codes.InvalidArgument, ...)` ก่อนที่จะแตะ repository เลย และ `GetProduct` แปลง `pgx.ErrNoRows` ที่ถูกห่อไว้ (เช็คด้วย `errors.Is`) ให้เป็น `status.Error(codes.NotFound, "product not found")` — ในขณะที่ error อื่นใดจาก repository จะกลายเป็น `codes.Internal` ทำให้ `NotFound` เป็นสัญญาณที่เชื่อถือได้ ฟังก์ชัน `toProto` เล็ก ๆ เป็นจุดเดียวที่ `repo.Product` กับ `catalogv1.Product` แตะกัน `services/catalog/cmd/main.go` ตอนนี้ต่อสาย `repo.New(pool)` เข้ากับ `server.New(productRepo)` แทนที่ placeholder ของ [The gRPC Server →](/shopmicro/th/catalog-service/grpc-server/) และ `grpcurl` ยืนยันว่า `CreateProduct` → `GetProduct` → `ListProducts` ทำงานได้จริงแบบ end-to-end กับแถวข้อมูลจริงใน PostgreSQL โดยเช็ค `codes.NotFound` กับ `codes.InvalidArgument` ทั้งคู่โดยตรง นั่นคือ Module 3 เสร็จสมบูรณ์ — Catalog service เป็น gRPC server ที่ใช้งานได้จริงพร้อมฐานข้อมูลของตัวเอง ต่อไป [Order Service →](/shopmicro/th/order-service/) จะสร้าง Order service ที่เรียกเข้าไปที่ Catalog service นี้ผ่าน gRPC โดยตรงเพื่อดูราคาปัจจุบันของสินค้า

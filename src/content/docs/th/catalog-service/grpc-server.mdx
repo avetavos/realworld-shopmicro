@@ -1,0 +1,225 @@
+---
+title: The gRPC Server
+description: "ต่อสาย services/catalog/cmd/main.go: TCP listener, grpc.NewServer, reflection, การ implement CatalogServiceServer แบบ placeholder และการปิดระบบอย่างสุภาพเมื่อรับ SIGINT/SIGTERM"
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+`services/catalog/cmd/main.go` — composition root ของ Catalog service ไฟล์นี้คือจุดที่เปลี่ยนทุกอย่างที่ Module 2 generate ไว้ให้กลายเป็น process ที่รันได้จริง: เปิด connection pool ผ่าน `pkg/pg` เปิด listen พอร์ต TCP สร้าง `grpc.NewServer()` ลงทะเบียน implementation ของ `CatalogServiceServer` เปิดใช้งาน server reflection สั่ง serve แล้วปิดระบบอย่างสุภาพเมื่อรับ `SIGINT`/`SIGTERM`
+
+ตรงนี้มีปัญหาเรื่องลำดับที่ตั้งใจไว้: `main.go` ต้องการ **บางอย่าง** ที่ satisfy `catalogv1.CatalogServiceServer` เพื่อเอาไป register แต่ implementation จริงที่ผูกกับ repository ยังไม่ถูกสร้างจนกว่าจะถึง [The Postgres Repository →](/shopmicro/th/catalog-service/postgres-repo/) และ [The Product API →](/shopmicro/th/catalog-service/product-api/) บทนี้แก้ปัญหานั้นด้วยการลงทะเบียน **placeholder** — struct ที่ embed `catalogv1.UnimplementedCatalogServiceServer` แล้วไม่เพิ่มอะไรเข้าไปอีก แค่นี้ก็เพียงพอที่จะ compile ลงทะเบียน และรองรับ reflection ได้ **ตั้งแต่วันนี้** สองบทถัดไปจะเอามันออกแล้วแทนที่ด้วยของจริง
+
+## Why
+
+การแยก "process สตาร์ตได้ ฟังพอร์ตได้ ถูกค้นพบได้หรือยัง" ออกจาก "business logic ทำงานถูกต้องหรือยัง" เป็นการแบ่งที่มีประโยชน์จริงระหว่างการพัฒนา ไม่ใช่แค่เทคนิคเขียนคอร์ส gRPC server ที่ยังตอบ `GetProduct` ไม่ถูกต้อง ก็ยังมีค่าที่จะ `grpcurl` เข้าไปทดสอบได้อยู่ดี — คุณจะรู้ทันทีว่า listener bind พอร์ตถูกไหม ชื่อ service ที่ reflection รายงานตรงกับที่ `.proto` ประกาศไว้หรือไม่ และ process ของคุณสตาร์ตกับหยุดได้สะอาดภายใต้ process manager หรือเปล่า ทั้งหมดนี้ก่อนที่จะมี SQL สักบรรทัดเดียว บั๊กเรื่อง wiring (พอร์ตผิด ลืมเรียก `Register` server ที่ไม่มีวันกลับจาก `main` เพราะไม่ได้ต่อสาย shutdown ไว้) วินิจฉัยง่ายกว่ามากตอนที่แยกออกมาต่างหาก ไม่ปนกับ database query ที่ล้มเหลว
+
+## Pros & cons
+
+**ลงทะเบียน placeholder implementation ก่อน**
+
+- **Pros:** พิสูจน์ว่าชั้น transport — listener, การลงทะเบียน, reflection, การปิดระบบ — ทำงานได้ก่อนที่จะมี business logic มาทำให้บั๊กเรื่อง wiring หลุดสายตา; `grpcurl -plaintext localhost:50051 list` ให้ feedback จริงทันทีโดยไม่ต้องตั้งค่าฐานข้อมูลเลย
+- **Cons:** ทุก RPC ล้มเหลวด้วย `codes.Unimplemented` จริง ๆ จนกว่า `Server` ตัวจริงจะถูกต่อสายเข้าไปตอนท้าย [The Product API →](/shopmicro/th/catalog-service/product-api/) — นี่ยังไม่ใช่ service ที่ใช้งานได้ เป็นแค่ process ที่รันได้เท่านั้น
+
+**เปิดใช้งาน gRPC server reflection**
+
+- **Pros:** `grpcurl` (และเครื่องมือคล้ายกัน) ค้นพบ service, method, และรูปร่างของ message ได้โดยตรงจาก process ที่กำลังรัน — ไม่ต้องส่งไฟล์ `.proto` ให้ใครก็ตามที่จะเรียก service นี้จาก command line เลย ซึ่งเป็นสิ่งที่ทำให้ขั้นตอน `Verify` ด้านล่างเป็นไปได้โดยไม่ต้องมี gRPC client ของเราเอง
+- **Cons:** reflection เปิดเผยพื้นผิว API ทั้งหมดของคุณ — ทุกชื่อ service, method, และ field — ให้กับใครก็ตามที่เข้าถึงพอร์ตได้ นั่นโอเคสำหรับการพัฒนาในเครื่องหรือแม้แต่การเรียก gRPC ที่จำกัดอยู่ใน internal network ส่วนตัว แต่ก็เป็นเหตุผลจริงจังที่ควรปิดไว้หลัง environment flag ก่อนที่ server จะถูกเปิดเผยสู่สาธารณะ
+
+## Set it up
+
+### 1. `pkg/pg` — ตัวสร้าง connection pool ที่ใช้ร่วมกัน
+
+ทุก service ที่แตะ PostgreSQL จะเรียกฟังก์ชันเดียวกันนี้ มันสร้าง pool แล้วยืนยันว่าฐานข้อมูลเข้าถึงได้จริงด้วย `Ping` ก่อนที่จะส่ง pool กลับไป — เพื่อให้ `CATALOG_DB_URL` ที่ตั้งค่าผิดล้มเหลวอย่างชัดเจนตั้งแต่ตอนสตาร์ต แทนที่จะเงียบแล้วไปพังตอน query แรกที่ handler รัน
+
+```go
+// Package pg provides a shared pgxpool.Pool constructor so every service
+// connects to PostgreSQL the same way.
+package pg
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// NewPool creates a pgxpool.Pool for url and verifies connectivity with a
+// Ping before returning, so a service fails fast at startup instead of on
+// its first query.
+func NewPool(ctx context.Context, url string) (*pgxpool.Pool, error) {
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		return nil, fmt.Errorf("pg: create pool: %w", err)
+	}
+
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("pg: ping: %w", err)
+	}
+
+	return pool, nil
+}
+```
+
+บันทึกไฟล์นี้เป็น `pkg/pg/pg.go` สังเกต `pool.Close()` ในเส้นทางที่ `Ping` ล้มเหลว — ถ้าไม่มีบรรทัดนี้ pool ที่สร้างสำเร็จแต่ health check ไม่ผ่านจะรั่วไหล connection ที่อยู่ข้างใต้ไว้
+
+### 2. server interface ที่ service นี้ implement
+
+[Code Generation →](/shopmicro/th/proto-grpc/codegen/) ได้ generate interface นี้ลงใน `gen/shopmicro/catalog/v1/catalog_grpc.pb.go` ไว้แล้ว:
+
+```go
+type CatalogServiceServer interface {
+	ListProducts(context.Context, *ListProductsRequest) (*ListProductsResponse, error)
+	GetProduct(context.Context, *GetProductRequest) (*Product, error)
+	CreateProduct(context.Context, *CreateProductRequest) (*Product, error)
+	mustEmbedUnimplementedCatalogServiceServer()
+}
+```
+
+method ที่ไม่ export ชื่อ `mustEmbedUnimplementedCatalogServiceServer()` คือกลไกบังคับ: ทางเดียวที่จะ satisfy มันได้คือ embed `catalogv1.UnimplementedCatalogServiceServer` **แบบ value** เพราะมันเป็น type เดียวที่มี method ไม่ export ตัวนี้ตรงกัน นี่คือสิ่งที่ทำให้ `main.go` ลงทะเบียน `CatalogServiceServer` ที่ใช้งานได้ตั้งแต่วันนี้ โดยยังไม่ได้ implement RPC จริงสักตัวเดียวจากสามตัว:
+
+```go
+// placeholderServer satisfies catalogv1.CatalogServiceServer for now by
+// embedding UnimplementedCatalogServiceServer and overriding nothing — every
+// RPC returns codes.Unimplemented until the next two lessons build the real
+// repo and Server.
+type placeholderServer struct {
+	catalogv1.UnimplementedCatalogServiceServer
+}
+```
+
+ทุกการเรียก `ListProducts`, `GetProduct`, หรือ `CreateProduct` กับ type นี้จะตกลงไปที่ method ของ `UnimplementedCatalogServiceServer` เอง ซึ่งแต่ละตัวคืนค่า gRPC status เป็น `codes.Unimplemented` นี่คือ response ของ gRPC ที่ถูกต้องสมบูรณ์ — ไม่ใช่การ crash — ซึ่งเป็นเหตุผลที่ `grpcurl list` และ `grpcurl describe` ทำงานได้ปกติดีกับมัน
+
+### 3. `services/catalog/cmd/main.go`
+
+```go
+// Command catalog runs the Catalog gRPC server.
+package main
+
+import (
+	"context"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+
+	catalogv1 "github.com/avetavos/shopmicro/gen/shopmicro/catalog/v1"
+	"github.com/avetavos/shopmicro/pkg/config"
+	"github.com/avetavos/shopmicro/pkg/pg"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
+)
+
+// placeholderServer satisfies catalogv1.CatalogServiceServer for now by
+// embedding UnimplementedCatalogServiceServer and overriding nothing — every
+// RPC returns codes.Unimplemented until the next two lessons build the real
+// repo and Server.
+type placeholderServer struct {
+	catalogv1.UnimplementedCatalogServiceServer
+}
+
+func main() {
+	ctx := context.Background()
+
+	dbURL := config.Get("CATALOG_DB_URL", "postgres://shopmicro:shopmicro@localhost:5432/catalog?sslmode=disable")
+	grpcAddr := config.Get("CATALOG_GRPC_ADDR", ":50051")
+
+	pool, err := pg.NewPool(ctx, dbURL)
+	if err != nil {
+		log.Fatalf("catalog: connect to postgres: %v", err)
+	}
+	defer pool.Close()
+
+	lis, err := net.Listen("tcp", grpcAddr)
+	if err != nil {
+		log.Fatalf("catalog: listen on %s: %v", grpcAddr, err)
+	}
+
+	grpcServer := grpc.NewServer()
+	catalogv1.RegisterCatalogServiceServer(grpcServer, &placeholderServer{})
+	reflection.Register(grpcServer)
+
+	go func() {
+		log.Printf("catalog: gRPC server listening on %s", grpcAddr)
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("catalog: serve: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Println("catalog: shutting down")
+	grpcServer.GracefulStop()
+}
+```
+
+บันทึกไฟล์นี้เป็น `services/catalog/cmd/main.go` ไล่ดูตามลำดับ:
+
+- **`config.Get`** ([Go Module & Dependencies →](/shopmicro/th/setup/go-workspace/)) อ่าน `CATALOG_DB_URL` และ `CATALOG_GRPC_ADDR` จาก environment โดยมีค่า fallback ที่ปลอดภัยสำหรับพัฒนาในเครื่อง ตรงกับ `.env.example` และการตั้งค่า Compose จาก [Infra & Compose →](/shopmicro/th/setup/infra-compose/)
+- **`pg.NewPool`** เปิด pool และยืนยันว่าฐานข้อมูลเข้าถึงได้ก่อนที่จะทำอะไรต่อ — ถ้า Postgres ยังไม่ขึ้น process จะออกทันทีพร้อม error ที่ชัดเจน แทนที่จะสตาร์ต gRPC server ที่จะล้มเหลวเงียบ ๆ ตอน query จริงครั้งแรก
+- **`net.Listen("tcp", grpcAddr)`** bind พอร์ต *ก่อน* ที่จะสร้าง gRPC server ด้วยซ้ำ เพื่อให้ error พอร์ตถูกใช้งานอยู่แล้วปรากฏขึ้นทันทีและชัดเจน
+- **`grpc.NewServer()`** สร้าง server; `RegisterCatalogServiceServer` ผูก implementation ของเรา (placeholder ในตอนนี้) เข้ากับมัน; `reflection.Register` เปิดใช้งาน introspection service ที่ `grpcurl` คุยด้วย
+- **`go func() { ... grpcServer.Serve(lis) ... }()`** รันคำสั่ง `Serve` ที่ block ไว้ใน goroutine ของตัวเอง เพราะ `Serve` จะไม่ return จนกว่า server จะหยุด — ถ้ารันแบบ inline โค้ด signal-handling ด้านล่างจะไม่มีโอกาสได้รันเลย
+- **`signal.Notify` + `<-stop`** block main goroutine ไว้จนกว่า OS จะส่ง `SIGINT` (Ctrl-C) หรือ `SIGTERM` (สิ่งที่ `docker stop` และ Kubernetes ส่งมา) เมื่อถึงตอนนั้น `grpcServer.GracefulStop()` จะหยุดรับ RPC ใหม่แล้วรอ RPC ที่กำลังทำงานอยู่ให้เสร็จก่อน return นี่ตั้งใจให้เป็นเวอร์ชันที่เล็กที่สุดของ graceful shutdown — ไม่มี timeout สำหรับการปิดระบบ ไม่มีการ drain pool ของ `pg` อย่างชัดเจน — graceful shutdown ระดับ production เต็มรูปแบบสำหรับทุก service คือหน้าที่ของ [Resilience →](/shopmicro/th/resilience/) (Module 11)
+
+## Verify
+
+รัน service โดยตรงจาก source:
+
+```bash
+go run ./services/catalog/cmd
+```
+
+ผลลัพธ์ที่คาดหวัง:
+
+```txt
+catalog: gRPC server listening on :50051
+```
+
+ปล่อยให้มันรันอยู่ แล้วจาก terminal อีกอัน ถาม reflection ว่ามีอะไรอยู่บ้าง:
+
+```bash
+grpcurl -plaintext localhost:50051 list
+```
+
+คุณควรเห็น reflection service เองอยู่คู่กับ `CatalogService` (ชื่อ reflection service ที่แน่นอนอาจต่างกันเล็กน้อยตามเวอร์ชันของ grpc-go แต่ `shopmicro.catalog.v1.CatalogService` จะปรากฏเสมอ):
+
+```txt
+grpc.reflection.v1.ServerReflection
+shopmicro.catalog.v1.CatalogService
+```
+
+ยืนยันว่า placeholder คืนค่า `Unimplemented` จริง ๆ ไม่ใช่ crash:
+
+```bash
+grpcurl -plaintext -d '{"id":"anything"}' localhost:50051 shopmicro.catalog.v1.CatalogService/GetProduct
+```
+
+```txt
+ERROR:
+  Code: Unimplemented
+  Message: method GetProduct not implemented
+```
+
+หยุด server ด้วย `Ctrl-C` ใน terminal แรก แล้วยืนยันว่ามัน log บรรทัด shutdown ออกมา ไม่ใช่ค้างอยู่:
+
+```txt
+catalog: shutting down
+```
+
+จากนั้นยืนยันว่าทั้ง module ยัง build ผ่านอยู่:
+
+```bash
+go build ./...
+```
+
+ไม่มี output แปลว่าสำเร็จ
+
+## Recap
+
+`services/catalog/cmd/main.go` คือ composition root ของ Catalog service: `pkg/pg.NewPool` เปิดและตรวจสุขภาพ connection pool ของ PostgreSQL, `net.Listen` bind พอร์ต gRPC, `grpc.NewServer()` สร้าง server, `reflection.Register` เปิด introspection และ `placeholderServer` — ซึ่งเป็นแค่ `catalogv1.UnimplementedCatalogServiceServer` ที่ embed แบบ value — ก็ satisfy `CatalogServiceServer` ได้ดีพอที่จะลงทะเบียน serve และตอบ `grpcurl` ด้วย error `codes.Unimplemented` ที่ถูกต้องสมบูรณ์ `SIGINT`/`SIGTERM` จะสั่ง `grpcServer.GracefulStop()` เพื่อออกจากระบบอย่างสะอาด ต่อไป [The Postgres Repository →](/shopmicro/th/catalog-service/postgres-repo/) จะสร้าง `ProductRepo` ตัวจริงที่ placeholder นี้ยืนแทนอยู่

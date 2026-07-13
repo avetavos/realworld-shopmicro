@@ -1,0 +1,303 @@
+---
+title: The Product API
+description: "Implement ListProducts/GetProduct/CreateProduct on a real Server backed by ProductRepo, map repo.Product to catalogv1.Product, validate input, and return codes.NotFound/codes.InvalidArgument — verified end-to-end with grpcurl."
+sidebar:
+  order: 3
+---
+
+## What we're building
+
+`services/catalog/internal/server/server.go` — a real `Server` type that implements all three `CatalogServiceServer` methods against the `ProductRepo` from [The Postgres Repository →](/shopmicro/en/catalog-service/postgres-repo/), and the `services/catalog/cmd/main.go` update that wires it in, replacing the `placeholderServer` from [The gRPC Server →](/shopmicro/en/catalog-service/grpc-server/). By the end of this lesson, `CreateProduct`, `GetProduct`, and `ListProducts` all genuinely work end-to-end against real PostgreSQL rows.
+
+## Why
+
+A gRPC handler has two jobs that are easy to blur together but genuinely separate: translating between the wire shape (`catalogv1.Product`) and the domain shape (`repo.Product`), and deciding what a repository error *means* to a caller. `ProductRepo.Get` returning a wrapped `pgx.ErrNoRows` is a fact about the database; `Server.GetProduct` deciding that fact means "return `codes.NotFound`" is a decision about the API contract — and it belongs here, not in the repository, because a different consumer of `ProductRepo` (a future batch job, say) might want to treat "no such product" completely differently than a gRPC client does. Input validation belongs here for the same reason: `codes.InvalidArgument` is a gRPC-specific way of rejecting bad input, and the repository shouldn't need to know gRPC exists at all.
+
+## Pros & cons
+
+**A dedicated `toProto` mapping function, instead of reusing `repo.Product` as the wire type**
+
+- **Pros:** the database row shape and the wire shape are free to diverge — `repo.Product.CreatedAt` simply has nowhere to go in `catalogv1.Product` today, and that's fine, because the mapping function is the one place that decides what crosses the boundary; adding a field to one side doesn't silently change the other's JSON/wire output.
+- **Cons:** it's a second struct definition and a small function to keep in sync by hand — for a resource this simple, that's a few lines of mechanical boilerplate that a code generator could arguably produce instead.
+
+**Validating in the `Server` layer, not the `ProductRepo` layer**
+
+- **Pros:** validation rules that are specific to *this* API contract (a gRPC client's `InvalidArgument`) don't leak into a repository that other callers might reuse with different rules; the repository's SQL stays focused purely on "how do I read/write this table," not "is this input acceptable."
+- **Cons:** if a second entry point into the same table ever exists (a REST admin tool calling `ProductRepo` directly, say), it would need to re-implement the same validation — there's no single place both would automatically share it, unless that validation is later factored out into its own package.
+
+## Set it up
+
+### 1. `Server`
+
+```go
+// Package server implements catalogv1.CatalogServiceServer against a
+// ProductRepo.
+package server
+
+import (
+	"context"
+	"errors"
+
+	catalogv1 "github.com/avetavos/shopmicro/gen/shopmicro/catalog/v1"
+	"github.com/avetavos/shopmicro/services/catalog/internal/repo"
+	"github.com/jackc/pgx/v5"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+// Server implements catalogv1.CatalogServiceServer.
+type Server struct {
+	catalogv1.UnimplementedCatalogServiceServer
+	repo *repo.ProductRepo
+}
+
+// New returns a Server backed by productRepo.
+func New(productRepo *repo.ProductRepo) *Server {
+	return &Server{repo: productRepo}
+}
+
+// ListProducts returns a page of products.
+func (s *Server) ListProducts(ctx context.Context, req *catalogv1.ListProductsRequest) (*catalogv1.ListProductsResponse, error) {
+	page, pageSize := req.GetPage(), req.GetPageSize()
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 20
+	}
+
+	products, total, err := s.repo.List(ctx, int(page), int(pageSize))
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list products: %v", err)
+	}
+
+	resp := &catalogv1.ListProductsResponse{Total: int32(total)}
+	for _, p := range products {
+		resp.Products = append(resp.Products, toProto(p))
+	}
+	return resp, nil
+}
+
+// GetProduct returns a single product by id.
+func (s *Server) GetProduct(ctx context.Context, req *catalogv1.GetProductRequest) (*catalogv1.Product, error) {
+	if req.GetId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "id is required")
+	}
+
+	p, err := s.repo.Get(ctx, req.GetId())
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, status.Error(codes.NotFound, "product not found")
+		}
+		return nil, status.Errorf(codes.Internal, "get product: %v", err)
+	}
+	return toProto(*p), nil
+}
+
+// CreateProduct creates a new product.
+func (s *Server) CreateProduct(ctx context.Context, req *catalogv1.CreateProductRequest) (*catalogv1.Product, error) {
+	if req.GetName() == "" {
+		return nil, status.Error(codes.InvalidArgument, "name is required")
+	}
+	if req.GetPriceCents() < 0 {
+		return nil, status.Error(codes.InvalidArgument, "price_cents must be non-negative")
+	}
+	if req.GetStock() < 0 {
+		return nil, status.Error(codes.InvalidArgument, "stock must be non-negative")
+	}
+
+	p, err := s.repo.Create(ctx, req.GetName(), req.GetDescription(), req.GetPriceCents(), req.GetStock())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "create product: %v", err)
+	}
+	return toProto(*p), nil
+}
+
+func toProto(p repo.Product) *catalogv1.Product {
+	return &catalogv1.Product{
+		Id:          p.ID,
+		Name:        p.Name,
+		Description: p.Description,
+		PriceCents:  p.PriceCents,
+		Stock:       p.Stock,
+	}
+}
+```
+
+Save this as `services/catalog/internal/server/server.go`. Notice `Server` embeds `catalogv1.UnimplementedCatalogServiceServer` by value exactly like the placeholder did — that's not a leftover, it's the same forward-compatibility guarantee from [Code Generation →](/shopmicro/en/proto-grpc/codegen/): if a fourth RPC is ever added to `catalog.proto`, this `Server` keeps compiling (falling through to `codes.Unimplemented` for the new method) instead of failing to build until every implementation is updated.
+
+A few mapping and validation details worth calling out:
+
+- **`ListProducts` defaults `page`/`pageSize` rather than rejecting zero values.** A client that omits both (the zero value for an unset `int32` field in proto3) gets page 1 of 20 rather than an error — a friendlier default for a read-only, non-destructive operation than `CreateProduct`'s strict validation.
+- **`GetProduct` and `CreateProduct` validate *before* touching the repository.** Checking `req.GetId() == ""` first means an empty ID never even reaches a SQL query — it's rejected as a client error (`InvalidArgument`), not a "no rows found" `NotFound`, which would incorrectly suggest a product with that empty ID could plausibly have existed.
+- **`errors.Is(err, pgx.ErrNoRows)`, not `err == pgx.ErrNoRows`.** `ProductRepo.Get` wraps the error with `fmt.Errorf("...: %w", err)`, so a direct `==` comparison would always be false — `errors.Is` unwraps the chain to find the original sentinel error underneath.
+- **Repository failures that aren't "not found" become `codes.Internal`, not `codes.NotFound`.** A real database outage and "this product genuinely doesn't exist" are different failures with different meanings to a client — collapsing them into the same status code would make `codes.NotFound` an unreliable signal.
+
+### 2. Wiring `Server` into `main.go`
+
+```go
+// Command catalog runs the Catalog gRPC server.
+package main
+
+import (
+	"context"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+
+	catalogv1 "github.com/avetavos/shopmicro/gen/shopmicro/catalog/v1"
+	"github.com/avetavos/shopmicro/pkg/config"
+	"github.com/avetavos/shopmicro/pkg/pg"
+	"github.com/avetavos/shopmicro/services/catalog/internal/repo"
+	"github.com/avetavos/shopmicro/services/catalog/internal/server"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
+)
+
+func main() {
+	ctx := context.Background()
+
+	dbURL := config.Get("CATALOG_DB_URL", "postgres://shopmicro:shopmicro@localhost:5432/catalog?sslmode=disable")
+	grpcAddr := config.Get("CATALOG_GRPC_ADDR", ":50051")
+
+	pool, err := pg.NewPool(ctx, dbURL)
+	if err != nil {
+		log.Fatalf("catalog: connect to postgres: %v", err)
+	}
+	defer pool.Close()
+
+	lis, err := net.Listen("tcp", grpcAddr)
+	if err != nil {
+		log.Fatalf("catalog: listen on %s: %v", grpcAddr, err)
+	}
+
+	productRepo := repo.New(pool)
+	catalogServer := server.New(productRepo)
+
+	grpcServer := grpc.NewServer()
+	catalogv1.RegisterCatalogServiceServer(grpcServer, catalogServer)
+	reflection.Register(grpcServer)
+
+	go func() {
+		log.Printf("catalog: gRPC server listening on %s", grpcAddr)
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("catalog: serve: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Println("catalog: shutting down")
+	grpcServer.GracefulStop()
+}
+```
+
+Save this over `services/catalog/cmd/main.go`. The only change from [The gRPC Server →](/shopmicro/en/catalog-service/grpc-server/)'s version: `productRepo := repo.New(pool)` and `catalogServer := server.New(productRepo)` now build the real dependency chain, and `RegisterCatalogServiceServer` registers `catalogServer` instead of `&placeholderServer{}`. Everything else — the listener, the reflection registration, the goroutine, the signal handling — is unchanged, because none of that was ever about the placeholder in the first place.
+
+## Verify
+
+Run the real server:
+
+```bash
+go run ./services/catalog/cmd
+```
+
+From another terminal, create a product:
+
+```bash
+grpcurl -plaintext -d '{"name":"Coffee Mug","description":"350ml ceramic mug","price_cents":1299,"stock":50}' \
+  localhost:50051 shopmicro.catalog.v1.CatalogService/CreateProduct
+```
+
+```json
+{
+  "id": "8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21",
+  "name": "Coffee Mug",
+  "description": "350ml ceramic mug",
+  "priceCents": "1299",
+  "stock": 50
+}
+```
+
+Note `priceCents` comes back as the JSON **string** `"1299"`, not the number `1299` — that's the standard protobuf JSON mapping for `int64`, since a JSON number can't safely represent every 64-bit integer value. `id` will be a different UUID every time you run this; copy it for the next command.
+
+Fetch it back by id (substitute the `id` from your own `CreateProduct` response):
+
+```bash
+grpcurl -plaintext -d '{"id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21"}' \
+  localhost:50051 shopmicro.catalog.v1.CatalogService/GetProduct
+```
+
+```json
+{
+  "id": "8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21",
+  "name": "Coffee Mug",
+  "description": "350ml ceramic mug",
+  "priceCents": "1299",
+  "stock": 50
+}
+```
+
+List products and confirm the one you just created shows up, with `total` reflecting the true row count:
+
+```bash
+grpcurl -plaintext -d '{"page":1,"pageSize":10}' \
+  localhost:50051 shopmicro.catalog.v1.CatalogService/ListProducts
+```
+
+```json
+{
+  "products": [
+    {
+      "id": "8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21",
+      "name": "Coffee Mug",
+      "description": "350ml ceramic mug",
+      "priceCents": "1299",
+      "stock": 50
+    }
+  ],
+  "total": 1
+}
+```
+
+Confirm `codes.NotFound` on an id that doesn't exist:
+
+```bash
+grpcurl -plaintext -d '{"id":"00000000-0000-0000-0000-000000000000"}' \
+  localhost:50051 shopmicro.catalog.v1.CatalogService/GetProduct
+```
+
+```txt
+ERROR:
+  Code: NotFound
+  Message: product not found
+```
+
+And `codes.InvalidArgument` on a missing required field:
+
+```bash
+grpcurl -plaintext -d '{"description":"no name given"}' \
+  localhost:50051 shopmicro.catalog.v1.CatalogService/CreateProduct
+```
+
+```txt
+ERROR:
+  Code: InvalidArgument
+  Message: name is required
+```
+
+Finally, confirm the whole module still builds:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+## Recap
+
+`services/catalog/internal/server/server.go`'s `Server` implements all three `CatalogServiceServer` methods against `ProductRepo`: `ListProducts` defaults unset paging fields instead of rejecting them, `GetProduct` and `CreateProduct` validate input with `status.Error(codes.InvalidArgument, ...)` before ever touching the repository, and `GetProduct` translates a wrapped `pgx.ErrNoRows` (checked with `errors.Is`) into `status.Error(codes.NotFound, "product not found")` — while any other repository failure becomes `codes.Internal`, keeping `NotFound` a reliable signal. A small `toProto` function is the only place `repo.Product` and `catalogv1.Product` ever touch each other. `services/catalog/cmd/main.go` now wires `repo.New(pool)` into `server.New(productRepo)` in place of [The gRPC Server →](/shopmicro/en/catalog-service/grpc-server/)'s placeholder, and `grpcurl` confirms `CreateProduct` → `GetProduct` → `ListProducts` all work end-to-end against real PostgreSQL rows, with `codes.NotFound` and `codes.InvalidArgument` both verified directly. That's Module 3 done — the Catalog service is a real, working gRPC server with its own database. Next, [Order Service →](/shopmicro/en/order-service/) builds the Order service, which calls straight into this Catalog service over gRPC to look up a product's current price.

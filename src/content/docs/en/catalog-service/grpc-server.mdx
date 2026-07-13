@@ -1,0 +1,225 @@
+---
+title: The gRPC Server
+description: "Bootstrap the Catalog service's cmd/main.go: a TCP listener, grpc.NewServer, reflection, a placeholder implementation of CatalogServiceServer, and graceful shutdown on SIGINT/SIGTERM."
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+`services/catalog/cmd/main.go` — the Catalog service's composition root. This is the file that turns everything Module 2 generated into an actual running process: it opens a `pkg/pg` connection pool, listens on a TCP port, creates a `grpc.NewServer()`, registers a `CatalogServiceServer` implementation on it, turns on server reflection, serves, and shuts down cleanly on `SIGINT`/`SIGTERM`.
+
+There's a deliberate ordering problem here: `main.go` needs *something* that satisfies `catalogv1.CatalogServiceServer` to register, but the real, repository-backed implementation isn't built until [The Postgres Repository →](/shopmicro/en/catalog-service/postgres-repo/) and [The Product API →](/shopmicro/en/catalog-service/product-api/). This lesson resolves that by registering a **placeholder** — a struct that embeds `catalogv1.UnimplementedCatalogServiceServer` and adds nothing else. That's enough to compile, register, and reflect *today*; the next two lessons replace it with the real thing.
+
+## Why
+
+Separating "can the process start, listen, and be discovered" from "does the business logic work" is a genuinely useful split during development, not just a course-authoring trick. A gRPC server that can't yet answer `GetProduct` correctly is still worth being able to `grpcurl` against — you find out immediately whether the listener bound to the right port, whether the service name reflection reports matches what your `.proto` declared, and whether your process starts and stops cleanly under a process manager, all before a single line of SQL exists. Bugs in wiring (wrong port, forgotten `Register` call, a server that never returns from `main` because shutdown was never wired up) are far easier to diagnose in isolation than tangled up with a failing database query.
+
+## Pros & cons
+
+**Registering a placeholder implementation first**
+
+- **Pros:** proves the transport layer — listener, registration, reflection, shutdown — works before any business logic exists to distract from a wiring bug; `grpcurl -plaintext localhost:50051 list` gives real, immediate feedback with zero database setup required.
+- **Cons:** every RPC genuinely fails with `codes.Unimplemented` until the real `Server` is wired in at the end of [The Product API →](/shopmicro/en/catalog-service/product-api/) — this is not yet a usable service, only a runnable one.
+
+**Enabling gRPC server reflection**
+
+- **Pros:** `grpcurl` (and similar tools) can discover services, methods, and message shapes directly from the running process — no `.proto` file needs to be shipped to whoever is calling the service from the command line, which is exactly what makes the `Verify` step below possible without a gRPC client of our own.
+- **Cons:** reflection hands out your entire API surface — every service name, method, and field — to anyone who can reach the port. That's fine for local development and even for gRPC calls confined to a private internal network, but it's a genuine reason to gate it behind an environment flag before a server is ever exposed publicly.
+
+## Set it up
+
+### 1. `pkg/pg` — the shared connection pool constructor
+
+Every service that touches PostgreSQL will call this same function. It creates a pool and confirms the database is actually reachable with a `Ping` before handing the pool back — so a misconfigured `CATALOG_DB_URL` fails loudly at startup instead of silently on the first query a handler runs.
+
+```go
+// Package pg provides a shared pgxpool.Pool constructor so every service
+// connects to PostgreSQL the same way.
+package pg
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// NewPool creates a pgxpool.Pool for url and verifies connectivity with a
+// Ping before returning, so a service fails fast at startup instead of on
+// its first query.
+func NewPool(ctx context.Context, url string) (*pgxpool.Pool, error) {
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		return nil, fmt.Errorf("pg: create pool: %w", err)
+	}
+
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("pg: ping: %w", err)
+	}
+
+	return pool, nil
+}
+```
+
+Save this as `pkg/pg/pg.go`. Note the `pool.Close()` on the `Ping` failure path — without it, a pool that was successfully created but failed its health check would leak its underlying connections.
+
+### 2. The server interface this service implements
+
+[Code Generation →](/shopmicro/en/proto-grpc/codegen/) already generated this interface into `gen/shopmicro/catalog/v1/catalog_grpc.pb.go`:
+
+```go
+type CatalogServiceServer interface {
+	ListProducts(context.Context, *ListProductsRequest) (*ListProductsResponse, error)
+	GetProduct(context.Context, *GetProductRequest) (*Product, error)
+	CreateProduct(context.Context, *CreateProductRequest) (*Product, error)
+	mustEmbedUnimplementedCatalogServiceServer()
+}
+```
+
+The unexported `mustEmbedUnimplementedCatalogServiceServer()` method is the enforcement mechanism: the only way to satisfy it is to embed `catalogv1.UnimplementedCatalogServiceServer` **by value**, since that's the only type with a matching unexported method. This is exactly what lets `main.go` register a working `CatalogServiceServer` today with zero of the three real RPCs implemented:
+
+```go
+// placeholderServer satisfies catalogv1.CatalogServiceServer for now by
+// embedding UnimplementedCatalogServiceServer and overriding nothing — every
+// RPC returns codes.Unimplemented until the next two lessons build the real
+// repo and Server.
+type placeholderServer struct {
+	catalogv1.UnimplementedCatalogServiceServer
+}
+```
+
+Every call to `ListProducts`, `GetProduct`, or `CreateProduct` against this type falls straight through to `UnimplementedCatalogServiceServer`'s own methods, each of which returns a `codes.Unimplemented` gRPC status. That's a legitimate, well-formed gRPC response — not a crash — which is exactly why `grpcurl list` and `grpcurl describe` both work perfectly fine against it.
+
+### 3. `services/catalog/cmd/main.go`
+
+```go
+// Command catalog runs the Catalog gRPC server.
+package main
+
+import (
+	"context"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+
+	catalogv1 "github.com/avetavos/shopmicro/gen/shopmicro/catalog/v1"
+	"github.com/avetavos/shopmicro/pkg/config"
+	"github.com/avetavos/shopmicro/pkg/pg"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
+)
+
+// placeholderServer satisfies catalogv1.CatalogServiceServer for now by
+// embedding UnimplementedCatalogServiceServer and overriding nothing — every
+// RPC returns codes.Unimplemented until the next two lessons build the real
+// repo and Server.
+type placeholderServer struct {
+	catalogv1.UnimplementedCatalogServiceServer
+}
+
+func main() {
+	ctx := context.Background()
+
+	dbURL := config.Get("CATALOG_DB_URL", "postgres://shopmicro:shopmicro@localhost:5432/catalog?sslmode=disable")
+	grpcAddr := config.Get("CATALOG_GRPC_ADDR", ":50051")
+
+	pool, err := pg.NewPool(ctx, dbURL)
+	if err != nil {
+		log.Fatalf("catalog: connect to postgres: %v", err)
+	}
+	defer pool.Close()
+
+	lis, err := net.Listen("tcp", grpcAddr)
+	if err != nil {
+		log.Fatalf("catalog: listen on %s: %v", grpcAddr, err)
+	}
+
+	grpcServer := grpc.NewServer()
+	catalogv1.RegisterCatalogServiceServer(grpcServer, &placeholderServer{})
+	reflection.Register(grpcServer)
+
+	go func() {
+		log.Printf("catalog: gRPC server listening on %s", grpcAddr)
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("catalog: serve: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Println("catalog: shutting down")
+	grpcServer.GracefulStop()
+}
+```
+
+Save this as `services/catalog/cmd/main.go`. Walking through it in order:
+
+- **`config.Get`** ([Go Module & Dependencies →](/shopmicro/en/setup/go-workspace/)) reads `CATALOG_DB_URL` and `CATALOG_GRPC_ADDR` from the environment, falling back to safe local-dev defaults that match `.env.example` and the Compose setup from [Infra & Compose →](/shopmicro/en/setup/infra-compose/).
+- **`pg.NewPool`** opens the pool and confirms the database is reachable before anything else happens — if Postgres isn't up, the process exits immediately with a clear error instead of starting a gRPC server that would silently fail on its first real query.
+- **`net.Listen("tcp", grpcAddr)`** binds the port *before* the gRPC server is even constructed, so a port-already-in-use error surfaces immediately and unambiguously.
+- **`grpc.NewServer()`** creates the server; `RegisterCatalogServiceServer` attaches our implementation (the placeholder, for now) to it; `reflection.Register` turns on the introspection service `grpcurl` talks to.
+- **`go func() { ... grpcServer.Serve(lis) ... }()`** runs the blocking `Serve` call in its own goroutine, since `Serve` doesn't return until the server stops — running it inline would mean the signal-handling code below it would never get a chance to run.
+- **`signal.Notify` + `<-stop`** blocks the main goroutine until the OS delivers `SIGINT` (Ctrl-C) or `SIGTERM` (what `docker stop` and Kubernetes send), at which point `grpcServer.GracefulStop()` stops accepting new RPCs and waits for in-flight ones to finish before returning. This is intentionally the minimal version of graceful shutdown — no shutdown timeout, no draining the `pg` pool explicitly — full production-grade graceful shutdown across every service is [Resilience →](/shopmicro/en/resilience/)'s job (Module 11).
+
+## Verify
+
+Run the service directly from source:
+
+```bash
+go run ./services/catalog/cmd
+```
+
+Expected output:
+
+```txt
+catalog: gRPC server listening on :50051
+```
+
+Leave that running and, from another terminal, ask reflection what's there:
+
+```bash
+grpcurl -plaintext localhost:50051 list
+```
+
+You should see the reflection service itself alongside `CatalogService` (the exact reflection service name can vary slightly by grpc-go version, but `shopmicro.catalog.v1.CatalogService` will always be listed):
+
+```txt
+grpc.reflection.v1.ServerReflection
+shopmicro.catalog.v1.CatalogService
+```
+
+Confirm the placeholder genuinely returns `Unimplemented` rather than crashing:
+
+```bash
+grpcurl -plaintext -d '{"id":"anything"}' localhost:50051 shopmicro.catalog.v1.CatalogService/GetProduct
+```
+
+```txt
+ERROR:
+  Code: Unimplemented
+  Message: method GetProduct not implemented
+```
+
+Stop the server with `Ctrl-C` in the first terminal and confirm it logs the shutdown line rather than hanging:
+
+```txt
+catalog: shutting down
+```
+
+Then confirm the whole module still builds cleanly:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+## Recap
+
+`services/catalog/cmd/main.go` is the Catalog service's composition root: `pkg/pg.NewPool` opens and health-checks a PostgreSQL connection pool, `net.Listen` binds the gRPC port, `grpc.NewServer()` creates the server, `reflection.Register` turns on introspection, and a `placeholderServer` — nothing more than `catalogv1.UnimplementedCatalogServiceServer` embedded by value — satisfies `CatalogServiceServer` well enough to register, serve, and respond to `grpcurl` with well-formed `codes.Unimplemented` errors. `SIGINT`/`SIGTERM` trigger `grpcServer.GracefulStop()` for a clean exit. Next, [The Postgres Repository →](/shopmicro/en/catalog-service/postgres-repo/) builds the real `ProductRepo` this placeholder is standing in for.

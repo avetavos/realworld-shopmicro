@@ -1,0 +1,188 @@
+---
+title: The Postgres Repository
+description: "เขียน migration ของ products, รันด้วย golang-migrate, และสร้าง ProductRepo — QueryRow/Query ของ pgx, การ scan rows, การนับจำนวนสำหรับ pagination, และการจัดการ pgx.ErrNoRows"
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+ตาราง `products` ผ่าน migration ของ `golang-migrate` และ `services/catalog/internal/repo/products.go` — `ProductRepo` ที่มีสามเมธอด (`List`, `Get`, `Create`) คุยกับตารางนี้ด้วย SQL ดิบผ่าน `pgx` นี่คือชั้นระหว่างฐานข้อมูลกับส่วนอื่นทั้งหมด: placeholder ของ [The gRPC Server →](/shopmicro/th/catalog-service/grpc-server/) ไม่ต้องใช้มัน แต่ [The Product API →](/shopmicro/th/catalog-service/product-api/) เรียกเข้ามาที่นี่โดยตรงสำหรับ RPC ทั้งสามตัว
+
+## Why
+
+การแยกทุกคำสั่ง SQL ไว้หลัง `ProductRepo` type เล็ก ๆ ที่สร้างมาเพื่อจุดประสงค์นี้โดยเฉพาะ — แทนที่จะกระจายการเรียก `pool.Query` ไปทั่วโค้ด handler ของ gRPC — ทำให้ชั้น gRPC พูดคุยกันด้วย Go struct เท่านั้น (`repo.Product` เข้า, `repo.Product` ออก) และไม่เคยต้องพูดถึงชื่อคอลัมน์ เลขคณิต `LIMIT`/`OFFSET` หรือ type ของ `pgx` เลย นี่คือเหตุผลเดียวกับที่ [The Product API →](/shopmicro/th/catalog-service/product-api/) จะ map `repo.Product` ไปเป็น `catalogv1.Product` อย่างชัดเจน แทนที่จะใช้ struct เดียวกันสำหรับทั้งสองฝั่ง: รูปร่างของแถวในฐานข้อมูลกับรูปร่างบน wire ได้รับอนุญาตให้วิวัฒนาการแยกจากกัน และวันนี้ทั้งสองก็ต่างกันอยู่แล้วหนึ่ง field (`CreatedAt` ซึ่ง `.proto` ยังไม่ได้เปิดเผยออกมา)
+
+## Pros & cons
+
+**Repository pattern (`ProductRepo` type ที่ห่อ SQL ไว้)**
+
+- **Pros:** ทุก query ที่เจาะจง `products` อยู่ในไฟล์เดียวเท่านั้น ดังนั้นการเปลี่ยน schema (เปลี่ยนชื่อคอลัมน์ หรือรูปร่าง query ใหม่ที่เป็นมิตรกับ index) มีที่ลงเพียงที่เดียว; โค้ด gRPC server ที่เรียก `repo.Get(ctx, id)` ไม่จำเป็นต้องรู้เลยว่ามันคือ Postgres ซึ่งทำให้ชั้น server ทดสอบแบบ unit test ง่ายด้วย `ProductRepo` ปลอม; parameterized query (`$1`, `$2`, ...) เป็นทางเดียวที่ SQL ถูกสร้างขึ้นที่นี่ ซึ่งตัดปัญหา SQL injection ออกไปด้วยโครงสร้าง ไม่ใช่แค่ด้วยวินัย
+- **Cons:** สำหรับตารางที่เรียบง่ายขนาดนี้ repository เป็นแค่ตัวห่อบาง ๆ เกือบจะเชิงกลไกรอบ ๆ คำสั่ง SQL สามคำสั่ง — คุณค่าจริงจะเห็นได้เมื่อตารางมีรูปร่าง query มากกว่าหนึ่งสองแบบ มี join ที่ซับซ้อนขึ้น หรือ storage backend ที่สลับได้จริง ซึ่งยังไม่มีข้อไหนเลยที่ใช้กับตาราง `products` เดียวที่มีแค่สาม operation นี้
+
+**SQL ดิบผ่าน `pgx` เทียบกับ ORM**
+
+- **Pros:** SQL ที่คุณอ่านคือ SQL ที่รันจริง — ไม่มี query builder หรือชั้น ORM ที่แปล method call ของ Go เป็น SQL ที่คุณต้อง reverse-engineer ตอนที่อะไรบางอย่างช้า; `pgx` เป็น native PostgreSQL driver ระดับ first-class (ไม่ใช่ `database/sql` ที่มี driver ทั่วไปอยู่ข้างใต้) จึงเร็วและเข้าถึง type และฟีเจอร์เฉพาะของ PostgreSQL ได้เต็มที่
+- **Cons:** ทุกคอลัมน์ต้อง scan ด้วยมือลงใน field ของ struct ให้ถูกต้องตามลำดับ — ความไม่ตรงกันระหว่างรายการคอลัมน์ใน `select` กับรายการ argument ใน `Scan` เป็นบั๊กจริงที่เกิดง่ายและ compiler จับไม่ได้; ไม่มีการสร้าง migration อัตโนมัติจากนิยาม struct ของ Go แบบที่ ORM บางตัวมีให้ ซึ่งเป็นเหตุผลที่บทนี้เขียน migration SQL ด้วยมือแทน
+
+## Set it up
+
+### 1. Migration
+
+```sql
+create extension if not exists pgcrypto;
+
+create table products (
+	id uuid primary key default gen_random_uuid(),
+	name text not null,
+	description text not null default '',
+	price_cents bigint not null,
+	stock int not null default 0,
+	created_at timestamptz not null default now()
+);
+```
+
+บันทึกไฟล์นี้เป็น `migrations/catalog/0001_init.sql` `pgcrypto` ให้ฟังก์ชัน `gen_random_uuid()` ซึ่งเป็นตัวสร้าง `id` ของแต่ละสินค้า — แอปพลิเคชันไม่ต้องสร้างหรือส่ง id เองเลย `description` มีค่า default เป็น `''` แทนที่จะเป็น nullable เพื่อให้ทุกคนที่อ่านค่านี้ปฏิบัติกับมันเป็น string ธรรมดาโดยไม่ต้องจัดการกรณี `NULL`; `price_cents` ไม่มีค่า default เพราะสินค้าต้องถูกสร้างขึ้นพร้อมราคาจริงเสมอ และมันเป็น `bigint` (Go `int64`) แทนที่จะเป็นชนิดจุดทศนิยม ด้วยเหตุผลเดียวกับที่ [เงินถูกเก็บเป็นจำนวนเต็มหน่วยสตางค์/เซนต์ ไม่ใช่ float](/shopmicro/th/proto-grpc/contracts/): คณิตศาสตร์สกุลเงินแบบจุดทศนิยมสูญเสียความแม่นยำในแบบที่สะสมกันอย่างเงียบ ๆ `stock` มีค่า default เป็น `0` — สินค้าที่เพิ่งสร้างโดยไม่ระบุสต็อกคือสินค้าหมดสต็อก ไม่ใช่ error
+
+### 2. รันด้วย `golang-migrate`
+
+[Go Module & Dependencies →](/shopmicro/th/setup/go-workspace/) ติดตั้ง CLI `migrate` ผ่าน Homebrew ไว้แล้ว เมื่อตั้งค่า `CATALOG_DB_URL` ใน shell ของคุณแล้ว (จาก `.env`):
+
+```bash
+migrate -path migrations/catalog -database "$CATALOG_DB_URL" up
+```
+
+`golang-migrate` ติดตามว่า migration ไหนรันไปแล้วบ้างในตาราง `schema_migrations` ที่มันจัดการเอง ดังนั้นการรัน `up` ซ้ำหลังจากที่สำเร็จแล้วจะไม่ทำอะไร ไม่ใช่ error — ปลอดภัยที่จะรันซ้ำ ๆ ได้ รวมถึงจาก CI ก่อนการทดสอบทุกครั้ง
+
+### 3. `ProductRepo`
+
+```go
+// Package repo is the PostgreSQL-backed store for the Catalog service.
+package repo
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Product is the row shape of the products table.
+type Product struct {
+	ID          string
+	Name        string
+	Description string
+	PriceCents  int64
+	Stock       int32
+	CreatedAt   time.Time
+}
+
+// ProductRepo is the PostgreSQL-backed store for products.
+type ProductRepo struct {
+	db *pgxpool.Pool
+}
+
+// New returns a ProductRepo backed by db.
+func New(db *pgxpool.Pool) *ProductRepo {
+	return &ProductRepo{db: db}
+}
+
+// List returns the page'th page (1-indexed) of up to pageSize products,
+// ordered by creation time, along with the total row count so callers can
+// compute how many pages exist.
+func (r *ProductRepo) List(ctx context.Context, page, pageSize int) ([]Product, int, error) {
+	var total int
+	if err := r.db.QueryRow(ctx, `select count(*) from products`).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("repo: count products: %w", err)
+	}
+
+	offset := (page - 1) * pageSize
+	rows, err := r.db.Query(ctx, `
+		select id, name, description, price_cents, stock, created_at
+		from products
+		order by created_at
+		limit $1 offset $2`, pageSize, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("repo: list products: %w", err)
+	}
+	defer rows.Close()
+
+	var products []Product
+	for rows.Next() {
+		var p Product
+		if err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.PriceCents, &p.Stock, &p.CreatedAt); err != nil {
+			return nil, 0, fmt.Errorf("repo: scan product: %w", err)
+		}
+		products = append(products, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("repo: iterate products: %w", err)
+	}
+
+	return products, total, nil
+}
+
+// Get returns the product with the given id. The returned error wraps
+// pgx.ErrNoRows (checkable with errors.Is) when no such product exists.
+func (r *ProductRepo) Get(ctx context.Context, id string) (*Product, error) {
+	var p Product
+	err := r.db.QueryRow(ctx, `
+		select id, name, description, price_cents, stock, created_at
+		from products
+		where id = $1`, id).Scan(&p.ID, &p.Name, &p.Description, &p.PriceCents, &p.Stock, &p.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("repo: get product %s: %w", id, err)
+	}
+	return &p, nil
+}
+
+// Create inserts a new product and returns the row PostgreSQL produced,
+// including the generated id and created_at.
+func (r *ProductRepo) Create(ctx context.Context, name, description string, priceCents int64, stock int32) (*Product, error) {
+	var p Product
+	err := r.db.QueryRow(ctx, `
+		insert into products (name, description, price_cents, stock)
+		values ($1, $2, $3, $4)
+		returning id, name, description, price_cents, stock, created_at`,
+		name, description, priceCents, stock,
+	).Scan(&p.ID, &p.Name, &p.Description, &p.PriceCents, &p.Stock, &p.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("repo: create product: %w", err)
+	}
+	return &p, nil
+}
+```
+
+บันทึกไฟล์นี้เป็น `services/catalog/internal/repo/products.go` มีรายละเอียดสองสามอย่างที่ควรพูดถึง:
+
+- **`List` ไปฐานข้อมูลสองรอบ** การนับจำนวนแถวทั้งหมดกับการดึงข้อมูลหนึ่งหน้าเป็นคนละ query กัน — `count(*)` ไม่สามารถคำนวณได้จาก result set ของ `LIMIT`/`OFFSET` เพราะ result set นั้นมีแค่แถวของหน้าปัจจุบันเท่านั้น ทั้งสอง query ใช้ `ctx` เดียวกัน ดังนั้นถ้าผู้เรียกยกเลิก request จะยกเลิก query ที่กำลังทำงานอยู่ตัวไหนก็ตาม
+- **`rows.Close()` ผ่าน `defer` ทันทีหลังตรวจ error ของ `Query`** การลืมบรรทัดนี้จะทำให้ connection ที่อยู่ข้างใต้รั่วไหลกลับไปที่ pool ช้าเกินไป (หรือไม่กลับไปเลยในบาง failure path) — `defer` ทันทีหลังตรวจ error คือตำแหน่งที่ถูกต้องตามธรรมเนียม ตรงกับการเรียก `pgx`/`database/sql` อื่น ๆ ทุกจุดใน codebase นี้
+- **`rows.Err()` หลัง loop** `rows.Next()` ที่คืนค่า `false` หมายถึง "ไม่มีแถวเหลือแล้ว" หรือ "error มาขัดจังหวะการวนซ้ำ" — สองกรณีนี้แยกไม่ออกจากตัว loop เอง การตรวจ `rows.Err()` ทันทีหลัง loop เป็นทางเดียวที่จะแยกแยะทั้งสองกรณีนี้ได้
+- **clause `returning` ของ `Create`** แทนที่จะ insert แล้วยิง `select` รอบสองเพื่ออ่าน `id` และ `created_at` ที่ถูกสร้างขึ้น คำสั่ง `insert ... returning ...` เดียวทำทั้งสองอย่างในรอบเดียวและ statement เดียว — เรียก network น้อยลง และไม่มีช่วงเวลาที่ process อื่นที่ทำงานพร้อมกันจะเห็นแถวนี้ก่อนที่ function นี้จะเห็น
+- **ทุกค่าถูก bind เป็น `$1`, `$2`, ... — ไม่เคยถูกแทรกเข้าไปใน SQL string เลย** นี่คือสิ่งที่ทำให้ SQL injection เป็นไปไม่ได้ด้วยโครงสร้าง ไม่ใช่แค่ไม่น่าจะเกิดขึ้น
+- **`Get` ห่อทุกอย่างที่ `Scan` คืนกลับมาด้วย `fmt.Errorf("...: %w", err)` ไม่เคย `return nil, err` เปล่า ๆ** เพราะ `%w` รักษา error ที่อยู่ข้างใต้ไว้ [The Product API →](/shopmicro/th/catalog-service/product-api/) จึงยังเรียก `errors.Is(err, pgx.ErrNoRows)` กับผลลัพธ์ที่ถูกห่อไว้ได้และได้คำตอบที่ถูกต้อง — การห่อ error เพิ่ม context โดยไม่สูญเสียความสามารถในการเช็ค error ค่าเฉพาะ
+
+### 4. `pgx.ErrNoRows` อธิบาย
+
+`QueryRow(...).Scan(...)` ของ `pgx` คืนค่า `pgx.ErrNoRows` — ไม่ใช่ `Product` ที่เป็น nil พร้อม error ว่างเปล่า — เมื่อ query ไม่ตรงกับแถวไหนเลย `Get` ด้านบนไม่ได้แยกกรณีนี้เลย มันแค่ห่อ error ที่คืนกลับมาไม่ว่าจะเป็นอะไร รวมถึง `pgx.ErrNoRows` แล้วคืนกลับไป นี่ตั้งใจให้เป็นแบบนี้: การตัดสินใจว่า *error "ไม่พบ" หมายถึงอะไรสำหรับผู้เรียก* (สถานะ gRPC `codes.NotFound` ในกรณีนี้) ไม่ใช่หน้าที่ของ repository — มันเป็นการตัดสินใจของชั้น presentation และ repository ควรรายงานแค่ข้อเท็จจริงเกี่ยวกับฐานข้อมูลเท่านั้น [The Product API →](/shopmicro/th/catalog-service/product-api/) คือจุดที่ `errors.Is(err, pgx.ErrNoRows)` ถูกตรวจสอบจริงและแปลงเป็น gRPC status
+
+## Verify
+
+ยืนยันว่าตารางมีอยู่และมีรูปร่างที่ถูกต้อง:
+
+```bash
+psql "$CATALOG_DB_URL" -c '\d products'
+```
+
+คุณควรเห็นครบทั้งหกคอลัมน์ โดย `id` เป็น primary key และ `gen_random_uuid()` เป็นค่า default ของมัน จากนั้นยืนยันว่าทั้ง module ยัง build ผ่านอยู่ — `repo.go` เป็นโค้ด Go จริงตั้งแต่ตอนที่บันทึกไฟล์ ดังนั้น `go build ./...` จะ compile มันไปพร้อมกับทุกอย่าง:
+
+```bash
+go build ./...
+```
+
+ไม่มี output แปลว่าสำเร็จ
+
+## Recap
+
+`migrations/catalog/0001_init.sql` สร้าง `products` ด้วย primary key แบบ UUID ที่สร้างโดย `pgcrypto`, `price_cents bigint` ที่ไม่ nullable สำหรับเงินหน่วยเซนต์ที่แม่นยำ และคอลัมน์ `created_at` ที่ query ทุกตัวถัดไปใช้เรียงลำดับ; `golang-migrate` ใช้มันอย่าง idempotent ด้วย `migrate -path migrations/catalog -database "$CATALOG_DB_URL" up` `ProductRepo` ใน `services/catalog/internal/repo/products.go` ห่อคำสั่ง SQL แบบ parameterized สามคำสั่ง — `List` (สองรอบ: `count(*)` กับหน้าแบบ `LIMIT`/`OFFSET`), `Get` (`select` แถวเดียว), และ `Create` (`insert ... returning ...` เดียว) — ไว้หลัง interface ที่มีรูปร่างแบบ Go ที่ไม่เคยรั่วไหลชื่อคอลัมน์หรือ type ของ `pgx` ออกไปนอกขอบเขตของมันเอง ยกเว้น `pgx.ErrNoRows` ที่จงใจปล่อยให้ถูกห่อแต่ยังเช็คได้ ให้ชั้นข้างบนแปลงเป็น gRPC status ต่อไป [The Product API →](/shopmicro/th/catalog-service/product-api/) จะต่อสาย `ProductRepo` นี้เข้ากับ `CatalogServiceServer` implementation ตัวจริง แทนที่ placeholder จากบทแรก
