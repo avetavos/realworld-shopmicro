@@ -1,0 +1,142 @@
+---
+title: Go Module & Dependencies
+description: "Initialize the single Go module, pull in every dependency the project needs, and verify it all with a trivial pkg/config and a running catalog binary."
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+A single Go module — `github.com/avetavos/shopmicro` — rooted at the repo we scaffolded in the last lesson, with every dependency the five services will eventually need already pulled in. We'll prove it works with the smallest possible slice: a `pkg/config` package and a `catalog` binary that reads one environment variable and runs.
+
+## Why
+
+Every file under `services/`, `gateway/`, and `pkg/` is going to live inside **one Go module**. That means one `go.mod`, one `go.sum`, and every internal package imported with a plain, stable path like `github.com/avetavos/shopmicro/pkg/config` — no `replace` directives, no separately versioned internal libraries, no publishing step. `go build ./...` from the repo root builds every service that exists so far in one shot, and `go get` run once updates a dependency for all five services simultaneously.
+
+## Pros & cons
+
+**Pros**
+
+- **Zero friction for shared code.** `pkg/config`, `pkg/pg`, `pkg/kafka`, etc. are just importable packages — the moment you write them, every service can use them.
+- **One dependency graph.** A single `go.sum` means one thing to audit, one `go mod tidy` to run, one set of versions to reason about.
+- **Simplest possible mental model.** New contributors run `go build ./...` and everything either compiles or doesn't — there's no multi-repo or multi-module bookkeeping to explain first.
+
+**Cons**
+
+- **No per-service dependency versions.** If `services/payment` someday needed an older `pgx` for compatibility while `services/catalog` wanted the latest, a single module can't express that.
+- **`go.mod` accumulates the union of every service's dependencies**, even though `notification` never touches PostgreSQL directly.
+- **Blast radius.** A bad `go.sum` entry or a broken dependency upgrade affects every service's build, not just the one that needed the change.
+
+The documented alternative is a **`go.work` multi-module workspace**: each service (`services/catalog/go.mod`, `services/order/go.mod`, ...) and `pkg/go.mod` become independent Go modules with their own `go.sum`, and a root `go.work` file lists them with `use` directives so they still resolve each other's local packages during development without needing to be published anywhere. That buys independent versioning per service at the cost of N times the `go.mod`/`go.sum` bookkeeping. For a teaching monorepo where all five services are meant to evolve together, one module is the simpler, correct choice — keep `go.work` in your back pocket for the day a service's dependency needs genuinely diverge.
+
+## Set it up
+
+### 1. Initialize the module
+
+From the `shopmicro/` root:
+
+```bash
+go mod init github.com/avetavos/shopmicro
+```
+
+This creates `go.mod` with the module path every package will be imported under.
+
+### 2. Pull in the dependencies
+
+Each dependency exists for a specific, later module — install them all now so nothing blocks you mid-lesson later:
+
+```bash
+# gRPC itself, plus the protobuf runtime generated code depends on (Module 2)
+go get google.golang.org/grpc google.golang.org/protobuf
+
+# translates the gateway's REST endpoints into gRPC calls (Module 5)
+go get github.com/grpc-ecosystem/grpc-gateway/v2
+
+# PostgreSQL driver for Catalog and Order (Modules 3-4)
+go get github.com/jackc/pgx/v5
+
+# Kafka producer/consumer client for the event stream (Modules 6, 8, 10)
+go get github.com/segmentio/kafka-go
+
+# RabbitMQ client for the notification work queue (Modules 7, 10)
+go get github.com/rabbitmq/amqp091-go
+```
+
+Each `go get` adds a `require` line to `go.mod` immediately, marked `// indirect` — that comment just means nothing in the module imports the package yet, which is true until later modules write the code that does. **Don't run `go mod tidy` yet.** `go mod tidy` prunes any requirement nothing imports, and right now nothing imports any of these — it would delete every line you just added. We'll let each later module's real `import` statements naturally drop the `// indirect` markers and keep `tidy` happy from then on.
+
+We'll also use **golang-migrate** to manage SQL schema migrations (Modules 3-4). It's a standalone CLI, not a package your code imports, so it's installed via Homebrew rather than `go get`:
+
+```bash
+brew install golang-migrate
+```
+
+### 3. A trivial `pkg/config`
+
+Every service reads its configuration from the environment (see `.env.example` from the last lesson). `pkg/config` is the one tiny helper every service will call into — a single function, no external dependencies:
+
+```go
+// Package config provides a minimal, dependency-free way to read
+// configuration from environment variables, following the 12-Factor
+// App convention of configuring services purely through the environment.
+package config
+
+import "os"
+
+// Get returns the value of the environment variable named by key, or
+// fallback if the variable is unset or empty.
+func Get(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+```
+
+Save this as `pkg/config/config.go`.
+
+### 4. A trivial `catalog` binary
+
+Enough to prove the module, the package, and the binary all wire together:
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/avetavos/shopmicro/pkg/config"
+)
+
+func main() {
+	addr := config.Get("CATALOG_GRPC_ADDR", ":50051")
+	fmt.Println("catalog up", addr)
+}
+```
+
+Save this as `services/catalog/cmd/main.go`.
+
+## Verify
+
+Run the catalog binary directly from source:
+
+```bash
+go run ./services/catalog/cmd
+```
+
+Expected output:
+
+```txt
+catalog up :50051
+```
+
+That confirms three things at once: the module resolves, `pkg/config` is importable from a service, and `config.Get` correctly falls back to `:50051` when `CATALOG_GRPC_ADDR` isn't set in your shell. Now confirm the whole module still builds cleanly (this will only touch `pkg/config` and `services/catalog/cmd` — every other directory is still empty, and `go build ./...` simply skips directories with no Go files):
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+## Recap
+
+`shopmicro/` is now a real Go module: `go mod init github.com/avetavos/shopmicro` gave it a root import path, and `go get` pulled in gRPC, protobuf, grpc-gateway, pgx, kafka-go, and amqp091-go as `// indirect` requirements waiting for real imports in later modules — deliberately not `tidy`'d away yet. `golang-migrate` is installed separately via Homebrew as a CLI tool. A one-function `pkg/config` and a two-line `catalog` binary proved the whole thing wires together: `go run ./services/catalog/cmd` prints `catalog up :50051`. We chose one module over a `go.work` multi-module workspace for simplicity, with the workspace form documented as the escape hatch if services ever need independent dependency versions. Next, [Protobuf Tooling →](/shopmicro/en/setup/proto-tooling/) installs buf and configures the codegen that will turn `.proto` files into the gRPC stubs every service actually uses.

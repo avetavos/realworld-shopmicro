@@ -1,0 +1,105 @@
+---
+title: Protobuf Tooling
+description: "Install buf, configure buf.yaml and buf.gen.yaml for the four codegen plugins, and lint the proto workspace before any .proto files exist."
+sidebar:
+  order: 3
+---
+
+## What we're building
+
+The **buf** toolchain, configured but not yet fed: `buf.yaml` (the proto workspace and its one external dependency) and `buf.gen.yaml` (the four plugins that will turn `.proto` files into Go code). The actual `.proto` contracts come in Module 2 — this lesson is entirely about having the tooling ready and verified before there's anything to generate.
+
+## Why
+
+Hand-rolling protobuf codegen means installing `protoc` plus a `protoc-gen-go` binary, a `protoc-gen-go-grpc` binary, and so on, keeping every contributor's versions in sync by hand. **buf** replaces all of that: `buf.gen.yaml` references **remote plugins** hosted on the Buf Schema Registry (BSR), so `buf generate` downloads and runs the exact pinned plugin version for everyone — no local `protoc-gen-*` binaries to install at all. `buf.yaml` also gives us `buf lint`, which catches proto API design problems (bad naming, missing options) before they reach a code review.
+
+## Pros & cons
+
+**Pros**
+
+- No local `protoc` or `protoc-gen-*` binaries — plugins run remotely via the BSR and are version-pinned in `buf.lock`.
+- `buf lint` enforces a consistent, well-known style (`STANDARD` rules) across every service's `.proto` files automatically.
+- One `buf generate` invocation runs all four plugins and writes everything into `gen/`.
+- `deps:` pulls in `google/api/annotations.proto` from `buf.build/googleapis/googleapis` — the annotation type the gateway plugin needs — without vendoring it by hand.
+
+**Cons**
+
+- `buf generate` needs network access to the BSR the first time it resolves remote plugins (they're cached locally afterward).
+- It's another config file and another CLI to learn, layered on top of protobuf itself.
+- Pinned plugin versions need occasional, deliberate bumping — they won't silently track upstream `protoc-gen-go` releases.
+
+## Set it up
+
+### 1. Install buf
+
+```bash
+brew install bufbuild/buf/buf
+```
+
+Verify:
+
+```bash
+buf --version
+```
+
+### 2. `buf.yaml` — the proto workspace
+
+This defines where your `.proto` files live, what lint rules apply, and the one external module dependency the gateway plugin needs:
+
+```yaml
+version: v2
+modules:
+  - path: proto
+deps:
+  - buf.build/googleapis/googleapis
+lint:
+  use:
+    - STANDARD
+```
+
+Save this as `buf.yaml` at the repo root. `modules` points at `proto/` (currently empty — Module 2 fills it in); `deps` declares `google/api/annotations.proto` (from `buf.build/googleapis/googleapis`) as available to import, which is what lets a `.proto` file attach HTTP routes for grpc-gateway; `lint.use: STANDARD` turns on buf's standard naming and style rules for every file under `proto/`.
+
+### 3. `buf.gen.yaml` — the four codegen plugins
+
+```yaml
+version: v2
+clean: true
+plugins:
+  - remote: buf.build/protocolbuffers/go
+    out: gen
+    opt: paths=source_relative
+  - remote: buf.build/grpc/go
+    out: gen
+    opt: paths=source_relative
+  - remote: buf.build/grpc-ecosystem/gateway
+    out: gen
+    opt: paths=source_relative
+  - remote: buf.build/grpc-ecosystem/openapiv2
+    out: gen
+inputs:
+  - directory: proto
+```
+
+Save this as `buf.gen.yaml` at the repo root. `clean: true` wipes `gen/` before each run, so it never accumulates stale files from renamed or deleted messages. `paths=source_relative` makes generated file paths mirror your `.proto` package layout instead of being flattened by Go import path — the convention this course uses throughout.
+
+### 4. What each plugin produces (once Module 2 adds `.proto` files)
+
+- **`protocolbuffers/go`** — the Go structs for every `message`: field getters, `Marshal`/`Unmarshal`, and everything `encoding/json`-adjacent code expects from a protobuf type.
+- **`grpc/go`** — the gRPC client and server stubs for every `service`/`rpc`: a `CatalogServiceClient` interface to call, and a `CatalogServiceServer` interface each service implements.
+- **`grpc-ecosystem/gateway`** — the reverse-proxy code that translates incoming REST/JSON requests into gRPC calls, driven by `google.api.http` annotations in the `.proto` files. This is what the API Gateway (Module 5) runs.
+- **`grpc-ecosystem/openapiv2`** — an OpenAPI (Swagger) v2 document generated from the same annotations, so the REST surface the gateway exposes is documented automatically, with zero hand-written API docs to keep in sync.
+
+All four are configured to write into the single `gen/` directory this course's canonical layout uses.
+
+## Verify
+
+```bash
+buf --version
+buf lint
+```
+
+`proto/` is still empty at this point (Module 2 adds the first `.proto` file), so `buf lint` has nothing to check yet and should exit cleanly with no violations printed — that's expected, not a sign anything is broken. What we've verified here is that `buf.yaml` parses, the workspace resolves, and the `googleapis` dependency is reachable. Once Module 2 lands real `.proto` files, the same `buf lint` command will start actually checking them, and `buf generate` will produce real output in `gen/` using the four plugins configured above.
+
+## Recap
+
+buf is installed, and two config files are in place: `buf.yaml` defines the `proto/` workspace, the `STANDARD` lint ruleset, and a `deps:` dependency on `buf.build/googleapis/googleapis` for the HTTP annotation types the gateway needs; `buf.gen.yaml` wires up four remote plugins — `protocolbuffers/go` (Go message types), `grpc/go` (client/server stubs), `grpc-ecosystem/gateway` (the REST-to-gRPC reverse proxy), and `grpc-ecosystem/openapiv2` (generated API docs) — all writing into `gen/`. `buf lint` runs clean against an empty `proto/` today; Module 2 is where the first real `.proto` files arrive and this tooling starts producing generated Go code. Next, [Infra & Compose →](/shopmicro/en/setup/infra-compose/) stands up the PostgreSQL, Kafka, and RabbitMQ this project runs against locally.

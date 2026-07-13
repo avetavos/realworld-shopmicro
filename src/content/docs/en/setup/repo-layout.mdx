@@ -1,0 +1,151 @@
+---
+title: Repo Layout
+description: "The ShopMicro monorepo tree, why a monorepo for five microservices, the .gitignore, and the .env.example every service reads from."
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+Before any code, we lay out the skeleton every later module will fill in. ShopMicro lives in a single **monorepo** — one Git repository, one Go module — holding all five services, their shared packages, the protobuf contracts, the infrastructure config, and the database migrations:
+
+```txt
+shopmicro/
+├── proto/                     # .proto contracts (Module 2)
+├── gen/                       # buf-generated Go code (Module 2)
+├── services/
+│   ├── catalog/
+│   │   ├── cmd/
+│   │   │   └── main.go
+│   │   └── internal/
+│   ├── order/
+│   │   ├── cmd/
+│   │   │   └── main.go
+│   │   └── internal/
+│   ├── payment/
+│   │   ├── cmd/
+│   │   │   └── main.go
+│   │   └── internal/
+│   └── notification/
+│       ├── cmd/
+│       │   └── main.go
+│       └── internal/
+├── gateway/
+│   └── cmd/
+│       └── main.go
+├── pkg/
+│   ├── config/                # env-based configuration
+│   ├── logging/                # shared structured logger
+│   ├── pg/                    # pgx pool helpers
+│   ├── kafka/                 # kafka-go producer/consumer helpers
+│   ├── amqp/                  # RabbitMQ helpers
+│   └── outbox/                # transactional outbox pattern
+├── deploy/
+│   └── compose/               # docker-compose.yml + initdb.sql
+├── migrations/
+│   ├── catalog/
+│   └── order/
+├── go.mod
+├── go.sum
+├── .env.example
+└── .gitignore
+```
+
+Every service is a small `cmd/main.go` binary plus an `internal/` package for its own logic; everything shared — config loading, logging, the PostgreSQL pool, the Kafka and RabbitMQ clients, the outbox — lives once in `pkg/`.
+
+## Why
+
+A **monorepo** here means one repository holds every service instead of one repository per service (a **polyrepo**). We're choosing it because ShopMicro's whole point is to *feel* how the pieces of a microservices system fit together — the fastest way to see that is to have Catalog, Order, Payment, Notification, and the shared `pkg/` code sitting side by side, changeable in one commit, buildable with one command.
+
+## Pros & cons
+
+**Pros**
+
+- **One `go.mod`, no version juggling.** Every service imports `pkg/config`, `pkg/pg`, `pkg/kafka`, etc. as plain internal packages — no `replace` directives, no publishing a shared module, no risk of two services silently drifting onto different versions of the same internal package.
+- **Atomic cross-service commits.** Changing the shape of an event that both Order and Payment consume is one commit, one PR, one CI run — not two repos that must be coordinated and merged in the right order.
+- **One `git clone`, one `go build ./...`.** New contributors (or you, in Module 2) see the whole system at once instead of hunting across five repositories.
+
+**Cons**
+
+- **No independent deploy cadence at the repo level.** In a polyrepo, each service's repo can have its own release process, its own access control, its own CI pipeline shape. Here, everything shares one repo's history and permissions.
+- **Every service is pinned to the same dependency versions.** Because there's one `go.mod`, you can't have Catalog on `pgx v5.10` while Order needs `v5.9` for some reason — a real constraint some teams hit at scale.
+- **The repo grows without bound.** Five services' worth of commits, generated code, and migrations all live in one Git history forever (unless you later split it).
+
+For a project this size, the pros dominate. If your services genuinely needed independent versioning while still living in one repo, the middle ground is a **`go.work` multi-module workspace** — each service gets its own `go.mod` (and its own dependency versions), a root `go.work` file ties them together for local development, and you lose none of the "one repo" convenience. We use a single module in this course because it's the simplest thing that works; [Go Module & Dependencies →](/shopmicro/en/setup/go-workspace/) shows exactly where `go.work` would slot in if you wanted it.
+
+## Set it up
+
+Scaffold the directory tree:
+
+```bash
+mkdir -p shopmicro/{proto,gen,deploy/compose}
+mkdir -p shopmicro/services/{catalog,order,payment,notification}/{cmd,internal}
+mkdir -p shopmicro/gateway/cmd
+mkdir -p shopmicro/pkg/{config,logging,pg,kafka,amqp,outbox}
+mkdir -p shopmicro/migrations/{catalog,order}
+cd shopmicro
+git init
+```
+
+Add a `.gitignore`. We don't commit build output, local environment overrides, or editor state:
+
+```txt
+# Binaries and build output
+/bin/
+*.exe
+*.test
+
+# Local environment overrides — .env.example is committed, .env is not
+.env
+
+# buf-generated code — regenerate with `buf generate` (Module 2)
+/gen/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+```
+
+We deliberately ignore `/gen/` rather than committing it: generated code is a deterministic function of `proto/` plus `buf.gen.yaml` (Module 2), so committing it just invites drift between what's checked in and what `buf generate` would actually produce. The trade-off is that CI and every contributor must run `buf generate` before building — a fine trade for a project where regeneration is one command.
+
+Add `.env.example` — every service reads its configuration from environment variables (the 12-Factor way), and this file documents exactly which ones, with safe local-dev defaults:
+
+```txt
+CATALOG_DB_URL=postgres://shopmicro:shopmicro@localhost:5432/catalog?sslmode=disable
+ORDER_DB_URL=postgres://shopmicro:shopmicro@localhost:5432/orders?sslmode=disable
+KAFKA_BROKERS=localhost:9092
+RABBITMQ_URL=amqp://shopmicro:shopmicro@localhost:5672/
+CATALOG_GRPC_ADDR=:50051
+ORDER_GRPC_ADDR=:50052
+GATEWAY_HTTP_ADDR=:8080
+```
+
+Notice `ORDER_DB_URL` points at a database named **`orders`**, not `order`. That's deliberate: `order` is a reserved SQL keyword in PostgreSQL, so naming the database `order` would force every tool and every raw query to quote it as `"order"` forever. Naming it `orders` sidesteps the whole problem — [Infra & Compose →](/shopmicro/en/setup/infra-compose/) is where this database actually gets created.
+
+Copy it to a real, git-ignored `.env` for local use:
+
+```bash
+cp .env.example .env
+```
+
+## Verify
+
+Confirm the tree matches what's above:
+
+```bash
+find . -maxdepth 3 -type d | sort
+```
+
+You should see `services/catalog`, `services/order`, `services/payment`, `services/notification`, `gateway`, and all six `pkg/*` subdirectories. Then confirm the two dotfiles are in place:
+
+```bash
+cat .gitignore
+cat .env.example
+```
+
+`.env.example` must show `ORDER_DB_URL` ending in `/orders`, not `/order`.
+
+## Recap
+
+ShopMicro is one monorepo: a single Git repository and (as the next lesson sets up) a single Go module holding `proto/`, `gen/`, five `services/*/cmd`+`internal` binaries, a shared `pkg/`, `deploy/compose/`, and `migrations/`. We chose a monorepo over a polyrepo to keep shared code import-friendly and cross-service changes atomic, at the cost of shared dependency versions and no per-service release cadence — `go.work` is the documented escape hatch if that trade-off ever stops paying off. `.gitignore` keeps build output, `.env`, and generated code out of Git; `.env.example` documents every environment variable a service needs, with the order database deliberately named `orders` to dodge PostgreSQL's `order` reserved word. Next, [Go Module & Dependencies →](/shopmicro/en/setup/go-workspace/) turns this skeleton into a real, buildable Go module.

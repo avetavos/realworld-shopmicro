@@ -1,0 +1,151 @@
+---
+title: โครงสร้าง Repo
+description: "โครงสร้างต้นไม้ของ ShopMicro monorepo, เหตุผลที่ใช้ monorepo สำหรับไมโครเซอร์วิสห้าตัว, .gitignore และ .env.example ที่ทุกเซอร์วิสอ่านค่าจากมัน"
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+ก่อนจะเขียนโค้ดสักบรรทัด เราวางโครงกระดูกที่โมดูลถัด ๆ ไปจะมาเติมเนื้อให้ ShopMicro อยู่ใน **monorepo** เดียว — Git repository เดียว, Go module เดียว — เก็บทั้งห้าเซอร์วิส, package ที่ใช้ร่วมกัน, สัญญา protobuf, ค่า config ของ infrastructure และ database migrations:
+
+```txt
+shopmicro/
+├── proto/                     # .proto contracts (Module 2)
+├── gen/                       # buf-generated Go code (Module 2)
+├── services/
+│   ├── catalog/
+│   │   ├── cmd/
+│   │   │   └── main.go
+│   │   └── internal/
+│   ├── order/
+│   │   ├── cmd/
+│   │   │   └── main.go
+│   │   └── internal/
+│   ├── payment/
+│   │   ├── cmd/
+│   │   │   └── main.go
+│   │   └── internal/
+│   └── notification/
+│       ├── cmd/
+│       │   └── main.go
+│       └── internal/
+├── gateway/
+│   └── cmd/
+│       └── main.go
+├── pkg/
+│   ├── config/                # env-based configuration
+│   ├── logging/                # shared structured logger
+│   ├── pg/                    # pgx pool helpers
+│   ├── kafka/                 # kafka-go producer/consumer helpers
+│   ├── amqp/                  # RabbitMQ helpers
+│   └── outbox/                # transactional outbox pattern
+├── deploy/
+│   └── compose/               # docker-compose.yml + initdb.sql
+├── migrations/
+│   ├── catalog/
+│   └── order/
+├── go.mod
+├── go.sum
+├── .env.example
+└── .gitignore
+```
+
+แต่ละเซอร์วิสคือ binary เล็ก ๆ ที่มี `cmd/main.go` บวก package `internal/` สำหรับ logic ของตัวเอง; ส่วนที่ใช้ร่วมกัน — การโหลด config, logging, PostgreSQL pool, Kafka และ RabbitMQ client, outbox — อยู่ครั้งเดียวใน `pkg/`
+
+## Why
+
+**Monorepo** ในที่นี้หมายถึง repository เดียวเก็บทุกเซอร์วิส แทนที่จะเป็นหนึ่ง repository ต่อหนึ่งเซอร์วิส (**polyrepo**) เราเลือกแบบนี้เพราะจุดประสงค์ทั้งหมดของ ShopMicro คือการ *สัมผัส* ว่าชิ้นส่วนของระบบไมโครเซอร์วิสประกอบกันยังไง — วิธีที่เร็วที่สุดที่จะเห็นแบบนั้นคือให้ Catalog, Order, Payment, Notification และโค้ด `pkg/` ที่ใช้ร่วมกันอยู่เคียงข้างกัน แก้ไขได้ใน commit เดียว และ build ได้ด้วยคำสั่งเดียว
+
+## Pros & cons
+
+**ข้อดี**
+
+- **`go.mod` เดียว ไม่ต้องคอยจัดการเวอร์ชัน** ทุกเซอร์วิส import `pkg/config`, `pkg/pg`, `pkg/kafka` ฯลฯ เป็น package ภายในธรรมดา — ไม่มี `replace` directive ไม่ต้อง publish shared module แยก และไม่มีความเสี่ยงที่สองเซอร์วิสจะแอบใช้ package ภายในตัวเดียวกันคนละเวอร์ชันอย่างเงียบ ๆ
+- **Commit ข้ามเซอร์วิสแบบ atomic** การเปลี่ยนรูปร่างของ event ที่ทั้ง Order และ Payment consume คือ commit เดียว, PR เดียว, CI run เดียว — ไม่ใช่สอง repo ที่ต้องประสานและ merge ให้ถูกลำดับ
+- **`git clone` ครั้งเดียว, `go build ./...` ครั้งเดียว** ผู้ร่วมพัฒนาใหม่ (หรือตัวคุณเองใน Module 2) เห็นทั้งระบบพร้อมกันแทนที่จะต้องไล่หาใน repository ห้าตัว
+
+**ข้อเสีย**
+
+- **ไม่มี deploy cadence แยกอิสระในระดับ repo** ใน polyrepo แต่ละ repo ของเซอร์วิสมี release process, access control, และรูปแบบ CI pipeline เป็นของตัวเองได้ ที่นี่ทุกอย่างใช้ประวัติและสิทธิ์ของ repo เดียวร่วมกัน
+- **ทุกเซอร์วิสถูกล็อกเวอร์ชัน dependency เดียวกัน** เพราะมี `go.mod` เดียว คุณจะให้ Catalog ใช้ `pgx v5.10` ในขณะที่ Order ต้องการ `v5.9` ด้วยเหตุผลบางอย่างไม่ได้ — เป็นข้อจำกัดจริงที่บางทีมเจอเมื่อขยายสเกล
+- **Repo โตแบบไม่มีขีดจำกัด** commit, generated code และ migrations ของทั้งห้าเซอร์วิสอยู่ใน Git history เดียวตลอดไป (เว้นแต่จะแยกทีหลัง)
+
+สำหรับโปรเจกต์ขนาดนี้ ข้อดีชนะขาด ถ้าเซอร์วิสของคุณต้องการ versioning แยกอิสระจริง ๆ ในขณะที่ยังอยู่ repo เดียว ทางสายกลางคือ **`go.work` multi-module workspace** — แต่ละเซอร์วิสมี `go.mod` ของตัวเอง (และเวอร์ชัน dependency ของตัวเอง) ไฟล์ `go.work` ที่ root ผูกพวกมันไว้ด้วยกันสำหรับการพัฒนาในเครื่อง โดยไม่เสียความสะดวกของ "repo เดียว" ไปเลย เราใช้ module เดียวในคอร์สนี้เพราะมันเป็นทางที่ง่ายที่สุดที่ใช้งานได้จริง; [Go Module & Dependencies →](/shopmicro/th/setup/go-workspace/) จะแสดงให้เห็นว่า `go.work` จะเข้ามาแทนที่ตรงไหนถ้าคุณต้องการมัน
+
+## Set it up
+
+Scaffold โครงสร้าง directory:
+
+```bash
+mkdir -p shopmicro/{proto,gen,deploy/compose}
+mkdir -p shopmicro/services/{catalog,order,payment,notification}/{cmd,internal}
+mkdir -p shopmicro/gateway/cmd
+mkdir -p shopmicro/pkg/{config,logging,pg,kafka,amqp,outbox}
+mkdir -p shopmicro/migrations/{catalog,order}
+cd shopmicro
+git init
+```
+
+เพิ่ม `.gitignore` — เราไม่ commit build output, environment override ในเครื่อง หรือ editor state:
+
+```txt
+# Binaries and build output
+/bin/
+*.exe
+*.test
+
+# Local environment overrides — .env.example is committed, .env is not
+.env
+
+# buf-generated code — regenerate with `buf generate` (Module 2)
+/gen/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+```
+
+เราตั้งใจ ignore `/gen/` แทนที่จะ commit มัน: generated code เป็นผลลัพธ์ที่กำหนดแน่นอนจาก `proto/` บวก `buf.gen.yaml` (Module 2) ดังนั้นการ commit มันไว้มีแต่จะชวนให้เกิดความไม่ตรงกันระหว่างสิ่งที่ commit ไว้กับสิ่งที่ `buf generate` จะผลิตออกมาจริง ข้อแลกเปลี่ยนคือ CI และผู้ร่วมพัฒนาทุกคนต้องรัน `buf generate` ก่อน build เสมอ — ข้อแลกเปลี่ยนที่คุ้มค่าสำหรับโปรเจกต์ที่การ regenerate เป็นแค่คำสั่งเดียว
+
+เพิ่ม `.env.example` — ทุกเซอร์วิสอ่าน configuration จาก environment variable (แบบ 12-Factor) และไฟล์นี้บันทึกไว้ชัดเจนว่ามีตัวไหนบ้าง พร้อมค่า default ที่ปลอดภัยสำหรับ local dev:
+
+```txt
+CATALOG_DB_URL=postgres://shopmicro:shopmicro@localhost:5432/catalog?sslmode=disable
+ORDER_DB_URL=postgres://shopmicro:shopmicro@localhost:5432/orders?sslmode=disable
+KAFKA_BROKERS=localhost:9092
+RABBITMQ_URL=amqp://shopmicro:shopmicro@localhost:5672/
+CATALOG_GRPC_ADDR=:50051
+ORDER_GRPC_ADDR=:50052
+GATEWAY_HTTP_ADDR=:8080
+```
+
+สังเกตว่า `ORDER_DB_URL` ชี้ไปที่ database ชื่อ **`orders`** ไม่ใช่ `order` นั่นตั้งใจ: `order` เป็นคำสงวน (reserved keyword) ของ SQL ใน PostgreSQL การตั้งชื่อ database ว่า `order` จะบังคับให้ tool ทุกตัวและทุก raw query ต้อง quote มันเป็น `"order"` ตลอดไป การตั้งชื่อ `orders` แทนช่วยหลบปัญหานี้ไปได้ทั้งหมด — [Infra & Compose →](/shopmicro/th/setup/infra-compose/) คือจุดที่ database นี้ถูกสร้างขึ้นจริง
+
+Copy มันไปเป็น `.env` จริงที่ git ignore ไว้สำหรับใช้ในเครื่อง:
+
+```bash
+cp .env.example .env
+```
+
+## Verify
+
+ยืนยันว่าโครงสร้างตรงกับด้านบน:
+
+```bash
+find . -maxdepth 3 -type d | sort
+```
+
+คุณควรเห็น `services/catalog`, `services/order`, `services/payment`, `services/notification`, `gateway`, และ subdirectory ทั้งหกของ `pkg/*` จากนั้นยืนยันว่าไฟล์ dotfile ทั้งสองอยู่ครบ:
+
+```bash
+cat .gitignore
+cat .env.example
+```
+
+`.env.example` ต้องแสดง `ORDER_DB_URL` ที่ลงท้ายด้วย `/orders` ไม่ใช่ `/order`
+
+## Recap
+
+ShopMicro เป็น monorepo เดียว: Git repository เดียวและ (ตามที่บทเรียนถัดไปจะตั้งค่า) Go module เดียวที่เก็บ `proto/`, `gen/`, ห้า binary `services/*/cmd`+`internal`, `pkg/` ที่ใช้ร่วมกัน, `deploy/compose/` และ `migrations/` เราเลือก monorepo แทน polyrepo เพื่อให้โค้ดที่ใช้ร่วมกัน import ได้ง่ายและการเปลี่ยนแปลงข้ามเซอร์วิสเป็น atomic แลกกับเวอร์ชัน dependency ที่ต้องใช้ร่วมกันและไม่มี release cadence แยกต่อเซอร์วิส — `go.work` คือทางออกที่บันทึกไว้ถ้าข้อแลกเปลี่ยนนี้ไม่คุ้มค่าอีกต่อไป `.gitignore` กัน build output, `.env` และ generated code ไม่ให้เข้า Git; `.env.example` บันทึกทุก environment variable ที่แต่ละเซอร์วิสต้องการ โดย database ของ order ตั้งใจตั้งชื่อ `orders` เพื่อหลบคำสงวน `order` ของ PostgreSQL ต่อไป [Go Module & Dependencies →](/shopmicro/th/setup/go-workspace/) จะเปลี่ยนโครงกระดูกนี้ให้เป็น Go module ที่ build ได้จริง
