@@ -1,0 +1,83 @@
+---
+title: ภาพรวม
+description: "รู้จัก ShopMicro ระบบ e-commerce แบบ microservices ที่ขับเคลื่อนด้วย event ที่คุณจะสร้างด้วย Go พร้อมรายการฟีเจอร์ทั้งหมดและแผนที่คอร์ส"
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+ShopMicro คือ **backend สำหรับ e-commerce ที่ขับเคลื่อนด้วย event** สร้างเป็นชุดของ **microservices** ด้วยภาษา Go — ลองนึกภาพเครื่องยนต์เบื้องหลังการ checkout ของร้านค้าออนไลน์ ที่ถูกแยกออกเป็นเซอร์วิสเล็ก ๆ ซึ่งแต่ละตัวรับผิดชอบงานเดียวและคุยกันผ่านเครือข่าย
+
+ลองนึกภาพ flow นี้ ลูกค้า **browse** แคตตาล็อกและเลือกสินค้า จากนั้น **สั่งซื้อ (place an order)** เบื้องหลังการคลิกครั้งเดียวนั้นจุดชนวนปฏิกิริยาลูกโซ่: order ถูกบันทึกเป็น `PENDING`, มีความพยายามชำระเงิน, และขึ้นอยู่กับว่าการชำระเงินสำเร็จหรือล้มเหลว order ก็จะกลายเป็น `CONFIRMED` หรือ `CANCELLED` — และไม่ว่าทางไหน ลูกค้าก็จะได้รับ **notification** ที่บอกว่าเกิดอะไรขึ้น ไม่มีโปรแกรมยักษ์ตัวเดียวที่ทำทั้งหมดนี้ แต่เป็นเซอร์วิสอิสระห้าตัวที่ส่งงานต่อกันผ่านการเรียกแบบ synchronous และกระแสของ event เส้นทาง **browse → order → pay → notify** ที่ประสานงานข้ามเซอร์วิสที่ไม่เคยแชร์ฐานข้อมูลกัน คือหัวใจทั้งหมดของ ShopMicro และเป็นเหตุผลที่มันคุ้มค่าที่จะสร้างตั้งแต่ต้นจนจบ
+
+พอจบแล้วคุณจะได้ระบบจริง: เซอร์วิส Go ห้าตัว, ฐานข้อมูล PostgreSQL สองตัว, event log ของ Kafka, work queue ของ RabbitMQ, gateway ที่แปลง REST เป็น gRPC และ Helm chart ที่ deploy ทั้งหมดขึ้น Kubernetes
+
+## Why
+
+ทิวทอเรียลส่วนใหญ่สอนเครื่องมือทีละตัวแบบโดด ๆ — "นี่ gRPC," "นี่ Kafka," "นี่ saga" — แล้วปล่อยให้คุณเดาเองว่ามันประกอบกันยังไง ShopMicro ทำตรงกันข้าม ทุกชิ้นมีอยู่เพราะโปรดักต์ต้องการมัน:
+
+- order และ product ต้องถูก **จัดเก็บ** โดยเซอร์วิสที่เป็นเจ้าของข้อมูลของตัวเอง แต่ละเซอร์วิสจึงมี **PostgreSQL ของตัวเอง**
+- เซอร์วิสต้อง **เรียกกันและกัน** อย่างรวดเร็วด้วยสัญญาที่มี type ชัดเจน เราจึงใช้ **gRPC**
+- โลกภายนอกพูดภาษา **REST** เราจึงวาง **grpc-gateway** ไว้ด้านหน้าเพื่อแปลง
+- order flow กินหลายเซอร์วิสและใช้ database transaction ก้อนใหญ่ก้อนเดียวไม่ได้ เราจึงประสานงานมันด้วย **event log (Kafka)** และ **saga**
+- side effect อย่างการส่งอีเมลต้อง **เชื่อถือได้และ retry ได้** เราจึงมอบมันให้ **RabbitMQ work queue** ที่มี ack, retry และ dead-letter queue
+
+การสร้างโปรดักต์ที่ประกอบกันเป็นหนึ่งเดียวบังคับให้คุณตัดสินใจแบบเดียวกับทีมจริง และรู้สึกได้ว่า *ทำไม* microservices, gRPC, Kafka, RabbitMQ และ Kubernetes แต่ละตัวถึงมีที่ทางของมัน
+
+## Pros & cons
+
+**ข้อดี**
+
+- คุณจบด้วยระบบ distributed ระดับพอร์ตโฟลิโอ ไม่ใช่โฟลเดอร์ของ snippet ที่ไม่เชื่อมกัน
+- ทุกแนวคิด — gRPC, event streaming, saga, outbox — ยึดโยงกับฟีเจอร์ที่จับต้องได้ซึ่งคุณเห็นมันทำงานจริง
+- สแตก (Go, gRPC, Kafka, RabbitMQ, Kubernetes) สะท้อนแพลตฟอร์ม microservice บน production จริง
+
+**ข้อเสีย**
+
+- กว้างและยากกว่าทิวทอเรียลเซอร์วิสเดียว: คุณรันเซอร์วิสห้าตัว, ฐานข้อมูลสองตัว และ broker สองตัวพร้อมกัน
+- ระบบ distributed มีรูปแบบความล้มเหลวที่ monolith ไม่เคยเจอ — การเรียกผ่านเครือข่ายล้มเหลว, message มาถึงซ้ำสองครั้ง, เซอร์วิสรีสตาร์ทกลางคัน — และเราจงใจเผชิญหน้ากับมัน
+- โมดูลช่วงแรกสร้างรากฐาน (protobuf, gRPC scaffolding) ก่อนที่ checkout flow จะมีชีวิตให้เห็น
+
+## Build it
+
+นี่คือชุดฟีเจอร์ทั้งหมดที่คุณจะส่งมอบ ทีละเซอร์วิส:
+
+- **API Gateway** — จุดเข้า REST จุดเดียวที่แปลง HTTP/JSON เป็น gRPC call (ผ่าน grpc-gateway) และ route ไปยังเซอร์วิสที่ถูกต้อง
+- **Catalog Service** — product และรายละเอียดของมัน เก็บใน PostgreSQL เสิร์ฟผ่าน gRPC
+- **Order Service** — สร้าง order (`PENDING`), เป็นเจ้าของ order saga และ publish event อย่างเชื่อถือได้ผ่าน **outbox pattern**; มี PostgreSQL ของตัวเอง
+- **Payment Service** — ขับเคลื่อนด้วย event; consume `order.created`, พยายามชำระเงิน และ publish `payment.succeeded` หรือ `payment.failed`
+- **Notification Service** — ขับเคลื่อนด้วย event; consume ผลลัพธ์การชำระเงินและ enqueue send-job บน RabbitMQ work queue ให้ worker ส่งต่อ
+- **Idempotent consumers** ทุกที่ เพื่อไม่ให้ message ที่ถูกส่งซ้ำสองครั้งไปตัดบัตรซ้ำหรือส่งอีเมลสองฉบับ
+- **Helm chart หนึ่งตัว** ที่ deploy เซอร์วิสทั้งห้าและ infrastructure ของมันขึ้น Kubernetes
+
+และนี่คือ **course map** แต่ละโมดูลของการสร้างต่อยอดจากคอร์สใน Learn Hub มายังชิ้นส่วนหนึ่งของโปรเจกต์
+
+| Module | What you build | Learn Hub course it adapts |
+| --- | --- | --- |
+| 1 · Setup & Tooling | Go monorepo, shared tooling และ Docker Compose ไฟล์แรก | Go / Docker |
+| 2 · Protobuf & gRPC | สัญญา `.proto` และ Go stub ที่ generate ด้วย buf | gRPC |
+| 3 · Catalog Service | เซอร์วิส Catalog แบบ gRPC ที่มี PostgreSQL รองรับ | Go / gRPC |
+| 4 · Order Service | เซอร์วิส Order แบบ gRPC, สคีมาของมัน และการสร้าง order | Go / gRPC |
+| 5 · API Gateway | grpc-gateway REST façade ด้านหน้าเซอร์วิสต่าง ๆ | gRPC / Microservices |
+| 6 · Kafka (Event Stream) | topic `orders` และ `payments` เป็น event log ที่ replay ได้ | Kafka |
+| 7 · RabbitMQ (Work Queues) | work queue พร้อม ack, retry และ dead-letter queue | RabbitMQ |
+| 8 · Payment Service | เซอร์วิส Payment ที่ขับเคลื่อนด้วย event ทั้ง consume และ publish | Kafka / Go |
+| 9 · Order Saga | order saga พร้อม outbox pattern สำหรับ publish อย่างเชื่อถือได้ | Microservices |
+| 10 · Notification Service | เซอร์วิส Notification: Kafka เข้า, RabbitMQ send-job ออก | Kafka / RabbitMQ |
+| 11 · Resilience | retry, timeout, idempotency และการล้มเหลวอย่างนุ่มนวล | Go |
+| 12 · Testing | unit test และ integration test ข้ามเซอร์วิส | Go |
+| 13 · Docker & Compose | Dockerfile และ Compose stack เต็มรูปแบบสำหรับ dev บนเครื่อง | Docker |
+| 14 · Kubernetes (Helm) | Helm chart ที่ deploy ทั้งระบบขึ้น Kubernetes | Kubernetes |
+
+## Verify
+
+คุณพร้อมไปต่อเมื่อคุณตอบคำถามเหล่านี้ด้วยคำพูดของคุณเองได้:
+
+- ShopMicro ทำอะไร และอะไรทำให้มัน "event-driven"?
+- คุณเรียกชื่อเซอร์วิสทั้งห้าตัวและงานเดียวที่แต่ละตัวรับผิดชอบได้ไหม?
+- คุณไล่เส้นทาง **browse → order → pay → notify** และชี้ได้ไหมว่าโมดูลไหนสร้างขั้นตอนไหน?
+
+## Recap
+
+ShopMicro คือระบบ e-commerce แบบ microservices ที่ขับเคลื่อนด้วย event ซึ่งคุณจะสร้างตั้งแต่ต้นจนจบด้วย Go — เซอร์วิสห้าตัว (API Gateway, Catalog, Order, Payment, Notification), gRPC สำหรับการเรียกแบบ synchronous, Kafka และ RabbitMQ สำหรับแบบ asynchronous และ Helm chart สำหรับ Kubernetes ตอนนี้คุณรู้รายการฟีเจอร์ทั้งหมดแล้ว และรู้ว่าโมดูลการสร้างทั้งสิบสี่ตัวจับคู่กับคอร์สใน Learn Hub ที่มันต่อยอดยังไง ต่อไปเราจะไปดู [architecture](/shopmicro/th/introduction/architecture/) ของระบบ

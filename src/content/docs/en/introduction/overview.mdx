@@ -1,0 +1,83 @@
+---
+title: Overview
+description: "Meet ShopMicro, the event-driven e-commerce microservices system you'll build in Go, and see the full feature list and course map."
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+ShopMicro is an **event-driven e-commerce backend** built as a set of **microservices** in Go — think of the checkout engine behind an online store, split into small services that each own one job and talk to each other over the network.
+
+Picture the flow. A shopper **browses** the catalog and picks a product. They **place an order**. Behind the scenes that single click kicks off a chain reaction: the order is saved as `PENDING`, a payment is attempted, and depending on whether the payment succeeds or fails the order becomes `CONFIRMED` or `CANCELLED` — and either way the shopper gets a **notification** telling them what happened. No single giant program does all of this. Instead, five independent services hand work to one another through synchronous calls and a stream of events. That **browse → order → pay → notify** flow, coordinated across services that never share a database, is the whole point of ShopMicro and what makes it worth building end to end.
+
+By the end you'll have a real system: five Go services, two PostgreSQL databases, a Kafka event log, a RabbitMQ work queue, a REST-to-gRPC gateway, and a Helm chart that deploys the whole thing onto Kubernetes.
+
+## Why
+
+Most tutorials teach one tool in isolation — "here's gRPC," "here's Kafka," "here's a saga" — and leave you to guess how they fit together. ShopMicro is the opposite. Every piece exists because the product needs it:
+
+- Orders and products need to be **stored** by services that own their own data, so each service gets its **own PostgreSQL**.
+- Services need to **call each other** quickly and with a typed contract, so we reach for **gRPC**.
+- The outside world speaks **REST**, so we put a **grpc-gateway** in front to translate.
+- The order flow spans multiple services and can't use one big database transaction, so we coordinate it with an **event log (Kafka)** and a **saga**.
+- Side effects like sending an email must be **reliable and retryable**, so we hand them to a **RabbitMQ work queue** with acks, retries, and a dead-letter queue.
+
+Building one coherent product forces you to make the same decisions a real team makes, and to feel *why* microservices, gRPC, Kafka, RabbitMQ, and Kubernetes each earn their place.
+
+## Pros & cons
+
+**Pros**
+
+- You finish with a portfolio-grade distributed system, not a folder of disconnected snippets.
+- Every concept — gRPC, event streaming, the saga, the outbox — is grounded in a concrete feature you can watch work.
+- The stack (Go, gRPC, Kafka, RabbitMQ, Kubernetes) mirrors real production microservice platforms.
+
+**Cons**
+
+- It's broader and harder than a single-service tutorial: you're running five services, two databases, and two brokers at once.
+- Distributed systems have failure modes a monolith never faces — network calls fail, messages arrive twice, services restart mid-flow — and we deliberately confront them.
+- Early modules build foundations (protobuf, gRPC scaffolding) before the checkout flow visibly comes alive.
+
+## Build it
+
+Here's the full feature set you'll ship, service by service:
+
+- **API Gateway** — a single REST entry point that translates HTTP/JSON into gRPC calls (via grpc-gateway) and routes them to the right service.
+- **Catalog Service** — products and their details, stored in PostgreSQL, served over gRPC.
+- **Order Service** — creates orders (`PENDING`), owns the order saga, and publishes events reliably via the **outbox pattern**; its own PostgreSQL.
+- **Payment Service** — event-driven; consumes `order.created`, attempts payment, and publishes `payment.succeeded` or `payment.failed`.
+- **Notification Service** — event-driven; consumes payment outcomes and enqueues a send-job on a RabbitMQ work queue for a worker to deliver.
+- **Idempotent consumers** everywhere, so a message delivered twice never charges a card twice or sends two emails.
+- **One Helm chart** that deploys all five services and their infrastructure onto Kubernetes.
+
+And here's the **course map**. Each build module adapts a Learn Hub course to one slice of the project.
+
+| Module | What you build | Learn Hub course it adapts |
+| --- | --- | --- |
+| 1 · Setup & Tooling | The Go monorepo, shared tooling, and a first Docker Compose file | Go / Docker |
+| 2 · Protobuf & gRPC | The `.proto` contracts and generated Go stubs with buf | gRPC |
+| 3 · Catalog Service | The Catalog gRPC service backed by PostgreSQL | Go / gRPC |
+| 4 · Order Service | The Order gRPC service, its schema, and order creation | Go / gRPC |
+| 5 · API Gateway | The grpc-gateway REST façade in front of the services | gRPC / Microservices |
+| 6 · Kafka (Event Stream) | The `orders` and `payments` topics as a replayable event log | Kafka |
+| 7 · RabbitMQ (Work Queues) | Work queues with acks, retries, and a dead-letter queue | RabbitMQ |
+| 8 · Payment Service | The event-driven Payment service consuming and publishing events | Kafka / Go |
+| 9 · Order Saga | The Order saga plus the outbox pattern for reliable publish | Microservices |
+| 10 · Notification Service | The Notification service: Kafka in, RabbitMQ send-jobs out | Kafka / RabbitMQ |
+| 11 · Resilience | Retries, timeouts, idempotency, and graceful failure | Go |
+| 12 · Testing | Unit and integration tests across the services | Go |
+| 13 · Docker & Compose | Dockerfiles and a full Compose stack for local dev | Docker |
+| 14 · Kubernetes (Helm) | A Helm chart deploying the whole system to Kubernetes | Kubernetes |
+
+## Verify
+
+You're ready to move on when you can answer these in your own words:
+
+- What does ShopMicro do, and what makes it "event-driven"?
+- Can you name the five services and the one job each one owns?
+- Can you trace the **browse → order → pay → notify** flow and point to which module builds each step?
+
+## Recap
+
+ShopMicro is an event-driven e-commerce microservices system you'll build end to end in Go — five services (API Gateway, Catalog, Order, Payment, Notification), gRPC for synchronous calls, Kafka and RabbitMQ for asynchronous ones, and a Helm chart for Kubernetes. You now know the full feature list and how the fourteen build modules map onto the Learn Hub courses they adapt. Next, we'll look at the system [architecture](/shopmicro/en/introduction/architecture/).

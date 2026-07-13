@@ -1,0 +1,56 @@
+---
+title: Real-World Projects Roadmap
+description: "ShopMicro is project #3 of a six-project series that adapts the whole Learn Hub catalog into real applications. Here's where it fits and what's around it."
+sidebar:
+  order: 4
+---
+
+## Where ShopMicro fits
+
+ShopMicro is **project #3** of a six-project **Real-World Projects** series. Each project takes a different real application and rebuilds it from an empty repo, deliberately drawing on a different slice of the Learn Hub courses — so that, taken together, the six cover almost the entire catalog. The first two projects are **complete and live** today; ShopMicro is the one you're building now; and three more follow to finish the map across mobile, the offline web, and real cloud infrastructure.
+
+## TaskFlow — realtime Kanban board ✅ live
+
+A Trello-style board where every change shows up live for everyone viewing it. You build a Rust backend, cache and fan out through Redis, and ship an Astro frontend with one interactive island — the whole thing brought up by Docker Compose.
+
+- **Stack:** Rust/Axum + PostgreSQL + Redis + WebSocket + Astro + Docker
+- **Adapts:** Rust Deep Dive, Rust for TypeScript Developers, PostgreSQL, Redis, WebSocket Design, REST API Design, Astro, Docker
+
+## DevBlog — headless CMS + blog ✅ live
+
+A content platform: authors write posts in a headless CMS, and a fast public blog renders them. You model content, expose it over a **GraphQL** API, and render it with server-side rendering and incremental static regeneration.
+
+- **Stack:** Node/NestJS + MongoDB + GraphQL + Next.js
+- **Adapts:** Node.js Deep Dive, MongoDB, GraphQL, Next.js, React, Design Patterns, Refactoring
+
+## ShopMicro — e-commerce microservices ← you are here
+
+An online store split into independent services — catalog, orders, payments, notifications — that talk over **gRPC** and coordinate an order flow through **event streaming**. You decompose a domain into services, wire them with Kafka and RabbitMQ, hold them together with a saga and the outbox pattern, and run the whole thing on Kubernetes via Helm.
+
+- **Stack:** Go + gRPC + PostgreSQL + Kafka + RabbitMQ + Kubernetes
+- **Adapts:** Go Deep Dive, Go for TypeScript Developers, gRPC, Microservices, Kafka, RabbitMQ, Docker, Kubernetes
+
+## FitTrack — mobile-first fitness app
+
+A workout tracker with a native mobile app and a web companion, backed by a Python API and a managed Postgres/auth platform. You build the same product for two clients and share one backend.
+
+- **Stack:** Python/FastAPI + Supabase + Flutter + Svelte
+- **Adapts:** Python Deep Dive, Python for TypeScript Developers, Supabase, Flutter (×2), Svelte
+
+## OfflineNotes — offline-first PWA
+
+A note-taking app that works with no network at all: notes live in the browser and sync when you come back online. You build reusable **Web Components**, store data in **IndexedDB**, speed up a hot path with **WebAssembly**, and ship it as an installable PWA.
+
+- **Stack:** TypeScript + Web Components + IndexedDB + WebAssembly + Astro
+- **Adapts:** TypeScript, Web Components, Browser Storage, PWA, WebAssembly, Web for Designers
+
+## CloudDeploy — infra capstone
+
+The capstone: take projects 1–5 and **deploy them for real**. You provision cloud infrastructure as code across three clouds, run it on Kubernetes, and add authentication, feature flags, and observability.
+
+- **Stack:** Terraform/Terragrunt (AWS/GCP/Azure) + Kubernetes + Datadog + Keycloak + GrowthBook
+- **Adapts:** Terraform (×3), Kubernetes, Datadog, Keycloak, GrowthBook
+
+## Start here
+
+TaskFlow and DevBlog are done and live; FitTrack, OfflineNotes, and CloudDeploy are on the way. Today, the one to build is **ShopMicro** — head to the [Overview](/shopmicro/en/introduction/overview/) and start from an empty repo.

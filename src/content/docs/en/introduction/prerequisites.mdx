@@ -1,0 +1,194 @@
+---
+title: Prerequisites
+description: "Set up your macOS machine for ShopMicro — install and verify Go, buf, Docker, grpcurl, kubectl, helm, and a local Kubernetes cluster, with the exact commands and expected output."
+sidebar:
+  order: 3
+---
+
+## What we're building
+
+In this lesson we get your **macOS** machine ready to build ShopMicro. No application code yet — just the toolchain. By the end you'll have every tool installed and, more importantly, **verified** with a command whose output you can compare against what's printed here.
+
+Here's the checklist we'll work through:
+
+- [ ] **Go 1.22+** — compile and run all five services
+- [ ] **buf** — lint the `.proto` files and generate gRPC Go stubs
+- [ ] **Docker Desktop** — run Postgres, Kafka, and RabbitMQ (and later, package the services)
+- [ ] **grpcurl** — call gRPC services from the terminal to test them
+- [ ] **kubectl** — talk to a Kubernetes cluster
+- [ ] **helm** — install ShopMicro's chart onto Kubernetes
+- [ ] **A local cluster** — `kind`, or Docker Desktop's built-in Kubernetes
+
+## Why
+
+Version drift is the silent killer of "works on my machine." Pinning down the toolchain now — and confirming each tool actually runs — means that when a later module says "run `buf generate`" or "helm install the chart," it just works. Verifying output up front turns "it's installed, I think" into "it's installed, I checked." A microservices project has more tools than a single-service one, so a clean setup pays off even more here.
+
+## Pros & cons
+
+**Pros**
+
+- Catches setup problems now, in a short lesson, instead of mid-way through the gRPC or Kubernetes module.
+- Every command has an **expected output**, so you're never guessing.
+- The backing services (Postgres, Kafka, RabbitMQ) run in Docker, so there are no native database or broker daemons cluttering your host.
+
+**Cons**
+
+- It's the least exciting lesson: install, verify, repeat.
+- Docker Desktop plus a Kubernetes cluster is a sizable download and wants a fair amount of RAM — running Kafka, RabbitMQ, and Postgres together is not lightweight.
+- Homebrew is assumed; if you don't have it, install it first from [brew.sh](https://brew.sh).
+
+## Set it up
+
+Work top to bottom. After each install, run its verify command and match the output before moving on.
+
+### 1. Go 1.22+
+
+Go is the language of all five ShopMicro services. Install it via Homebrew (or from [go.dev/dl](https://go.dev/dl/)):
+
+```sh
+brew install go
+```
+
+Verify:
+
+```sh
+go version
+```
+
+Expected output (the version must be **1.22 or higher**):
+
+```
+go version go1.22.5 darwin/arm64
+```
+
+### 2. buf
+
+`buf` is the modern toolchain for Protocol Buffers. We'll use it to lint the `.proto` contracts and generate the gRPC Go stubs (client and server) from Module 2 onward. Install it via Homebrew:
+
+```sh
+brew install bufbuild/buf/buf
+```
+
+Verify:
+
+```sh
+buf --version
+```
+
+Expected output:
+
+```
+1.34.0
+```
+
+### 3. Docker Desktop
+
+Docker runs ShopMicro's infrastructure — **PostgreSQL**, **Kafka**, and **RabbitMQ** — during development, all wired together by a Docker Compose file you'll write in Module 1. Later, Docker also packages each service into an image. Install **Docker Desktop for Mac** from [docker.com](https://www.docker.com/products/docker-desktop/) (or `brew install --cask docker`), then launch it once so the engine is running.
+
+Verify both the engine and the Compose plugin:
+
+```sh
+docker --version
+docker compose version
+```
+
+Expected output:
+
+```
+Docker version 27.0.3, build 7d4bcd8
+Docker Compose version v2.28.1
+```
+
+If `docker` errors with "Cannot connect to the Docker daemon," make sure the Docker Desktop app is actually running (whale icon in the menu bar).
+
+### 4. grpcurl
+
+`grpcurl` is `curl` for gRPC — it lets you call a service's methods straight from the terminal, which is invaluable for testing Catalog and Order before the gateway exists. Install via Homebrew:
+
+```sh
+brew install grpcurl
+```
+
+Verify:
+
+```sh
+grpcurl --version
+```
+
+Expected output:
+
+```
+grpcurl v1.9.1
+```
+
+### 5. kubectl and helm
+
+`kubectl` is the command-line client for Kubernetes; `helm` is the package manager we use to install ShopMicro's chart in Module 14. Install both via Homebrew:
+
+```sh
+brew install kubectl helm
+```
+
+Verify:
+
+```sh
+kubectl version --client
+helm version
+```
+
+Expected output (roughly):
+
+```
+Client Version: v1.30.2
+version.BuildInfo{Version:"v3.15.2", ...}
+```
+
+### 6. A local Kubernetes cluster
+
+You need somewhere to run the chart. Two easy options:
+
+**Option A — Docker Desktop's built-in Kubernetes.** In Docker Desktop, open **Settings → Kubernetes** and tick **Enable Kubernetes**. It spins up a single-node cluster and points `kubectl` at it.
+
+**Option B — kind (Kubernetes in Docker).** A lightweight cluster that runs inside Docker containers. Install and create one:
+
+```sh
+brew install kind
+kind create cluster --name shopmicro
+```
+
+Either way, verify `kubectl` can reach the cluster:
+
+```sh
+kubectl cluster-info
+kubectl get nodes
+```
+
+Expected output (a running control plane and at least one `Ready` node):
+
+```
+Kubernetes control plane is running at https://127.0.0.1:6443
+NAME                      STATUS   ROLES           AGE   VERSION
+shopmicro-control-plane   Ready    control-plane   1m    v1.30.0
+```
+
+Either option is fine — pick one. You only need the cluster for Module 14, so you can come back to this step later if you'd rather not run it now.
+
+> **Note:** You do **not** install Kafka, RabbitMQ, or PostgreSQL directly on your machine. They run as containers via the Docker Compose file you'll create in [Module 1 · Setup & Tooling](/shopmicro/en/setup/). That keeps your host clean and everyone's environment identical.
+
+## Verify
+
+Run this final sweep. Every line should print a version, and no command should be "not found":
+
+```sh
+go version && \
+buf --version && \
+docker --version && docker compose version && \
+grpcurl --version && \
+kubectl version --client && helm version
+```
+
+If every command answers with a version string — and Go is 1.22+ — your machine is ready.
+
+## Recap
+
+Your macOS toolchain is installed and, crucially, **verified**: **Go 1.22+** for the services, **buf** to lint protos and generate gRPC stubs, **Docker Desktop** (engine + Compose) to run Postgres/Kafka/RabbitMQ, **grpcurl** to test gRPC by hand, and **kubectl** + **helm** + a **local cluster** for the Kubernetes deploy. The brokers and databases themselves run in Docker, not on your host. That's the end of Module 0. Next up is [Module 1 · Setup & Tooling](/shopmicro/en/setup/), where we scaffold the Go monorepo and stand up the backing services.

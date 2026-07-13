@@ -1,0 +1,56 @@
+---
+title: Roadmap
+description: "ShopMicro คือโปรเจกต์ #3 ของซีรีส์หกโปรเจกต์ที่ต่อยอดทั้งแค็ตตาล็อกของ Learn Hub มาเป็นแอปพลิเคชันจริง นี่คือตำแหน่งของมันและสิ่งที่อยู่รอบ ๆ"
+sidebar:
+  order: 4
+---
+
+## Where ShopMicro fits
+
+ShopMicro คือ **โปรเจกต์ #3** ของซีรีส์ **Real-World Projects** ที่มีหกโปรเจกต์ แต่ละโปรเจกต์หยิบแอปพลิเคชันจริงคนละตัวมาสร้างใหม่ตั้งแต่ repo เปล่า ๆ โดยจงใจดึงเอาคอร์สคนละส่วนใน Learn Hub มาใช้ — เพื่อว่าเมื่อรวมทั้งหกเข้าด้วยกันจะครอบคลุมแค็ตตาล็อกเกือบทั้งหมด สองโปรเจกต์แรก **เสร็จและใช้งานได้จริง** แล้ววันนี้; ShopMicro คือตัวที่คุณกำลังสร้างอยู่ตอนนี้; และอีกสามตัวตามมาเพื่อเติมแผนที่ให้ครบทั้งฝั่ง mobile, offline web และ cloud infrastructure จริง
+
+## TaskFlow — realtime Kanban board ✅ live
+
+บอร์ดสไตล์ Trello ที่ทุกการเปลี่ยนแปลงปรากฏสด ๆ ให้ทุกคนที่กำลังดูอยู่เห็น คุณสร้าง backend ด้วย Rust, cache และกระจายข้อมูลผ่าน Redis และส่ง frontend ด้วย Astro ที่มี island อินเทอร์แอกทีฟหนึ่งตัว — ทั้งหมดถูกยกขึ้นมาด้วย Docker Compose
+
+- **Stack:** Rust/Axum + PostgreSQL + Redis + WebSocket + Astro + Docker
+- **Adapts:** Rust Deep Dive, Rust for TypeScript Developers, PostgreSQL, Redis, WebSocket Design, REST API Design, Astro, Docker
+
+## DevBlog — headless CMS + blog ✅ live
+
+แพลตฟอร์มคอนเทนต์: ผู้เขียนเขียนโพสต์ใน headless CMS และบล็อกสาธารณะที่รวดเร็ว render มันออกมา คุณจะออกแบบโครงสร้างคอนเทนต์, เปิดมันผ่าน **GraphQL** API และ render ด้วย server-side rendering และ incremental static regeneration
+
+- **Stack:** Node/NestJS + MongoDB + GraphQL + Next.js
+- **Adapts:** Node.js Deep Dive, MongoDB, GraphQL, Next.js, React, Design Patterns, Refactoring
+
+## ShopMicro — e-commerce microservices ← คุณอยู่ที่นี่
+
+ร้านค้าออนไลน์ที่ถูกแยกเป็นเซอร์วิสอิสระ — catalog, orders, payments, notifications — ที่คุยกันผ่าน **gRPC** และประสาน order flow ผ่าน **event streaming** คุณจะแยกโดเมนออกเป็นเซอร์วิส, เชื่อมมันด้วย Kafka และ RabbitMQ, ยึดมันเข้าด้วยกันด้วย saga และ outbox pattern แล้วรันทั้งหมดบน Kubernetes ผ่าน Helm
+
+- **Stack:** Go + gRPC + PostgreSQL + Kafka + RabbitMQ + Kubernetes
+- **Adapts:** Go Deep Dive, Go for TypeScript Developers, gRPC, Microservices, Kafka, RabbitMQ, Docker, Kubernetes
+
+## FitTrack — mobile-first fitness app
+
+แอปติดตามการออกกำลังกายที่มีทั้งแอป mobile แบบ native และเพื่อนคู่หูฝั่งเว็บ รองรับด้วย Python API และแพลตฟอร์ม Postgres/auth แบบ managed คุณจะสร้างโปรดักต์เดียวกันสำหรับ client สองตัวและแชร์ backend เดียวกัน
+
+- **Stack:** Python/FastAPI + Supabase + Flutter + Svelte
+- **Adapts:** Python Deep Dive, Python for TypeScript Developers, Supabase, Flutter (×2), Svelte
+
+## OfflineNotes — offline-first PWA
+
+แอปจดโน้ตที่ทำงานได้แม้ไม่มีเครือข่ายเลย: โน้ตอยู่ในเบราว์เซอร์และ sync เมื่อคุณกลับมาออนไลน์ คุณจะสร้าง **Web Components** ที่นำกลับมาใช้ซ้ำได้, เก็บข้อมูลใน **IndexedDB**, เร่งความเร็ว hot path ด้วย **WebAssembly** และส่งมันเป็น PWA ที่ติดตั้งได้
+
+- **Stack:** TypeScript + Web Components + IndexedDB + WebAssembly + Astro
+- **Adapts:** TypeScript, Web Components, Browser Storage, PWA, WebAssembly, Web for Designers
+
+## CloudDeploy — infra capstone
+
+บทสรุปปิดท้าย: หยิบโปรเจกต์ 1–5 มา **deploy จริง** คุณจะจัดเตรียม cloud infrastructure แบบ as code ข้ามสาม cloud, รันมันบน Kubernetes และเพิ่ม authentication, feature flag และ observability
+
+- **Stack:** Terraform/Terragrunt (AWS/GCP/Azure) + Kubernetes + Datadog + Keycloak + GrowthBook
+- **Adapts:** Terraform (×3), Kubernetes, Datadog, Keycloak, GrowthBook
+
+## Start here
+
+TaskFlow และ DevBlog เสร็จและใช้งานได้จริงแล้ว; FitTrack, OfflineNotes และ CloudDeploy กำลังตามมา วันนี้ตัวที่จะสร้างคือ **ShopMicro** — ไปที่ [Overview](/shopmicro/th/introduction/overview/) แล้วเริ่มจาก repo เปล่า ๆ
