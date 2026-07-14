@@ -1,0 +1,223 @@
+---
+title: Deploying to the cluster
+description: "Install Helm chart เข้า kind cluster local: load image shopmicro, รัน database migration เป็น Helm pre-install hook Job, helm install, รอ pod Ready บน probe ของมัน, port-forward gateway, แล้วขับ order flow curl เดียวกัน (PENDING เป็น CONFIRMED) กับ pod แทน go run แล้ว rolling helm upgrade และ helm uninstall"
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+ไม่มีโค้ด application ใหม่ — บทนี้เอา chart ที่ [The Helm chart →](/shopmicro/th/kubernetes/helm-chart/) สร้างมารันจริง บน kind cluster local: load image `shopmicro/*` ที่ Module 13 สร้าง [Service images →](/shopmicro/th/docker/service-images/), เพิ่ม template ใหม่หนึ่งตัว — migration `Job` ที่รันเป็น Helm **pre-install/pre-upgrade hook** เพื่อให้ schema มีอยู่ก่อน service ใด ๆ เริ่ม — `helm install`, รอทุก pod ผ่าน probe, `port-forward` gateway, แล้วรัน `curl` flow เดียวกับที่ทั้งคอร์สใช้: สร้าง product, วางคำสั่งซื้อ, poll จนเป็น `CONFIRMED` ความต่างคือคราวนี้ saga รันข้าม pod ที่ Kubernetes schedule กู้ตัวเองและ rolling-upgrade ได้ แทนที่จะเป็นหก terminal `go run`
+
+## Why
+
+ทุกอย่างที่ chart declare เฉื่อยอยู่จนกว่ามีอะไร reconcile มันกับ cluster จริง — นั่นคือสิ่งที่ `helm install` trigger และสิ่งที่บทนี้ทำทั้งหมด สามอย่างกลายเป็นจริงตรงนี้ และแต่ละอันควรดูมันเกิด:
+
+- **Migration ต้องรันก่อน service ที่ต้องการ table** `catalog` และ `order` เปิด Postgres pool และคาดว่า schema มีอยู่; service ที่เริ่มกับ database ว่างเปล่าจะ crash ตอน dev local [Infra & Compose →](/shopmicro/th/setup/infra-compose/) คุณรัน `migrate ... up` ด้วยมือก่อน ใน cluster ไม่มี "ด้วยมือ" — ดังนั้น chart พก `Job` ที่ annotate เป็น Helm `pre-install,pre-upgrade` hook ซึ่ง Helm รัน *และรอ* ก่อนจะ apply Deployment ลำดับการทำงานที่ implicit ตอน shell prompt กลายเป็น dependency ที่ declare ชัด
+- **Probe คุม readiness และ readiness คุม traffic** `Service` หน้า gateway ส่ง request เฉพาะ pod ที่ผ่าน `readinessProbe`; pod ที่ยังเริ่มอยู่ หรือ pod ที่ `/healthz` fail จะถูกกันออกจาก rotation อัตโนมัติ นี่คือ cluster บังคับใช้วินัย "อย่า route ไปสิ่งที่ยังไม่พร้อม" เดียวกันที่ resilience layer [Circuit breakers →](/shopmicro/th/resilience/circuit-breaker/) บังคับใช้ที่ระดับ client — สองชั้นของแนวคิดเดียวกัน
+- **เวอร์ชันใหม่ roll out โดยไม่ downtime** `helm upgrade` พร้อม image tag หรือจำนวน replica ที่เปลี่ยน trigger rolling update: Kubernetes ยก pod ใหม่ขึ้น รอให้มันผ่าน readiness แล้วค่อยรื้อ pod เก่า — ดังนั้น `Service` ของ gateway มี pod ที่พร้อมอยู่เบื้องหลังเสมอ graceful shutdown ที่ทุก `main` implement บน `SIGTERM` [grpc-gateway →](/shopmicro/th/gateway/grpc-gateway/) คือสิ่งที่ทำให้ครึ่งรื้อของ rollout นั้นสะอาด: Kubernetes ส่ง `SIGTERM`, process ทำงานที่ค้างให้เสร็จแล้ว exit ไม่มี request ถูกตัดกลางคัน
+
+`kind` (Kubernetes-in-Docker) คือ cluster ตรงนี้เพราะมันรันใน Docker ที่คุณมีอยู่แล้วทั้งหมด ไม่ต้องมี cloud account และ — สำคัญ — ให้คุณ load image ที่ build local ตรงเข้า cluster ด้วย `kind load` ดังนั้นคุณไม่ต้อง push ไป registry แค่เพื่อลอง chart บน cluster จริงคุณจะ push `shopmicro/*` ไป registry แล้ว set `image.repository` ตามนั้น; ไม่มีอะไรอื่นเกี่ยวกับ chart เปลี่ยน
+
+## Pros & cons
+
+**`kind load docker-image` (cluster local อ่าน image local)** เทียบกับ **push image ไป registry**
+
+- **Pros:** ไม่ต้อง setup registry และไม่มี network round trip — คุณ build image แล้วมันใช้ได้ใน cluster ในไม่กี่วินาที ทำให้ loop edit-build-deploy เร็วพอจะ iterate กับ chart จริง; เหมาะกับ dev local และ CI test cluster
+- **Cons:** มันทำงานได้เพราะ node ของ `kind` *คือ* Docker local — kubelet ของ cluster หลาย node จริงอ่าน image cache ของ laptop คุณไม่ได้ ดังนั้น deployment non-local ใด ๆ ต้องการ registry และเรื่อง `imagePullPolicy`/`imagePullSecrets` ที่ `kind` ให้ข้าม ความสะดวกจริงแต่ local ล้วน
+
+**Migration เป็น Helm pre-install hook Job** เทียบกับ **initContainer บนแต่ละ service หรือ migrate ด้วยมือ**
+
+- **Pros:** hook รันครั้งเดียวเป๊ะต่อ release ก่อน service pod ใด ๆ เริ่ม และ Helm block บนความสำเร็จของมัน — ดังนั้นมีที่เดียวที่ ordered และ declare ที่ schema รับประกันว่าปัจจุบัน และ migration ที่ fail ทำให้ `helm install` fail ดัง ๆ แทนที่จะทิ้ง service ที่เริ่มครึ่ง ๆ ให้ crash-loop
+- **Cons:** hook Job เป็น object อีกตัวพร้อม image และ failure mode ของมันเอง และมันรันบน *ทุก* upgrade แม้ไม่มีอะไรเปลี่ยน (migration จึงต้อง idempotent — ซึ่ง `migrate ... up` เป็นอยู่แล้ว); `initContainer` ต่อ service วาง migration ไว้กับสิ่งที่ต้องการมันแต่แล้วรัน migration เดิม N ครั้งแข่งกันข้าม replica ซึ่งแย่กว่า และ "ด้วยมือ" ไม่รอดเมื่อเจอมากกว่าหนึ่ง environment hook เป็นตัวที่แย่น้อยที่สุดในสามสำหรับ chart ที่ตั้งใจให้ install ซ้ำได้
+
+## Set it up
+
+### 1. `deploy/helm/shopmicro/templates/migrate-job.yaml`
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: shopmicro-migrate
+  labels:
+    {{- include "shopmicro.labels" . | nindent 4 }}
+  annotations:
+    # Run before the Deployments on every install and upgrade, and wait for
+    # success before proceeding. delete-policy cleans up the old Job first.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "shopmicro.selectorLabels" (dict "name" "migrate") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          # shopmicro/migrate bundles the migrate CLI with the migrations/
+          # tree — built in the next section. A cluster can't bind-mount the
+          # host's migrations the way the Compose stack does, so they're baked
+          # into an image instead.
+          image: "{{ .Values.image.repository }}/migrate:{{ .Values.image.tag }}"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              migrate -path /migrations/catalog -database "$CATALOG_DB_URL" up && \
+              migrate -path /migrations/order   -database "$ORDER_DB_URL"   up
+          env:
+            - name: CATALOG_DB_URL
+              valueFrom:
+                secretKeyRef: { name: shopmicro-db, key: CATALOG_DB_URL }
+            - name: ORDER_DB_URL
+              valueFrom:
+                secretKeyRef: { name: shopmicro-db, key: ORDER_DB_URL }
+```
+
+บันทึกเป็น `templates/migrate-job.yaml` `hook-weight: "-5"` จัดมันไว้ก่อน hook อื่น; `pre-install,pre-upgrade` ทำให้ Helm รันมันและ block บนการเสร็จของมันก่อน apply Deployment ดังนั้น `catalog` และ `order` ไม่เคยเริ่มกับ database ที่ยังไม่ migrate
+
+### 2. สร้าง cluster และ load image
+
+```bash
+kind create cluster --name shopmicro
+```
+
+image ของหกservice มาจาก [Service images →](/shopmicro/th/docker/service-images/) ใน Module 13 chart ต้องการอีกหนึ่งตัวที่ service image จงใจไม่ bundle — migrations image ที่จับคู่ `migrate` CLI กับ SQL tree build มันตอนนี้ โดยใช้ `migrations/` เป็น build context เพื่อให้ root `.dockerignore` (ที่ exclude `migrations` ออกจาก service build) ไม่มีผล:
+
+```bash
+docker build -t shopmicro/migrate:latest -f - migrations <<'EOF'
+FROM migrate/migrate:v4.17.1
+COPY . /migrations
+EOF
+```
+
+แล้ว load ทุก image ที่ chart อ้างเข้า node ของ cluster เพื่อให้ `imagePullPolicy: IfNotPresent` เจอมัน local โดยไม่มี registry:
+
+```bash
+for svc in catalog order payment notification notification-worker gateway migrate; do
+  kind load docker-image shopmicro/$svc:latest --name shopmicro
+done
+```
+
+### 3. เตรียม infrastructure
+
+chart คาดว่า Postgres, Kafka, และ RabbitMQ เข้าถึงได้ที่ชื่อใน `values.yaml` [The Helm chart →](/shopmicro/th/kubernetes/helm-chart/) สำหรับ cluster local ทางที่เร็วสุดคือ chart ของ Bitnami:
+
+```bash
+helm install postgres oci://registry-1.docker.io/bitnamicharts/postgresql \
+  --set auth.username=shopmicro,auth.password=shopmicro,auth.database=shopmicro \
+  --set fullnameOverride=postgres
+helm install kafka oci://registry-1.docker.io/bitnamicharts/kafka \
+  --set fullnameOverride=kafka --set listeners.client.protocol=PLAINTEXT
+helm install rabbitmq oci://registry-1.docker.io/bitnamicharts/rabbitmq \
+  --set auth.username=shopmicro,auth.password=shopmicro --set fullnameOverride=rabbitmq
+```
+
+(Catalog และ Order ใช้ Postgres instance เดียวกันร่วมกันด้วยสอง database, `catalog` และ `orders` — สร้าง database ที่สองเมื่อ Postgres ขึ้นแล้ว หรือชี้ `infra.postgres` ไปสอง host ถ้าคุณอยากให้แยกกัน)
+
+## Verify
+
+Install chart Helm รัน migration Job ก่อน รอมัน แล้ว apply ที่เหลือ:
+
+```bash
+helm install shopmicro deploy/helm/shopmicro
+```
+
+ดู pod ขึ้นมาและผ่าน probe ของมัน — `READY 1/1` แปลว่า `readinessProbe` เขียว:
+
+```bash
+kubectl get pods
+```
+
+```txt
+NAME                                   READY   STATUS      RESTARTS   AGE
+shopmicro-migrate-abcde                0/1     Completed   0          40s
+catalog-6f9c8b7d5-2xk4p                1/1     Running     0          35s
+order-7d4b9c6f8-9wq2n                  1/1     Running     0          35s
+payment-5c8d7b4f9-lm6rt                1/1     Running     0          35s
+notification-6b7d9f8c5-pk3wq           1/1     Running     0          35s
+notification-worker-8f9c7b6d4-aa11b    1/1     Running     0          35s
+notification-worker-8f9c7b6d4-bb22c    1/1     Running     0          35s
+gateway-7f8d9c6b5-zz99x                1/1     Running     0          35s
+gateway-7f8d9c6b5-yy88w                1/1     Running     0          35s
+```
+
+migration Job แสดง `Completed` (มันรันครั้งเดียวแล้ว exit); สอง `notification-worker` และสอง `gateway` pod คือ `replicas` จาก `values.yaml` port-forward `Service` ของ gateway มาที่ laptop:
+
+```bash
+kubectl port-forward svc/gateway 8080:8080
+```
+
+ทีนี้รัน flow เดียวกับที่คอร์สใช้มาตั้งแต่ [REST Mapping →](/shopmicro/th/gateway/rest-mapping/) — สร้าง product, วางคำสั่งซื้อ, poll มัน — ยกเว้นตอนนี้ทุก hop เป็น pod:
+
+```bash
+curl -s -X POST localhost:8080/v1/products \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Coffee Mug","description":"350ml ceramic mug","price_cents":1299,"stock":50}'
+```
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
+```
+
+Poll คำสั่งซื้ออีกไม่กี่วินาทีต่อมา — นานพอให้ loop outbox relay → Kafka → Payment → Kafka → saga [The Saga Handler →](/shopmicro/th/saga/orchestration/) รันข้าม pod:
+
+```bash
+curl -s localhost:8080/v1/orders/3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90
+```
+
+```json
+{
+  "id": "3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90",
+  "status": "ORDER_STATUS_CONFIRMED",
+  "totalCents": "2598"
+}
+```
+
+`PENDING → CONFIRMED` รันใน cluster ทั้งหมด — ทั้งระบบ ทุก service และทั้งสอง broker deploy ด้วย `helm install` เดียว ทีนี้พิสูจน์ rolling upgrade เปลี่ยนค่าแล้ว upgrade:
+
+```bash
+helm upgrade shopmicro deploy/helm/shopmicro --set services.gateway.replicas=3
+```
+
+```bash
+kubectl rollout status deployment/gateway
+```
+
+```txt
+deployment "gateway" successfully rolled out
+```
+
+Kubernetes ยก gateway pod ที่สามขึ้น รอ readiness `/healthz` ของมัน แล้ว `Service` ตอนนี้ balance ข้ามสามตัว — ไม่มี request หล่น เพราะ pod เก่าออกจาก rotation หลัง pod ใหม่พร้อมเท่านั้น สุดท้าย รื้อทั้งหมด:
+
+```bash
+helm uninstall shopmicro
+```
+
+```txt
+release "shopmicro" uninstalled
+```
+
+แล้วยืนยันว่า chart ยัง lint สะอาดหลังเพิ่ม Job template ใหม่:
+
+```bash
+helm lint deploy/helm/shopmicro
+```
+
+ไม่มี failure แปลว่าสำเร็จ
+
+ตรวจสอบความเข้าใจ:
+
+- migration `Job` เป็น `pre-install,pre-upgrade` hook อะไรพังถ้ามันเป็น template ธรรมดา (ไม่มี hook annotation) ที่ Helm apply พร้อมกับ Deployment?
+- `kubectl get pods` แสดง `gateway` เป็น `READY 1/1` หลังไม่กี่วินาทีเท่านั้น `Service` ทำอะไรกับ gateway pod ในไม่กี่วินาทีนั้นก่อนมันพร้อม และทำไม?
+- `helm upgrade` ที่เปลี่ยน image tag roll out โดยไม่ downtime ชิ้นไหนใน `main` ของแต่ละ service ทำให้ครึ่ง *teardown* ของ rollout นั้นสะอาด และ signal อะไร trigger มัน?
+- `kind load docker-image` ให้คุณข้าม registry ทั้งหมด ทำไมนั่นทำงานได้กับ `kind` แต่ไม่ได้กับ cluster หลาย node จริง?
+
+## Recap
+
+`helm install shopmicro deploy/helm/shopmicro` ยกทั้งระบบขึ้นบน kind cluster: `pre-install` hook `Job` รัน `migrate ... up` สำหรับทั้งสอง database และ Helm block บนมัน ดังนั้น `catalog` และ `order` ไม่เคยเริ่มกับ schema ว่างเปล่า; แล้วทุก Deployment roll out และแต่ละ pod เข้าร่วม `Service` ก็ต่อเมื่อ `readinessProbe` (`/healthz` สำหรับ gateway, `tcpSocket` สำหรับ gRPC service) ผ่าน image ถึง cluster ด้วย `kind load docker-image` — ไม่มี registry — และ `curl` flow เดียวกับที่คอร์สใช้ตลอดขับคำสั่งซื้อจาก `PENDING` เป็น `CONFIRMED` ข้าม pod ทั้งหมด loop outbox-relay → Kafka → Payment → saga รันเป๊ะเหมือนตอน local `helm upgrade --set services.gateway.replicas=3` พิสูจน์ zero-downtime rolling update โดย graceful `SIGTERM` shutdown ทำให้ teardown สะอาด และ `helm uninstall` ลบ release ShopMicro ตอนนี้รันแบบเดียวกันใน cluster กับที่รันบน laptop อธิบายครั้งเดียวเป็น chart ที่ version ได้ บทถัดไป [Wrap-up →](/shopmicro/th/wrap-up/) ถอยกลับมามองทุกอย่างที่คุณสร้าง — service, สอง broker, saga และ outbox, resilience layer, และ deployment นี้ — trade-off เบื้องหลังแต่ละอัน และจะพาระบบไปทางไหนต่อ

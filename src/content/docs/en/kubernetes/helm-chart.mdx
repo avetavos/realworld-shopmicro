@@ -1,0 +1,376 @@
+---
+title: The Helm chart
+description: "deploy/helm/shopmicro — a Helm chart that packages all six ShopMicro binaries as Deployments (catalog, order, payment on their own; notification and notification-worker as consumers; gateway with a Service), driven by values.yaml, with a ConfigMap for non-secret env, a Secret for database URLs, _helpers.tpl for labels, and readiness/liveness probes. Why the same CATALOG_GRPC_ADDR is a bind address in one pod and a dial address in another. Verified with helm lint and helm template."
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+`deploy/helm/shopmicro/` — a Helm chart that packages the whole system for Kubernetes. Every binary Module 13 containerized [Service images →](/shopmicro/en/docker/service-images/) becomes a Kubernetes `Deployment`: `catalog`, `order`, and `payment` each on their own; `notification` and `notification-worker` as consumers with no inbound port; and `gateway` fronting them all with a `Service` (and an optional `Ingress`) on HTTP `8080`. The two gRPC services that other pods call — `catalog` and `order` — get `ClusterIP` `Service`s so their names resolve inside the cluster. A `ConfigMap` holds the non-secret env (`KAFKA_BROKERS`, `RABBITMQ_URL`), a `Secret` holds the database URLs, and `templates/_helpers.tpl` centralizes names and labels so every object is tagged consistently.
+
+Everything is driven by `values.yaml`: image repository and tag, per-service replica counts, and the endpoints of the shared infrastructure. This chart deliberately does **not** package Postgres, Kafka, or RabbitMQ — it treats them as externally managed and points `values.yaml` at wherever they run. This lesson builds and lints the chart; [Deploying to the cluster →](/shopmicro/en/kubernetes/deploy-cluster/) installs it into a real cluster and runs the same `curl` smoke test the rest of the course used, against pods instead of `go run`.
+
+## Why
+
+Docker Compose [Compose stack →](/shopmicro/en/docker/compose-stack/) already runs all six services on one machine. Kubernetes answers the questions Compose doesn't: how do these run across many machines, restart themselves when they crash, roll out a new version without downtime, and scale `notification-worker` to five replicas without touching any other service? A Helm chart is how you describe all of that as one versioned, parameterized package — `helm install` once, and the cluster reconciles reality toward the manifests the chart renders. Writing raw Kubernetes YAML by hand would work too, but you'd copy the same Deployment boilerplate six times and hand-edit an image tag across a dozen files for every release; Helm's templating collapses that into `values.yaml` plus one template per *kind* of object.
+
+The single most important thing to understand in this chart is a subtlety that was invisible in local development: **`CATALOG_GRPC_ADDR` means two different things depending on which pod reads it.** In the `catalog` pod it's a *bind address* — `catalog`'s `main` passes it to `net.Listen`, so it must be `:50051` (listen on that port on every interface). In the `order` and `gateway` pods it's a *dial address* — they pass it to `grpc.NewClient` to reach Catalog, so it must be `catalog:50051`, the DNS name Kubernetes gives Catalog's `Service`. Locally, both collapsed to `:50051` because `net.Listen(":50051")` and dialing `localhost:50051` are the same host — so [The gRPC Server →](/shopmicro/en/order-service/grpc-server/) could get away with one value for both roles. In a cluster they're genuinely different values, so the chart sets `CATALOG_GRPC_ADDR` *per Deployment* rather than once in the shared `ConfigMap`. Recognizing that "the same variable is a listen address in the server and a dial address in the client" is most of what makes wiring gRPC services in Kubernetes click.
+
+The rest is standard, and each choice earns its place:
+
+- **`ConfigMap` vs `Secret`.** `KAFKA_BROKERS` and `RABBITMQ_URL`'s host are non-secret and go in a `ConfigMap`; the database URLs carry credentials and go in a `Secret`. Kubernetes treats them differently (Secrets are, at minimum, kept out of plain `get -o yaml` by default and can be encrypted at rest), and keeping the split honest means a leaked ConfigMap dump doesn't leak a password.
+- **Which Deployments get a `Service`.** A `Service` exists to give a stable name and load-balance traffic *to* a set of pods. `catalog` and `order` need one because other pods dial them; `gateway` needs one because clients (or an Ingress) hit it. `payment`, `notification`, and `notification-worker` are pure consumers — nothing ever connects *to* them, they reach *out* to Kafka and RabbitMQ — so they get no Service at all. A Service with no consumers is just clutter.
+- **Readiness and liveness probes.** The gateway exposes `/healthz` [grpc-gateway →](/shopmicro/en/gateway/grpc-gateway/), so its probes are a plain `httpGet`. The gRPC services don't serve HTTP, so this chart probes them with a `tcpSocket` on their gRPC port — enough to know the process is listening. (The stronger option is Kubernetes' native `grpc` probe, which needs the server to implement the standard `grpc.health.v1` service; adding that is a small, worthwhile follow-up, noted in Pros & cons.)
+
+## Pros & cons
+
+**A Helm chart** vs. **raw `kubectl apply` of hand-written manifests (or Kustomize)**
+
+- **Pros:** one `values.yaml` parameterizes image tag, replicas, and resources across every object, so a release is a one-line change instead of a find-and-replace across a dozen files; `helm install`/`upgrade`/`rollback` give versioned, atomic releases with a real rollback command; the chart is a single distributable artifact another team can install without reading its internals.
+- **Cons:** Helm's Go-template-inside-YAML is genuinely harder to read and debug than flat manifests — a missing `{{- }}` whitespace trim or a wrong `.Values` path produces YAML that's invalid in confusing ways; for a tiny, static deployment, Kustomize's overlay-a-base model (no templating language at all) is simpler, and raw manifests are the most transparent of all. Helm earns its complexity once you have many parameterized objects and real releases to manage — which this system does.
+
+**Treating Postgres/Kafka/RabbitMQ as externally managed** vs. **bundling them as chart subchart dependencies**
+
+- **Pros:** the chart stays focused on ShopMicro's own stateless services, and production infra is almost always managed separately anyway — a cloud Postgres, a managed Kafka — with its own backups, scaling, and lifecycle that a stateless app chart has no business owning; `values.yaml` just points at wherever it lives.
+- **Cons:** the chart isn't self-contained — `helm install` alone doesn't give you a running system, you must provision the infra first and set the endpoints — whereas bundling Bitnami's Postgres/Kafka/RabbitMQ subcharts would make one command stand up everything, which is genuinely nicer for a demo or an ephemeral test cluster. The trade is "realistic production shape" vs. "one-command everything," and this course picks the former, with subcharts as the documented alternative.
+
+## Set it up
+
+### 1. `deploy/helm/shopmicro/Chart.yaml`
+
+```yaml
+apiVersion: v2
+name: shopmicro
+description: The ShopMicro microservices system — catalog, order, payment, notification, and the API gateway
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+```
+
+### 2. `deploy/helm/shopmicro/values.yaml`
+
+```yaml
+image:
+  repository: shopmicro   # images are shopmicro/<service>, built in Module 13
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Shared infrastructure is externally managed. Point these at wherever
+# Postgres, Kafka, and RabbitMQ run — in-cluster Service DNS is shown here.
+infra:
+  kafkaBrokers: kafka:9092
+  rabbitmqURL: amqp://shopmicro:shopmicro@rabbitmq:5672/
+  postgres:
+    host: postgres
+    port: 5432
+    user: shopmicro
+    password: shopmicro   # override via --set or a values file in real use
+
+services:
+  catalog:
+    replicas: 1
+    grpcPort: 50051
+    db: catalog
+  order:
+    replicas: 1
+    grpcPort: 50052
+    db: orders
+  payment:
+    replicas: 1
+  notification:
+    replicas: 1
+  notificationWorker:
+    replicas: 2
+  gateway:
+    replicas: 2
+    httpPort: 8080
+    service:
+      type: ClusterIP
+    ingress:
+      enabled: false
+      host: shopmicro.local
+```
+
+### 3. `deploy/helm/shopmicro/templates/_helpers.tpl`
+
+```yaml
+{{/* Common labels applied to every object. */}}
+{{- define "shopmicro.labels" -}}
+app.kubernetes.io/part-of: shopmicro
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+{{- end -}}
+
+{{/* Selector labels for a single service, given its name as the context. */}}
+{{- define "shopmicro.selectorLabels" -}}
+app.kubernetes.io/name: {{ .name }}
+app.kubernetes.io/part-of: shopmicro
+{{- end -}}
+
+{{/* The Postgres URL for a given database name, assembled from infra values. */}}
+{{- define "shopmicro.pgurl" -}}
+postgres://{{ .root.Values.infra.postgres.user }}:{{ .root.Values.infra.postgres.password }}@{{ .root.Values.infra.postgres.host }}:{{ .root.Values.infra.postgres.port }}/{{ .db }}?sslmode=disable
+{{- end -}}
+```
+
+### 4. `deploy/helm/shopmicro/templates/configmap.yaml` and `secret.yaml`
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shopmicro-config
+  labels:
+    {{- include "shopmicro.labels" . | nindent 4 }}
+data:
+  KAFKA_BROKERS: {{ .Values.infra.kafkaBrokers | quote }}
+  RABBITMQ_URL: {{ .Values.infra.rabbitmqURL | quote }}
+```
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: shopmicro-db
+  labels:
+    {{- include "shopmicro.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  CATALOG_DB_URL: {{ include "shopmicro.pgurl" (dict "root" $ "db" .Values.services.catalog.db) | quote }}
+  ORDER_DB_URL: {{ include "shopmicro.pgurl" (dict "root" $ "db" .Values.services.order.db) | quote }}
+```
+
+Save these as `templates/configmap.yaml` and `templates/secret.yaml`. The DB URLs are assembled from `infra.postgres` values by the `shopmicro.pgurl` helper, so credentials live in exactly one place.
+
+### 5. `deploy/helm/shopmicro/templates/catalog.yaml` — the gRPC-service pattern
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog
+  labels:
+    {{- include "shopmicro.labels" . | nindent 4 }}
+    app.kubernetes.io/name: catalog
+spec:
+  replicas: {{ .Values.services.catalog.replicas }}
+  selector:
+    matchLabels:
+      {{- include "shopmicro.selectorLabels" (dict "name" "catalog") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "shopmicro.selectorLabels" (dict "name" "catalog") | nindent 8 }}
+    spec:
+      containers:
+        - name: catalog
+          image: "{{ .Values.image.repository }}/catalog:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.services.catalog.grpcPort }}
+          env:
+            # Bind address: catalog LISTENS on this port.
+            - name: CATALOG_GRPC_ADDR
+              value: ":{{ .Values.services.catalog.grpcPort }}"
+            - name: CATALOG_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: shopmicro-db
+                  key: CATALOG_DB_URL
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.services.catalog.grpcPort }}
+            initialDelaySeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.services.catalog.grpcPort }}
+            initialDelaySeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog
+  labels:
+    {{- include "shopmicro.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "shopmicro.selectorLabels" (dict "name" "catalog") | nindent 4 }}
+  ports:
+    - port: {{ .Values.services.catalog.grpcPort }}
+      targetPort: {{ .Values.services.catalog.grpcPort }}
+```
+
+Save this as `templates/catalog.yaml`. The `Service` named `catalog` on port `50051` is what makes `catalog:50051` resolvable from any other pod. `templates/order.yaml` follows the exact same shape with two differences: it binds `ORDER_GRPC_ADDR: ":50052"`, and it adds the env that makes Order a *client* of Catalog and Kafka:
+
+```yaml
+          env:
+            - name: ORDER_GRPC_ADDR
+              value: ":{{ .Values.services.order.grpcPort }}"
+            # Dial address: order CONNECTS to Catalog's Service by name.
+            - name: CATALOG_GRPC_ADDR
+              value: "catalog:{{ .Values.services.catalog.grpcPort }}"
+            - name: ORDER_DB_URL
+              valueFrom:
+                secretKeyRef: { name: shopmicro-db, key: ORDER_DB_URL }
+            - name: KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef: { name: shopmicro-config, key: KAFKA_BROKERS }
+```
+
+That's the same `CATALOG_GRPC_ADDR` name as the catalog pod, holding a *dial* value (`catalog:50051`) instead of a *bind* value (`:50051`) — the distinction the Why section flagged, made concrete.
+
+### 6. The consumer Deployments — `payment.yaml`, `notification.yaml`, `notification-worker.yaml`
+
+These follow the catalog Deployment pattern with **no Service and no ports** — nothing connects to them. They differ only in image and which env they pull:
+
+- `payment`: `KAFKA_BROKERS` from the ConfigMap. No DB, no probes on a port (a pure consumer has no readiness endpoint; omit the probes or add a tiny health port later).
+- `notification`: `KAFKA_BROKERS` and `RABBITMQ_URL` from the ConfigMap.
+- `notification-worker`: `RABBITMQ_URL` only, and `replicas: {{ .Values.services.notificationWorker.replicas }}` (defaulted to 2 — the competing-consumers scale-out [The Send Worker →](/shopmicro/en/notification-service/worker-deliver/) built is now just a replica count).
+
+### 7. `deploy/helm/shopmicro/templates/gateway.yaml`
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  labels:
+    {{- include "shopmicro.labels" . | nindent 4 }}
+    app.kubernetes.io/name: gateway
+spec:
+  replicas: {{ .Values.services.gateway.replicas }}
+  selector:
+    matchLabels:
+      {{- include "shopmicro.selectorLabels" (dict "name" "gateway") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "shopmicro.selectorLabels" (dict "name" "gateway") | nindent 8 }}
+    spec:
+      containers:
+        - name: gateway
+          image: "{{ .Values.image.repository }}/gateway:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.services.gateway.httpPort }}
+          env:
+            - name: GATEWAY_HTTP_ADDR
+              value: ":{{ .Values.services.gateway.httpPort }}"
+            - name: CATALOG_GRPC_ADDR
+              value: "catalog:{{ .Values.services.catalog.grpcPort }}"
+            - name: ORDER_GRPC_ADDR
+              value: "order:{{ .Values.services.order.grpcPort }}"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.services.gateway.httpPort }}
+            initialDelaySeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.services.gateway.httpPort }}
+            initialDelaySeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  labels:
+    {{- include "shopmicro.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.services.gateway.service.type }}
+  selector:
+    {{- include "shopmicro.selectorLabels" (dict "name" "gateway") | nindent 4 }}
+  ports:
+    - port: {{ .Values.services.gateway.httpPort }}
+      targetPort: {{ .Values.services.gateway.httpPort }}
+{{- if .Values.services.gateway.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gateway
+  labels:
+    {{- include "shopmicro.labels" . | nindent 4 }}
+spec:
+  rules:
+    - host: {{ .Values.services.gateway.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: {{ .Values.services.gateway.httpPort }}
+{{- end }}
+```
+
+Save this as `templates/gateway.yaml`. The gateway dials `catalog:50051` and `order:50052` — the two Service names — and its own `/healthz` drives real HTTP probes. The `Ingress` is guarded by `{{- if .Values.services.gateway.ingress.enabled }}`, off by default: on a laptop you'll `port-forward` next lesson; on a real cluster you flip it on.
+
+## Verify
+
+You don't need a running cluster to check the chart is well-formed. First, lint it:
+
+```bash
+helm lint deploy/helm/shopmicro
+```
+
+```txt
+==> Linting deploy/helm/shopmicro
+1 chart(s) linted, 0 chart(s) failed
+```
+
+Then render the templates locally with the default values and read the YAML Kubernetes would actually receive — no cluster involved:
+
+```bash
+helm template shopmicro deploy/helm/shopmicro | grep -A2 "CATALOG_GRPC_ADDR"
+```
+
+You should see the same variable rendered two different ways, proving the bind-vs-dial split:
+
+```txt
+            - name: CATALOG_GRPC_ADDR
+              value: ":50051"          # in the catalog Deployment (bind)
+--
+            - name: CATALOG_GRPC_ADDR
+              value: "catalog:50051"   # in the order Deployment (dial)
+--
+            - name: CATALOG_GRPC_ADDR
+              value: "catalog:50051"   # in the gateway Deployment (dial)
+```
+
+Confirm the consumers have no Service by counting them — five Services would be wrong, three is right (`catalog`, `order`, `gateway`):
+
+```bash
+helm template shopmicro deploy/helm/shopmicro | grep -c "^kind: Service"
+```
+
+```txt
+3
+```
+
+Override a value without editing a file, to see templating do its job — bump the worker replicas:
+
+```bash
+helm template shopmicro deploy/helm/shopmicro \
+  --set services.notificationWorker.replicas=5 \
+  | grep -B4 "name: notification-worker" | grep replicas
+```
+
+```txt
+  replicas: 5
+```
+
+Check your understanding:
+
+- `CATALOG_GRPC_ADDR` is `:50051` in one Deployment and `catalog:50051` in two others. Why is that correct rather than a bug, and why did local development never expose the difference?
+- Why do `payment`, `notification`, and `notification-worker` get no `Service` while `catalog`, `order`, and `gateway` do?
+- The database URLs live in a `Secret` and the broker addresses in a `ConfigMap`. What would go wrong if the DB URLs were in the ConfigMap instead?
+- Scaling `notification-worker` to 5 replicas is a one-line values change. Why is that safe for this specific service, and what did [The Send Worker →](/shopmicro/en/notification-service/worker-deliver/) build that makes it safe?
+
+## Recap
+
+`deploy/helm/shopmicro/` packages all six ShopMicro binaries as a single Helm chart: `catalog`, `order`, and `payment` Deployments, `notification` and `notification-worker` as no-Service consumers, and a `gateway` Deployment with a `Service` (and optional `Ingress`) on `8080` — all parameterized through `values.yaml` for image tag, replicas, and the externally-managed infra endpoints. `_helpers.tpl` centralizes labels and assembles the Postgres URLs; a `ConfigMap` carries the non-secret `KAFKA_BROKERS`/`RABBITMQ_URL` and a `Secret` carries the DB URLs. The one idea that makes gRPC-in-Kubernetes click is that `CATALOG_GRPC_ADDR` is a *bind* address (`:50051`) in the catalog pod and a *dial* address (`catalog:50051`) in the order and gateway pods — the same variable, set per-Deployment, because a cluster splits the listen/connect roles that `localhost` collapsed. `helm lint` and `helm template` proved the chart renders valid manifests, with the bind-vs-dial split and the three-Services count both visible in the output, before any cluster touched it. Next, [Deploying to the cluster →](/shopmicro/en/kubernetes/deploy-cluster/) installs this chart into a real Kubernetes cluster, runs the migrations as a pre-install Job, and drives the same `curl` order flow — `PENDING → CONFIRMED` — against pods instead of `go run`.

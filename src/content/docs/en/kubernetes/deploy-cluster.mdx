@@ -1,0 +1,223 @@
+---
+title: Deploying to the cluster
+description: "Install the Helm chart into a local kind cluster: load the shopmicro images, run database migrations as a Helm pre-install hook Job, helm install, wait for pods to become Ready on their probes, port-forward the gateway, and drive the same curl order flow (PENDING to CONFIRMED) against pods instead of go run. Then a rolling helm upgrade and helm uninstall."
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+No new application code — this lesson takes the chart [The Helm chart →](/shopmicro/en/kubernetes/helm-chart/) built and actually runs it. On a local `kind` cluster: load the `shopmicro/*` images Module 13 built [Service images →](/shopmicro/en/docker/service-images/), add one new template — a migration `Job` that runs as a Helm **pre-install/pre-upgrade hook** so schemas exist before any service starts — `helm install`, wait for every pod to pass its probes, `port-forward` the gateway, and run the exact same `curl` flow the whole course has used: create a product, place an order, poll it to `CONFIRMED`. The difference is that this time the saga runs across pods scheduled by Kubernetes, self-healing and rolling-upgradeable, instead of six `go run` terminals.
+
+## Why
+
+Everything the chart declares is inert until something reconciles it against a real cluster — that's what `helm install` triggers and what this lesson exercises end to end. Three things only become real here, and each is worth watching happen:
+
+- **Migrations must run before the services that need the tables.** `catalog` and `order` open a Postgres pool and expect their schema to exist; a service that starts against an empty database crashes. In local dev [Infra & Compose →](/shopmicro/en/setup/infra-compose/) you ran `migrate ... up` by hand first. In a cluster there's no "by hand" — so the chart carries a `Job` annotated as a Helm `pre-install,pre-upgrade` hook, which Helm runs *and waits for* before it applies the Deployments. Order-of-operations that was implicit at a shell prompt becomes an explicit, declared dependency.
+- **Probes gate readiness, and readiness gates traffic.** The `Service` in front of the gateway only sends requests to pods that pass their `readinessProbe`; a pod still starting, or one whose `/healthz` is failing, is kept out of rotation automatically. This is the cluster enforcing, at the platform level, the same "don't route to something that isn't ready" discipline the resilience layer [Circuit breakers →](/shopmicro/en/resilience/circuit-breaker/) enforced at the client level — two layers of the same idea.
+- **A new version rolls out without downtime.** `helm upgrade` with a changed image tag or replica count triggers a rolling update: Kubernetes brings up new pods, waits for them to pass readiness, then tears down old ones — so the gateway `Service` always has ready pods behind it. The graceful shutdown every `main` implements on `SIGTERM` [grpc-gateway →](/shopmicro/en/gateway/grpc-gateway/) is exactly what makes the teardown half of that clean: Kubernetes sends `SIGTERM`, the process finishes in-flight work and exits, no request is cut off mid-flight.
+
+`kind` (Kubernetes-in-Docker) is the cluster here because it runs entirely in the Docker you already have, needs no cloud account, and — crucially — lets you load a locally-built image straight into the cluster with `kind load`, so you never have to push to a registry just to try the chart. On a real cluster you'd push `shopmicro/*` to a registry and set `image.repository` accordingly; nothing else about the chart changes.
+
+## Pros & cons
+
+**`kind load docker-image` (a local cluster reading local images)** vs. **pushing images to a registry**
+
+- **Pros:** zero registry setup and no network round trip — you build an image and it's usable in-cluster seconds later, which makes the edit-build-deploy loop fast enough to actually iterate on the chart; perfect for local development and CI test clusters.
+- **Cons:** it only works because `kind`'s nodes *are* local Docker — a real multi-node cluster's kubelets can't read your laptop's image cache, so any non-local deployment genuinely needs a registry and an `imagePullPolicy`/`imagePullSecrets` story `kind` lets you skip. The convenience is real but strictly local.
+
+**Migrations as a Helm pre-install hook Job** vs. **an initContainer on each service, or migrating by hand**
+
+- **Pros:** the hook runs exactly once per release, before any service pod starts, and Helm blocks on its success — so there's a single, ordered, declared place the schema is guaranteed current, and a failed migration fails the whole `helm install` loudly instead of leaving half-started services crash-looping.
+- **Cons:** a hook Job is one more object with its own image and failure modes, and it runs on *every* upgrade even when nothing changed (migrations must therefore be idempotent — which `migrate ... up` already is); an `initContainer` per service co-locates the migration with the thing that needs it but then runs the same migration N times racing across replicas, which is worse, and "by hand" doesn't survive contact with more than one environment. The hook is the least-bad of the three for a chart meant to be installed repeatably.
+
+## Set it up
+
+### 1. `deploy/helm/shopmicro/templates/migrate-job.yaml`
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: shopmicro-migrate
+  labels:
+    {{- include "shopmicro.labels" . | nindent 4 }}
+  annotations:
+    # Run before the Deployments on every install and upgrade, and wait for
+    # success before proceeding. delete-policy cleans up the old Job first.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "shopmicro.selectorLabels" (dict "name" "migrate") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          # shopmicro/migrate bundles the migrate CLI with the migrations/
+          # tree — built in the next section. A cluster can't bind-mount the
+          # host's migrations the way the Compose stack does, so they're baked
+          # into an image instead.
+          image: "{{ .Values.image.repository }}/migrate:{{ .Values.image.tag }}"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              migrate -path /migrations/catalog -database "$CATALOG_DB_URL" up && \
+              migrate -path /migrations/order   -database "$ORDER_DB_URL"   up
+          env:
+            - name: CATALOG_DB_URL
+              valueFrom:
+                secretKeyRef: { name: shopmicro-db, key: CATALOG_DB_URL }
+            - name: ORDER_DB_URL
+              valueFrom:
+                secretKeyRef: { name: shopmicro-db, key: ORDER_DB_URL }
+```
+
+Save this as `templates/migrate-job.yaml`. The `hook-weight: "-5"` orders it ahead of any other hooks; `pre-install,pre-upgrade` makes Helm run it and block on its completion before applying the Deployments, so `catalog` and `order` never start against an unmigrated database.
+
+### 2. Create a cluster and load the images
+
+```bash
+kind create cluster --name shopmicro
+```
+
+The six service images came from [Service images →](/shopmicro/en/docker/service-images/) in Module 13. The chart needs one more that the service images deliberately don't bundle — a migrations image pairing the `migrate` CLI with the SQL tree. Build it now, using `migrations/` as the build context so the root `.dockerignore` (which excludes `migrations` from the service builds) doesn't apply:
+
+```bash
+docker build -t shopmicro/migrate:latest -f - migrations <<'EOF'
+FROM migrate/migrate:v4.17.1
+COPY . /migrations
+EOF
+```
+
+Then load every image the chart references into the cluster's nodes, so `imagePullPolicy: IfNotPresent` finds them locally with no registry:
+
+```bash
+for svc in catalog order payment notification notification-worker gateway migrate; do
+  kind load docker-image shopmicro/$svc:latest --name shopmicro
+done
+```
+
+### 3. Provide the infrastructure
+
+The chart expects Postgres, Kafka, and RabbitMQ reachable at the names in `values.yaml` [The Helm chart →](/shopmicro/en/kubernetes/helm-chart/). For a local cluster, the quickest path is the Bitnami charts:
+
+```bash
+helm install postgres oci://registry-1.docker.io/bitnamicharts/postgresql \
+  --set auth.username=shopmicro,auth.password=shopmicro,auth.database=shopmicro \
+  --set fullnameOverride=postgres
+helm install kafka oci://registry-1.docker.io/bitnamicharts/kafka \
+  --set fullnameOverride=kafka --set listeners.client.protocol=PLAINTEXT
+helm install rabbitmq oci://registry-1.docker.io/bitnamicharts/rabbitmq \
+  --set auth.username=shopmicro,auth.password=shopmicro --set fullnameOverride=rabbitmq
+```
+
+(Catalog and Order share one Postgres instance with two databases, `catalog` and `orders` — create the second database once Postgres is up, or point `infra.postgres` at two hosts if you prefer them separate.)
+
+## Verify
+
+Install the chart. Helm runs the migration Job first, waits for it, then applies everything else:
+
+```bash
+helm install shopmicro deploy/helm/shopmicro
+```
+
+Watch the pods come up and pass their probes — `READY 1/1` means the `readinessProbe` is green:
+
+```bash
+kubectl get pods
+```
+
+```txt
+NAME                                   READY   STATUS      RESTARTS   AGE
+shopmicro-migrate-abcde                0/1     Completed   0          40s
+catalog-6f9c8b7d5-2xk4p                1/1     Running     0          35s
+order-7d4b9c6f8-9wq2n                  1/1     Running     0          35s
+payment-5c8d7b4f9-lm6rt                1/1     Running     0          35s
+notification-6b7d9f8c5-pk3wq           1/1     Running     0          35s
+notification-worker-8f9c7b6d4-aa11b    1/1     Running     0          35s
+notification-worker-8f9c7b6d4-bb22c    1/1     Running     0          35s
+gateway-7f8d9c6b5-zz99x                1/1     Running     0          35s
+gateway-7f8d9c6b5-yy88w                1/1     Running     0          35s
+```
+
+The migration Job shows `Completed` (it ran once and exited); two `notification-worker` and two `gateway` pods are the `replicas` from `values.yaml`. Port-forward the gateway `Service` to your laptop:
+
+```bash
+kubectl port-forward svc/gateway 8080:8080
+```
+
+Now run the exact same flow the course has used since [REST Mapping →](/shopmicro/en/gateway/rest-mapping/) — create a product, place an order, poll it — except every hop is now a pod:
+
+```bash
+curl -s -X POST localhost:8080/v1/products \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Coffee Mug","description":"350ml ceramic mug","price_cents":1299,"stock":50}'
+```
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
+```
+
+Poll the order a few seconds later — long enough for the outbox relay → Kafka → Payment → Kafka → saga loop [The Saga Handler →](/shopmicro/en/saga/orchestration/) to run across pods:
+
+```bash
+curl -s localhost:8080/v1/orders/3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90
+```
+
+```json
+{
+  "id": "3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90",
+  "status": "ORDER_STATUS_CONFIRMED",
+  "totalCents": "2598"
+}
+```
+
+`PENDING → CONFIRMED`, running entirely in-cluster — the whole system, every service and both brokers, deployed by one `helm install`. Now prove a rolling upgrade. Change a value and upgrade:
+
+```bash
+helm upgrade shopmicro deploy/helm/shopmicro --set services.gateway.replicas=3
+```
+
+```bash
+kubectl rollout status deployment/gateway
+```
+
+```txt
+deployment "gateway" successfully rolled out
+```
+
+Kubernetes brought up the third gateway pod, waited for its `/healthz` readiness, and the `Service` now balances across three — no request dropped, because old pods only left rotation after new ones were ready. Finally, tear it all down:
+
+```bash
+helm uninstall shopmicro
+```
+
+```txt
+release "shopmicro" uninstalled
+```
+
+Then confirm the chart still lints clean after the new Job template:
+
+```bash
+helm lint deploy/helm/shopmicro
+```
+
+No failures means success.
+
+Check your understanding:
+
+- The migration `Job` is a `pre-install,pre-upgrade` hook. What breaks if it were an ordinary template (no hook annotation) that Helm applied at the same time as the Deployments?
+- `kubectl get pods` showed `gateway` as `READY 1/1` only after a few seconds. What is the `Service` doing with the gateway pod during those seconds before it's ready, and why?
+- A `helm upgrade` that changes the image tag rolls out with no downtime. Which piece of each service's `main` makes the *teardown* half of that rollout clean, and what signal triggers it?
+- `kind load docker-image` let you skip a registry entirely. Why does that work for `kind` but not for a real multi-node cluster?
+
+## Recap
+
+`helm install shopmicro deploy/helm/shopmicro` stands up the entire system on a `kind` cluster: a `pre-install` hook `Job` runs `migrate ... up` for both databases and Helm blocks on it, so `catalog` and `order` never start against an empty schema; then every Deployment rolls out, and each pod joins its `Service` only once its `readinessProbe` (`/healthz` for the gateway, a `tcpSocket` for the gRPC services) passes. Images reach the cluster with `kind load docker-image` — no registry — and the same `curl` flow the course has used throughout drove an order from `PENDING` to `CONFIRMED` entirely across pods, the outbox-relay → Kafka → Payment → saga loop running exactly as it did locally. `helm upgrade --set services.gateway.replicas=3` proved a zero-downtime rolling update, with graceful `SIGTERM` shutdown making the teardown clean, and `helm uninstall` removed the release. ShopMicro now runs the same way in a cluster as it did on your laptop, described once as a versioned chart. Next, [Wrap-up →](/shopmicro/en/wrap-up/) steps back over everything you built — the services, the two brokers, the saga and outbox, the resilience layer, and this deployment — the trade-offs behind each, and where to take the system from here.
