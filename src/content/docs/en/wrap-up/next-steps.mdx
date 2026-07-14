@@ -1,0 +1,42 @@
+---
+title: Where to go next
+description: "A concrete roadmap for extending ShopMicro — auth, observability, a real payment gateway, exactly-once, orchestration, autoscaling, and more — each mapped to where it plugs into what you already built."
+sidebar:
+  order: 2
+---
+
+## From simplifications to a roadmap
+
+Every simplification [Recap →](/shopmicro/en/wrap-up/recap/) named is a door to walk through next. Each of these extends the system you already have without rewriting it — the boundaries you built are the seams you extend along.
+
+## Harden the edges
+
+- **Authentication & authorization at the gateway.** Put identity in front of everything: validate a JWT (or an OIDC access token) in a gateway middleware, reject unauthenticated requests before they reach a gRPC call, and forward the verified identity as gRPC metadata. This teaches where a cross-cutting concern belongs in a system with one front door — at [the gateway →](/shopmicro/en/gateway/grpc-gateway/), not duplicated in every service — and how to propagate identity across a trust boundary.
+
+- **Observability across every hop.** The one thing this system makes hard is *seeing* a request that spans five services and two brokers. Add OpenTelemetry tracing that propagates a trace context through the gRPC calls *and* across the Kafka/RabbitMQ envelopes (carry the trace id on `events.Event`), so a single order's whole journey — [gateway → Order → outbox → Kafka → Payment → saga & Notification → worker](/shopmicro/en/introduction/architecture/) — is one connected trace. Layer on Prometheus metrics (consumer lag, retry counts, breaker state from [Resilience →](/shopmicro/en/resilience/circuit-breaker/)) and structured logging with the trace id, and the black box becomes legible.
+
+## Make the money real
+
+- **A real payment gateway with persisted idempotency.** This is the callout [Process & Publish →](/shopmicro/en/payment-service/process-publish/) made explicit. Replace the `TotalCents` rule with an actual card-network call, fronted by a `payments` table with a unique constraint on `order_id` (or an explicit idempotency key sent to the provider), checked *before* charging — so a redelivered `order.created` finds the existing row and returns the stored result instead of charging twice. This is the difference between "idempotent because it's pure" and "idempotent because it remembers."
+
+- **Tighten delivery guarantees.** Both broker hops are at-least-once today. Explore the transactional-outbox refinements that get you closer to effectively-once processing, and give the Notification worker a real retry-with-delay path (the TTL+DLX cycling or retry-count header [Acks, Retry & Dead Letters →](/shopmicro/en/rabbitmq/acks-retry-dlq/) described but didn't build), so a transient provider outage retries automatically instead of dead-lettering on the first failure.
+
+## Grow the coordination
+
+- **Distributed compensation and an orchestration saga.** The [choreography saga →](/shopmicro/en/saga/orchestration/) you built shines for a two-hop loop, but its weakness — the sequence isn't written down anywhere — grows with each step. Add a step that can fail *after* an earlier one succeeded (reserve inventory, then charge, then ship) and you'll feel the pull toward an orchestrator: a service holding an explicit state machine per saga, issuing commands and running compensations when a later step fails. Building it is the best way to understand the trade-off this course only described.
+
+- **Event and contract versioning.** As the system evolves, `events.Event` payloads and the `.proto` contracts [The Contracts →](/shopmicro/en/proto-grpc/contracts/) will need to change without breaking existing consumers. Practice additive schema evolution, a schema registry for the Kafka events, and how a consumer tolerates a field it doesn't recognize.
+
+## Scale and ship it
+
+- **Autoscaling the workers.** The Notification worker is a competing-consumers design [The Send Worker →](/shopmicro/en/notification-service/worker-deliver/) precisely so you can run more of them. Wire a Kubernetes HPA — on CPU, or better, on RabbitMQ queue depth — so the worker fleet grows under a backlog and shrinks when it clears, and watch the work redistribute automatically.
+
+- **CI/CD.** Automate the loop this course ran by hand: test [Testing →](/shopmicro/en/testing/), build the images [Docker & Compose →](/shopmicro/en/docker/), and roll the Helm release [Kubernetes →](/shopmicro/en/kubernetes/) on every merge, with the tests as the gate.
+
+- **A real notification provider.** Swap the worker's log line for an email/SMS integration, and build the recipient resolution [Consuming events →](/shopmicro/en/notification-service/consume-events/) left as a stub — a lookup from `order_id` to a customer's contact details, or a `customer_id` carried on the event from the start.
+
+## Closing
+
+You started at an [architecture diagram](/shopmicro/en/introduction/architecture/) and a set of deliberate trade-offs, and you built every box in it — then hardened, tested, containerized, and deployed the whole thing. The system that felt like a lot of moving parts at the start is now one you can reason about hop by hop, extend along its own seams, and defend decision by decision. The full source lives at [github.com/avetavos/realworld-shopmicro](https://github.com/avetavos/realworld-shopmicro) — fork it, break it, and build the next box yourself.
+
+That's the course. Go build something real.

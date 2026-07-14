@@ -1,0 +1,42 @@
+---
+title: Where to go next
+description: "roadmap ที่เป็นรูปธรรมสำหรับต่อยอด ShopMicro — auth, observability, payment gateway จริง, exactly-once, orchestration, autoscaling และอื่น ๆ — แต่ละอันจับคู่กับจุดที่มันเสียบเข้ากับสิ่งที่คุณสร้างไว้แล้ว"
+sidebar:
+  order: 2
+---
+
+## From simplifications to a roadmap
+
+ทุกการทำให้ง่ายที่ [Recap →](/shopmicro/th/wrap-up/recap/) พูดถึงคือประตูให้เดินผ่านต่อ แต่ละอันต่อยอดระบบที่คุณมีอยู่แล้วโดยไม่ต้องเขียนใหม่ — ขอบเขตที่คุณสร้างไว้คือรอยต่อที่คุณต่อยอดไปตามนั้น
+
+## Harden the edges
+
+- **Authentication & authorization ที่ gateway** วาง identity ไว้ข้างหน้าทุกอย่าง: validate JWT (หรือ OIDC access token) ใน gateway middleware, ปฏิเสธ request ที่ไม่ authenticate ก่อนถึง gRPC call, แล้วส่ง identity ที่ verify แล้วต่อเป็น gRPC metadata สิ่งนี้สอนว่า cross-cutting concern ควรอยู่ตรงไหนในระบบที่มีประตูเดียว — ที่ [gateway →](/shopmicro/th/gateway/grpc-gateway/) ไม่ใช่ทำซ้ำในทุกเซอร์วิส — และวิธี propagate identity ข้าม trust boundary
+
+- **Observability ข้ามทุก hop** สิ่งเดียวที่ระบบนี้ทำให้ยากคือการ *เห็น* request ที่ข้ามห้าเซอร์วิสและสอง broker เพิ่ม OpenTelemetry tracing ที่ propagate trace context ผ่าน gRPC call *และ* ข้าม envelope ของ Kafka/RabbitMQ (พก trace id ไว้บน `events.Event`) เพื่อให้การเดินทางทั้งหมดของคำสั่งซื้อเดียว — [gateway → Order → outbox → Kafka → Payment → saga & Notification → worker](/shopmicro/th/introduction/architecture/) — เป็น trace เดียวที่ต่อกัน เพิ่ม Prometheus metrics (consumer lag, จำนวน retry, state ของ breaker จาก [Resilience →](/shopmicro/th/resilience/circuit-breaker/)) และ structured logging พร้อม trace id แล้ว black box ก็อ่านออก
+
+## Make the money real
+
+- **Payment gateway จริงพร้อม persisted idempotency** นี่คือ callout ที่ [Process & Publish →](/shopmicro/th/payment-service/process-publish/) พูดชัด แทนที่กฎ `TotalCents` ด้วย card-network call จริง front ด้วย `payments` table ที่มี unique constraint บน `order_id` (หรือ idempotency key ที่ส่งให้ provider ชัด ๆ) เช็ค *ก่อน* charge — ดังนั้น `order.created` ที่ redeliver เจอ row เดิมแล้ว return ผลที่เก็บไว้แทนที่จะ charge สองครั้ง นี่คือความต่างระหว่าง "idempotent เพราะมัน pure" กับ "idempotent เพราะมันจำได้"
+
+- **กระชับการรับประกันการส่ง** ทั้งสอง broker hop เป็น at-least-once ตอนนี้ ลองสำรวจ transactional-outbox refinement ที่พาคุณเข้าใกล้ effectively-once processing และให้ Notification worker มี retry-with-delay path จริง (TTL+DLX cycling หรือ retry-count header ที่ [Acks, Retry & Dead Letters →](/shopmicro/th/rabbitmq/acks-retry-dlq/) อธิบายไว้แต่ยังไม่สร้าง) เพื่อให้ provider outage แบบ transient retry อัตโนมัติแทนที่จะ dead-letter ตั้งแต่ครั้งแรก
+
+## Grow the coordination
+
+- **Distributed compensation และ orchestration saga** [choreography saga →](/shopmicro/th/saga/orchestration/) ที่คุณสร้างโดดเด่นสำหรับ loop สอง hop แต่จุดอ่อนของมัน — ลำดับไม่ได้เขียนไว้ที่ไหน — โตขึ้นทุกขั้น เพิ่มขั้นที่ล้มเหลวได้ *หลัง* ขั้นก่อนหน้าสำเร็จแล้ว (จองสินค้า แล้ว charge แล้ว ship) คุณจะรู้สึกถึงแรงดึงไปหา orchestrator: เซอร์วิสที่ถือ state machine ชัดเจนต่อ saga สั่ง command และรัน compensation เมื่อขั้นทีหลังล้มเหลว การสร้างมันคือวิธีที่ดีที่สุดในการเข้าใจ trade-off ที่คอร์สนี้แค่อธิบาย
+
+- **Event และ contract versioning** เมื่อระบบวิวัฒน์ payload ของ `events.Event` และ `.proto` contract [The Contracts →](/shopmicro/th/proto-grpc/contracts/) จะต้องเปลี่ยนโดยไม่ break consumer เดิม ฝึก schema evolution แบบ additive, schema registry สำหรับ Kafka event, และวิธีที่ consumer ทน field ที่มันไม่รู้จัก
+
+## Scale and ship it
+
+- **Autoscaling worker** Notification worker เป็นการออกแบบ competing-consumers ที่ [The Send Worker →](/shopmicro/th/notification-service/worker-deliver/) ตั้งใจให้คุณรันหลายตัวได้ ต่อสาย Kubernetes HPA — บน CPU หรือดีกว่านั้นบน RabbitMQ queue depth — เพื่อให้ worker fleet โตตอนมี backlog และหดตอนเคลียร์ แล้วดู work กระจายตัวใหม่อัตโนมัติ
+
+- **CI/CD** ทำ loop ที่คอร์สนี้รันด้วยมือให้อัตโนมัติ: test [Testing →](/shopmicro/th/testing/), build image [Docker & Compose →](/shopmicro/th/docker/), และ roll Helm release [Kubernetes →](/shopmicro/th/kubernetes/) ทุกครั้งที่ merge โดยมี test เป็น gate
+
+- **Notification provider จริง** เปลี่ยน log บรรทัดเดียวของ worker เป็นการต่อ email/SMS และสร้าง recipient resolution ที่ [Consuming events →](/shopmicro/th/notification-service/consume-events/) ละไว้เป็น stub — lookup จาก `order_id` ไปยังข้อมูลติดต่อของลูกค้า หรือ `customer_id` ที่พกมากับ event ตั้งแต่ต้น
+
+## Closing
+
+คุณเริ่มที่ [architecture diagram](/shopmicro/th/introduction/architecture/) และชุด trade-off ที่ตั้งใจ แล้วสร้างทุกกล่องในนั้น — จากนั้น harden, test, containerize, และ deploy ทั้งหมด ระบบที่ตอนแรกรู้สึกว่ามีชิ้นส่วนขยับเยอะ ตอนนี้เป็นระบบที่คุณ reason ได้ทีละ hop, ต่อยอดไปตามรอยต่อของมันเอง, และ defend ได้ทีละการตัดสินใจ source เต็มอยู่ที่ [github.com/avetavos/realworld-shopmicro](https://github.com/avetavos/realworld-shopmicro) — fork มัน ทำมันพัง แล้วสร้างกล่องถัดไปด้วยตัวเอง
+
+นั่นคือคอร์สนี้ ไปสร้างอะไรที่จริงกันเถอะ
