@@ -1,0 +1,255 @@
+---
+title: Integration tests
+description: "services/order/internal/repo/repo_integration_test.go — behind a //go:build integration tag, spin a real PostgreSQL with testcontainers-go, apply the migrations with golang-migrate, and test OrderRepo.Create/Get/ApplyPaymentResult against genuine SQL and transactions: the outbox row committed atomically, the processed_events dedupe, and the terminal-state guard. Why a fake can't prove any of this, and how build tags keep slow tests out of the fast loop. Verified with go test -tags=integration and Docker running."
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+`services/order/internal/repo/repo_integration_test.go` — a test that does the one thing [Table tests →](/shopmicro/en/testing/unit-table-tests/)'s fakes deliberately couldn't: run `repo.OrderRepo` [The Order Repository →](/shopmicro/en/order-service/order-repo/) against a **real PostgreSQL**. It uses `testcontainers-go` to start an ephemeral Postgres container, `golang-migrate` to apply the same `migrations/order/` files the services use, and then exercises the three methods whose correctness lives entirely in their SQL and transactions: `Create` (order, items, and the `order.created` outbox row committed in one transaction), and `ApplyPaymentResult` (the `processed_events` dedupe and the `for update` terminal-state guard [The Saga Handler →](/shopmicro/en/saga/orchestration/) built). The whole file sits behind a `//go:build integration` tag so it never runs in the fast unit loop.
+
+There's no new production code — this lesson tests what's already there. The point is the *kind* of test: one that needs a genuine database because the behavior under test is the database's behavior.
+
+## Why
+
+A unit test with a fake can prove `Create` calls `Publish` with the right bytes; it can never prove that the order row, its `order_items`, and the outbox row actually **commit together or not at all**. That atomicity is a property of a real `BEGIN … COMMIT` against a real Postgres — of the `pgx.Tx` and the `defer tx.Rollback(ctx)` discipline [The Order Repository →](/shopmicro/en/order-service/order-repo/) leans on — and the only honest way to test it is to run the real SQL and then look at the real rows. Same for `ApplyPaymentResult`: its idempotency comes from `insert into processed_events … on conflict do nothing` returning zero rows affected on a duplicate, and its safety comes from `select … for update` locking the order row — both are PostgreSQL semantics, not Go logic, so a mock of the database would be testing the mock, not the guarantee. Integration tests exist for exactly the code whose correctness *is* the interaction with the real dependency.
+
+`testcontainers-go` is what makes that cheap enough to do routinely. It starts a throwaway Postgres in Docker at the start of the test, hands back a connection string, and tears it down at the end — every run gets a pristine database with no shared state, no leftover rows from a previous run, and nothing to clean up by hand. That beats pointing tests at a long-lived shared database (whose state one test can corrupt for the next) and it beats a hand-maintained local Postgres (which every contributor and CI runner would have to provision identically). The container *is* the fixture, created and destroyed per test run.
+
+The cost is real, though: starting a container takes seconds, and it needs a Docker daemon. That's why the file carries `//go:build integration`. A build tag makes the file invisible to a plain `go test ./...` — the fast, no-Docker loop a developer runs on every save stays milliseconds-quick and covers all the pure logic from [Table tests →](/shopmicro/en/testing/unit-table-tests/) — and the slow, Docker-dependent tests run only when you opt in with `go test -tags=integration ./...`, typically in CI or before a merge. Separating the two by a tag (rather than `testing.Short()` and `-short`, the other common split) means the slow tests aren't even *compiled* into the fast binary, and the fast loop has zero chance of accidentally trying to reach Docker.
+
+## Pros & cons
+
+**Ephemeral Postgres per run via testcontainers** vs. **a shared/long-lived test database**
+
+- **Pros:** every run starts from an identical, empty schema, so tests can't leak state into each other and a failure is reproducible rather than "it passed on my machine because my DB happened to have that row"; there's nothing to provision — CI and every laptop get the same Postgres version straight from the image, matching production far more closely than SQLite-as-a-stand-in ever could.
+- **Cons:** it requires a Docker daemon and pays seconds of startup per run, so it's genuinely too slow for the tight edit-save-test loop (hence the build tag); and a suite that spins one container per test (rather than sharing one across a package) can multiply that cost — a real trade between isolation and speed you tune per suite.
+
+**A `//go:build integration` tag** vs. **`testing.Short()` with `go test -short`**
+
+- **Pros:** the tagged file isn't compiled at all unless you ask for it, so `go test ./...` can't accidentally invoke Docker even if someone forgets `-short`, and the fast build stays free of the testcontainers dependency graph; the intent is explicit at the file level — this whole file is integration-only, no per-test `if testing.Short() { t.Skip() }` boilerplate.
+- **Cons:** tagged files are easy to forget about — they're excluded from `go test ./...`, so a broken integration test can sit green-looking until someone runs the tagged build, which is why the tag has to be wired into CI deliberately; `testing.Short()` keeps everything in one always-compiled file, which some teams prefer for visibility even at the cost of always dragging the heavy dependencies into the build.
+
+## Set it up
+
+Pull in the test dependencies:
+
+```bash
+go get github.com/testcontainers/testcontainers-go
+go get github.com/testcontainers/testcontainers-go/modules/postgres
+go get github.com/golang-migrate/migrate/v4
+```
+
+### 1. `services/order/internal/repo/repo_integration_test.go`
+
+```go
+//go:build integration
+
+package repo_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/avetavos/shopmicro/pkg/pg"
+	"github.com/avetavos/shopmicro/services/order/internal/repo"
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/testcontainers/testcontainers-go"
+	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
+)
+
+// newTestRepo starts a throwaway Postgres, applies every migration in
+// migrations/order, and returns a repo backed by it. The container and pool
+// are torn down automatically when the test finishes.
+func newTestRepo(t *testing.T) *repo.OrderRepo {
+	t.Helper()
+	ctx := context.Background()
+
+	container, err := tcpostgres.Run(ctx, "postgres:16-alpine",
+		tcpostgres.WithDatabase("orders"),
+		tcpostgres.WithUsername("shopmicro"),
+		tcpostgres.WithPassword("shopmicro"),
+		testcontainers.WithWaitStrategy(
+			wait.ForListeningPort("5432/tcp").WithStartupTimeout(30*time.Second),
+		),
+	)
+	if err != nil {
+		t.Fatalf("start postgres container: %v", err)
+	}
+	testcontainers.CleanupContainer(t, container)
+
+	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("connection string: %v", err)
+	}
+
+	m, err := migrate.New("file://../../../../migrations/order", dsn)
+	if err != nil {
+		t.Fatalf("open migrations: %v", err)
+	}
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	pool, err := pg.NewPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	return repo.New(pool)
+}
+
+func TestIntegrationCreateAndGet(t *testing.T) {
+	ctx := context.Background()
+	r := newTestRepo(t)
+
+	created, err := r.Create(ctx, "cust-1", []repo.PricedItem{
+		{ProductID: "prod-1", Quantity: 2, UnitPriceCents: 1299},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if created.Status != "pending" {
+		t.Errorf("status = %q, want pending", created.Status)
+	}
+	if created.TotalCents != 2598 {
+		t.Errorf("total = %d, want 2598", created.TotalCents)
+	}
+
+	got, err := r.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(got.Items) != 1 || got.Items[0].ProductID != "prod-1" {
+		t.Errorf("items = %+v, want one prod-1", got.Items)
+	}
+
+	// Create wrote an order.created outbox row in the same transaction; it
+	// must be sitting in outbox, unpublished, right now.
+	var outboxCount int
+	if err := r.Pool().QueryRow(ctx,
+		`select count(*) from outbox where aggregate_id = $1 and event_type = 'order.created'`,
+		created.ID,
+	).Scan(&outboxCount); err != nil {
+		t.Fatalf("count outbox: %v", err)
+	}
+	if outboxCount != 1 {
+		t.Errorf("outbox rows = %d, want 1 (committed atomically with the order)", outboxCount)
+	}
+}
+
+func TestIntegrationApplyPaymentResultIdempotent(t *testing.T) {
+	ctx := context.Background()
+	r := newTestRepo(t)
+
+	order, err := r.Create(ctx, "cust-1", []repo.PricedItem{
+		{ProductID: "prod-1", Quantity: 1, UnitPriceCents: 5000},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// First application of a payment.succeeded moves pending -> confirmed.
+	if err := r.ApplyPaymentResult(ctx, order.ID, "evt-1", true); err != nil {
+		t.Fatalf("ApplyPaymentResult (first): %v", err)
+	}
+	if got, _ := r.Get(ctx, order.ID); got.Status != "confirmed" {
+		t.Fatalf("after first apply, status = %q, want confirmed", got.Status)
+	}
+
+	// Redelivering the SAME event id is a no-op: the processed_events
+	// dedupe swallows it and the status doesn't change.
+	if err := r.ApplyPaymentResult(ctx, order.ID, "evt-1", true); err != nil {
+		t.Fatalf("ApplyPaymentResult (duplicate): %v", err)
+	}
+
+	// A DIFFERENT event arriving after the order already left pending must
+	// not flip it: the for-update terminal-state guard leaves it confirmed.
+	if err := r.ApplyPaymentResult(ctx, order.ID, "evt-2", false); err != nil {
+		t.Fatalf("ApplyPaymentResult (late failure): %v", err)
+	}
+	got, _ := r.Get(ctx, order.ID)
+	if got.Status != "confirmed" {
+		t.Errorf("status = %q, want still confirmed (guards held)", got.Status)
+	}
+}
+```
+
+Save this as `services/order/internal/repo/repo_integration_test.go`. A few things to note:
+
+- **`//go:build integration` on the very first line**, with a blank line before `package` — that's what excludes the file from a plain `go test ./...`.
+- **`package repo_test`** (external test package), so it exercises `OrderRepo` exactly as a real caller does, through its exported API only.
+- **`testcontainers.CleanupContainer(t, container)`** registers the container's teardown with `t.Cleanup`, so it's removed even if the test fails — no orphaned Docker containers piling up across runs.
+- **The two `ApplyPaymentResult` assertions are the whole reason this is an integration test:** the duplicate-event no-op and the late-event guard are `on conflict do nothing` and `for update` behaving as real PostgreSQL, which no fake could stand in for.
+
+### 2. A small accessor for the outbox assertion
+
+The test above reads the `outbox` table directly to prove `Create`'s atomicity, which needs the pool. Add a tiny accessor to `services/order/internal/repo/orders.go` so the test can query without exporting the field:
+
+```go
+// Pool returns the underlying connection pool. It exists for integration
+// tests that need to assert on rows Create/ApplyPaymentResult wrote in
+// tables the repo's methods don't otherwise expose (e.g. outbox).
+func (r *OrderRepo) Pool() *pgxpool.Pool {
+	return r.db
+}
+```
+
+If you'd rather not widen the repo's surface for a test, drop the outbox assertion and the `Pool()` method — `Create` returning the right total and `Get` returning the items already prove the happy path; the outbox check is the extra mile that verifies the *atomic* write.
+
+## Verify
+
+Integration tests need Docker running. Start Docker Desktop (or your daemon), then run only the tagged tests:
+
+```bash
+go test -tags=integration -v ./services/order/internal/repo/
+```
+
+The first run pulls `postgres:16-alpine` if you don't have it, then:
+
+```txt
+=== RUN   TestIntegrationCreateAndGet
+--- PASS: TestIntegrationCreateAndGet (2.14s)
+=== RUN   TestIntegrationApplyPaymentResultIdempotent
+--- PASS: TestIntegrationApplyPaymentResultIdempotent (1.98s)
+PASS
+ok      github.com/avetavos/shopmicro/services/order/internal/repo      4.3s
+```
+
+Note the seconds-per-test — that's the container lifecycle, and exactly why these are tag-gated. Now confirm the fast loop is *unaffected*: without the tag, the integration file isn't even compiled, so this runs in milliseconds and needs no Docker:
+
+```bash
+go test ./...
+```
+
+```txt
+ok      github.com/avetavos/shopmicro/pkg/resilience              0.2s
+ok      github.com/avetavos/shopmicro/services/payment/internal/processor  0.1s
+...
+```
+
+Finally, confirm the whole project — including the tagged build — compiles:
+
+```bash
+go build ./...
+go vet -tags=integration ./...
+```
+
+No failures means success.
+
+Check your understanding:
+
+- `TestIntegrationApplyPaymentResultIdempotent` applies `evt-1` twice and then a different `evt-2`, asserting the order stays `confirmed`. Which specific SQL clause makes each of those two no-ops safe, and why couldn't a mocked database prove either one?
+- The integration file is invisible to `go test ./...`. What's the risk that creates, and what has to happen for these tests to actually protect the codebase?
+- Why does `newTestRepo` start a fresh container per test instead of sharing one across the package? What would you trade to share one, and when would that trade be worth it?
+- `Create`'s test reads the `outbox` table directly rather than trusting the returned `Order`. What does that extra assertion prove that inspecting the return value can't?
+
+## Recap
+
+`services/order/internal/repo/repo_integration_test.go` tests `OrderRepo` against a real PostgreSQL that `testcontainers-go` spins up per run and `golang-migrate` migrates with the project's own `migrations/order/` files — proving the things that *are* database behavior and so can't be faked: `Create` committing the order, its items, and the `order.created` outbox row atomically, and `ApplyPaymentResult`'s two guards (`on conflict do nothing` dedupe, `for update` terminal-state lock) making a duplicate event and a late event genuine no-ops. The whole file sits behind `//go:build integration`, so the fast, Docker-free `go test ./...` loop from [Table tests →](/shopmicro/en/testing/unit-table-tests/) stays milliseconds-quick and the slow, real-infrastructure tests run only on `go test -tags=integration ./...`. Together the two lessons cover both halves: pure decisions with fakes in milliseconds, and real SQL and transactions with an ephemeral database when correctness lives in the dependency itself. ShopMicro is now not just built but *verified*. Next, [Docker & Compose →](/shopmicro/en/docker/) packages every service into an image and brings the whole stack — services, databases, Kafka, and RabbitMQ — up with a single command, so the system you've tested can be run the same way anywhere.

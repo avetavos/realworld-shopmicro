@@ -1,0 +1,316 @@
+---
+title: Table tests
+description: "pkg/resilience/interceptor_test.go และ services/payment/internal/processor/processor_test.go — table-driven unit test พร้อม subtest ที่ทดสอบ pure logic ที่ไม่ต้อง I/O เลย: resilience helper อย่าง idempotent/retryable/jitteredBackoff และ decision ของ Payment ที่ทดสอบได้ด้วยการ refactor interface บรรทัดเดียวบวก fake publisher ทำไม pure function ถึงทดสอบง่ายมาก และทำไมคุณถึง depend บน interface ที่คุณเป็นเจ้าของสำหรับส่วนที่ไม่ pure ตรวจสอบด้วย go test -run เฉพาะ package เหล่านี้"
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+ไฟล์ `_test.go` สองไฟล์ กับการแก้ production code เล็ก ๆ หนึ่งจุดที่ทำให้ไฟล์ที่สองเป็นไปได้ `pkg/resilience/interceptor_test.go` เป็น white-box test (อยู่ใน `package resilience` เดียวกัน) ที่ table-test pure helper สามตัวที่ [Timeouts & retries →](/shopmicro/th/resilience/timeouts-retries/) สร้างไว้ — `idempotent`, `retryable`, และ `jitteredBackoff` — ซึ่งไม่มีตัวไหนแตะ network, clock หรือ database เลย จึงทดสอบได้ด้วยแค่ table ของ input กับ output ที่คาดหวัง `services/payment/internal/processor/processor_test.go` ทดสอบ decision ของ `Processor.Handle` จาก [Process & Publish →](/shopmicro/th/payment-service/process-publish/) — ว่าคำสั่งซื้อที่ราคาเท่ากับหรือต่ำกว่า $5,000 กลายเป็น `payment.succeeded` และตัวที่เกินกลายเป็น `payment.failed` พร้อม reason — ซึ่งตัวนี้ *มี* side effect (มัน publish ไป Kafka) ดังนั้นบทนี้จะทำให้ `Processor` depend บน `publisher` **interface** เล็ก ๆ ที่มันเป็นเจ้าของเองก่อน แทน `*kafka.Publisher` ที่เป็น concrete type แล้วส่ง fake เข้าไปใน test
+
+ทุก test ในนี้เป็น **table-driven**: slice ของ case หนึ่งอัน แต่ละ case เป็น struct ที่มี input และผลลัพธ์ที่คาดหวัง รันเป็น subtest ด้วย `t.Run` นี่คือรูปแบบ Go แบบ idiomatic สำหรับ "logic เดียวกัน หลาย input" และเป็น toolkit ทั้งหมดที่บทนี้ตั้งไว้ก่อนที่ [Integration tests →](/shopmicro/th/testing/integration-tests/) จะไปต่อกับส่วนที่ต้องใช้ infrastructure จริง ๆ
+
+## Why
+
+เหตุผลที่ `idempotent`, `retryable`, และ `jitteredBackoff` เป็นโค้ดที่ทดสอบง่ายที่สุดในทั้งคอร์สนี้คือมันเป็น **pure**: output ขึ้นกับ input อย่างเดียว ไม่มี I/O ไม่มี hidden state `retryable(status.Error(codes.Unavailable, ""))` เป็น `true` วันนี้ พรุ่งนี้ และบนทุกเครื่อง โดยไม่ต้องเปิด Postgres และไม่ต้องต่อ Kafka test ของ pure function ก็แค่ table — list ของคู่ `(input, want)` — และ test body คือ loop ที่เรียก function แล้วเทียบผล ไม่มีอะไรต้อง mock เพราะไม่มีอะไรภายนอกให้เข้าถึง นี่คือเหตุผลที่หนักแน่นที่สุดสำหรับการดัน logic เข้าไปเป็น pure function ทุกที่ที่ทำได้: ไม่ใช่เพื่อความสวยงามในตัวมันเอง แต่เพราะ pure logic ทดสอบได้โดยไม่มีพิธีรีตองอะไรเลย และทุกอย่างที่เหลือในไฟล์นี้คือการพยายามดึงกลับไปหา ideal นั้นสำหรับโค้ดที่ยังไม่ pure
+
+`Processor.Handle` คือโค้ดที่ยังไม่ pure ตัวนั้น decision ของมัน — branch `if oc.TotalCents > limitCents` — เป็น pure แต่มันถูกเชื่อมติดกับการเรียก `p.pub.Publish(...)` จริงไป Kafka และ unit test ต้องไม่ต้องใช้ broker วิธีแก้คือไอเดียที่สำคัญที่สุดของบทนี้: **depend บน interface ที่คุณเป็นเจ้าของ ไม่ใช่ concrete type จาก package อื่น** `Processor` ไม่ต้องการทั้งหมดของ `*kafka.Publisher` มันต้องการแค่ method เดียว คือ `Publish(ctx, topic, key, value)` การประกาศสิ่งนี้เป็น `publisher` interface ที่มี method เดียวใน package `processor` แล้วเก็บ *ตัวนั้น* ไว้ ไม่เปลี่ยนอะไรตอน runtime เลย — `*kafka.Publisher` ยังคง satisfy มันอยู่ ดังนั้น `main.go` ไม่ถูกแตะ — แต่มันทำให้ test ส่ง `fakePublisher` ที่บันทึกสิ่งที่ถูก publish แทนที่จะส่งไปไหนจริง ๆ ได้ ตอนนี้ test assert `events.Event` ที่ `Handle` สร้างได้แบบเป๊ะ ๆ: `Type`, `AggregateID`, `ID` ที่ derive มา (`e.ID + ":payment"`), และ `Result` payload ที่ unmarshal แล้ว ทั้งหมดโดยไม่มี network call แม้แต่ครั้งเดียว
+
+decision เล็ก ๆ อีกสองอันที่ควรพูดถึงชื่อ เพราะทั้งคู่เป็น Go-testing idiom ที่คอร์สนี้พึ่งพาตั้งแต่ตรงนี้ไป:
+
+- **Subtest ผ่าน `t.Run(name, ...)`** ไม่ใช่ test ก้อนใหญ่อันเดียวที่มี loop แล้วหยุดตอน failure แรก แต่ละ case ได้ชื่อของตัวเองใน output รายงานแยกกันเป็นอิสระ (case 3 fail ไม่บัง case 5) และคุณรันแค่อันเดียวได้ด้วย `go test -run TestHandle/over_limit`
+- **`t.Parallel()` ข้างใน subtest ของ pure function** เพราะ case เหล่านี้ไม่ share state กันเลย มันรัน concurrent ได้ และการ mark ไว้ทั้งเร่งความเร็ว suite และ document ว่า case เป็นอิสระจริง ๆ — คำกล่าวอ้างที่ปลอดภัยได้ *เพราะ* โค้ดที่ทดสอบเป็น pure
+
+## Pros & cons
+
+**Table-driven tests** เทียบกับ **หนึ่ง `Test…` function ต่อหนึ่ง case**
+
+- **Pros:** การเพิ่ม case คือ struct literal อันเดียว ไม่ใช่ function ใหม่ทั้งอัน กำแพงของการ cover edge case เพิ่มจึงแทบเป็นศูนย์ ทุก case วิ่งผ่าน assertion logic เดียวกันเป๊ะ จึงไม่มีความเสี่ยงที่ test เขียนมือตัวหนึ่งจะ assert ต่างจากเพื่อนบ้านนิด ๆ และตัว table เองอ่านเป็น specification แบบกระชับของพฤติกรรม function — row succeeded/failed/ignored ของ `Handle` test *คือ* contract ของมัน
+- **Cons:** table ที่ยืดยาวพร้อม conditional ต่อ case (`if tc.wantErr { ... } else { ... }`) อาจอ่านยากกว่า function แยกที่โฟกัสได้ และ assertion block ที่ share กันอันเดียวอาจบัง case ที่ต้องการ check แบบต่างจริง ๆ — พ้นความซับซ้อนระดับหนึ่งไป การแยก table ออกเป็น table เล็ก ๆ หลายอัน (หรือ function แยก) คือทางเลือกที่ชัดกว่า
+
+**`publisher` interface ที่ package `processor` เป็นเจ้าของ** เทียบกับ **การทดสอบกับ `*kafka.Publisher` ที่เป็น concrete**
+
+- **Pros:** test ไม่ต้องใช้ Kafka broker รันเสร็จในหลัก millisecond และเป็น deterministic — มัน assert bytes ที่ `Handle` *พยายาม* publish ซึ่งเป็นพฤติกรรมที่ทดสอบพอดี และ interface ถูกนิยามโดย consumer (`processor`) ที่ list เฉพาะ method เดียวที่มันใช้ ซึ่งเป็นทิศทาง Go แบบ idiomatic มันจึง minimal และ `main.go` ยังส่ง `*kafka.Publisher` ตัวจริงต่อไปโดยไม่เปลี่ยน
+- **Cons:** มันเพิ่ม interface ที่มีอยู่บางส่วนเพื่อ test — indirection เล็ก ๆ ที่คนอ่านต้องตามเพื่อดูว่าอะไรถูกเรียกจริง และ fake อาจ drift จากพฤติกรรมของ publisher จริง (`Publish` จริงอาจ fail, block หรือ reorder ตอน load สูง) — unit test ที่ใช้ fake พิสูจน์ *decision* logic เท่านั้น ไม่เคยพิสูจน์ว่า Kafka path จริงทำงาน ซึ่งนั่นแหละคือช่องว่างที่ [Integration tests →](/shopmicro/th/testing/integration-tests/) มีอยู่เพื่อปิด
+
+## Set it up
+
+### 1. Make `Processor` depend on a `publisher` interface
+
+ใน `services/payment/internal/processor/processor.go` เปลี่ยน Kafka dependency ที่เป็น concrete ให้เป็น interface method เดียวที่ package เป็นเจ้าของ เพิ่ม interface แล้วเปลี่ยน field กับ constructor:
+
+```go
+// publisher is the slice of *kafka.Publisher that Processor actually uses —
+// declared as an interface here (defined by the consumer, listing only the
+// method it needs) so a test can substitute a fake without a real broker.
+// *kafka.Publisher satisfies it, so cmd/main.go passes one unchanged.
+type publisher interface {
+	Publish(ctx context.Context, topic, key string, value []byte) error
+}
+
+// Processor decides each order's payment outcome and publishes it.
+type Processor struct {
+	pub publisher
+}
+
+// New returns a Processor that publishes results through pub.
+func New(pub publisher) *Processor {
+	return &Processor{pub: pub}
+}
+```
+
+ไม่มีอะไรอื่นใน `processor.go` เปลี่ยน และไม่มีอะไรใน `services/payment/cmd/main.go` เปลี่ยน — `processor.New(publisher)` ยังรับ `*kafka.Publisher` ที่เป็น concrete จาก [Process & Publish →](/shopmicro/th/payment-service/process-publish/) ซึ่งตอนนี้ satisfy interface แล้ว `go build ./...` ยังผ่าน type ของ field คือการแก้เดียวเท่านั้น
+
+### 2. `services/payment/internal/processor/processor_test.go`
+
+```go
+package processor
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+
+	"github.com/avetavos/shopmicro/pkg/events"
+)
+
+// fakePublisher records the last Publish call instead of sending anything,
+// so a test can assert on exactly what Processor.Handle tried to publish.
+type fakePublisher struct {
+	calls int
+	topic string
+	key   string
+	value []byte
+}
+
+func (f *fakePublisher) Publish(_ context.Context, topic, key string, value []byte) error {
+	f.calls++
+	f.topic, f.key, f.value = topic, key, value
+	return nil
+}
+
+func orderCreated(t *testing.T, id, orderID string, cents int64) events.Event {
+	t.Helper()
+	payload, err := json.Marshal(OrderCreated{OrderID: orderID, CustomerID: "cust-1", TotalCents: cents})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	return events.Event{ID: id, Type: "order.created", AggregateID: orderID, Payload: payload}
+}
+
+func TestHandle(t *testing.T) {
+	cases := []struct {
+		name         string
+		event        events.Event
+		wantPublish  bool
+		wantType     string
+		wantReason   string
+	}{
+		{
+			name:        "under the limit succeeds",
+			event:       orderCreated(t, "evt-1", "order-1", 2598),
+			wantPublish: true,
+			wantType:    "payment.succeeded",
+		},
+		{
+			name:        "exactly at the limit succeeds",
+			event:       orderCreated(t, "evt-2", "order-2", 500000),
+			wantPublish: true,
+			wantType:    "payment.succeeded",
+		},
+		{
+			name:        "over the limit fails with a reason",
+			event:       orderCreated(t, "evt-3", "order-3", 600000),
+			wantPublish: true,
+			wantType:    "payment.failed",
+			wantReason:  "amount exceeds limit",
+		},
+		{
+			name:        "a non-order.created event is ignored",
+			event:       events.Event{ID: "evt-4", Type: "order.confirmed", AggregateID: "order-4"},
+			wantPublish: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakePublisher{}
+			p := New(fake)
+
+			if err := p.Handle(context.Background(), tc.event); err != nil {
+				t.Fatalf("Handle returned error: %v", err)
+			}
+
+			if tc.wantPublish && fake.calls != 1 {
+				t.Fatalf("want exactly 1 publish, got %d", fake.calls)
+			}
+			if !tc.wantPublish {
+				if fake.calls != 0 {
+					t.Fatalf("want no publish for %q, got %d", tc.event.Type, fake.calls)
+				}
+				return
+			}
+
+			if fake.topic != "payments" {
+				t.Errorf("topic = %q, want payments", fake.topic)
+			}
+			if fake.key != tc.event.AggregateID {
+				t.Errorf("key = %q, want %q (the order id)", fake.key, tc.event.AggregateID)
+			}
+
+			var out events.Event
+			if err := json.Unmarshal(fake.value, &out); err != nil {
+				t.Fatalf("published value is not an events.Event: %v", err)
+			}
+			if out.Type != tc.wantType {
+				t.Errorf("Type = %q, want %q", out.Type, tc.wantType)
+			}
+			if want := tc.event.ID + ":payment"; out.ID != want {
+				t.Errorf("ID = %q, want derived %q", out.ID, want)
+			}
+
+			var res Result
+			if err := json.Unmarshal(out.Payload, &res); err != nil {
+				t.Fatalf("payload is not a Result: %v", err)
+			}
+			if res.Reason != tc.wantReason {
+				t.Errorf("Reason = %q, want %q", res.Reason, tc.wantReason)
+			}
+		})
+	}
+}
+```
+
+บันทึกไฟล์นี้เป็น `services/payment/internal/processor/processor_test.go` มันเป็น white-box test (`package processor`) จึงสร้างค่า `OrderCreated`/`Result` และเข้าถึง `New` ตรง ๆ ได้ สี่ row ของ table คือ specification ทั้งหมดของ decision: สองจำนวนที่ succeed (รวม boundary พอดีที่ `500000`), หนึ่งตัวที่ fail พร้อม reason และหนึ่ง event type ที่ต้องถูก ignore โดยไม่ publish เลย
+
+### 3. `pkg/resilience/interceptor_test.go`
+
+```go
+package resilience
+
+import (
+	"testing"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+func TestIdempotent(t *testing.T) {
+	cases := []struct {
+		method string
+		want   bool
+	}{
+		{"/shopmicro.catalog.v1.CatalogService/GetProduct", true},
+		{"/shopmicro.catalog.v1.CatalogService/ListProducts", true},
+		{"/shopmicro.order.v1.OrderService/GetOrder", true},
+		{"/shopmicro.order.v1.OrderService/CreateOrder", false},
+		{"/shopmicro.catalog.v1.CatalogService/CreateProduct", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.method, func(t *testing.T) {
+			t.Parallel()
+			if got := idempotent(tc.method); got != tc.want {
+				t.Errorf("idempotent(%q) = %v, want %v", tc.method, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRetryable(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil is not retryable", nil, false},
+		{"Unavailable is retryable", status.Error(codes.Unavailable, "down"), true},
+		{"DeadlineExceeded is retryable", status.Error(codes.DeadlineExceeded, "slow"), true},
+		{"NotFound is not retryable", status.Error(codes.NotFound, "missing"), false},
+		{"InvalidArgument is not retryable", status.Error(codes.InvalidArgument, "bad"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := retryable(tc.err); got != tc.want {
+				t.Errorf("retryable(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestJitteredBackoff(t *testing.T) {
+	base := 100 * time.Millisecond
+	cases := []struct{ attempt int }{{1}, {2}, {3}, {4}}
+	for _, tc := range cases {
+		t.Run("attempt", func(t *testing.T) {
+			window := base * time.Duration(1<<(tc.attempt-1))
+			// Run many times: jitter is random, so assert the bounds hold
+			// every time rather than a single value.
+			for i := 0; i < 1000; i++ {
+				got := jitteredBackoff(base, tc.attempt)
+				if got < window/2 || got > window {
+					t.Fatalf("attempt %d: backoff %v out of [%v, %v]", tc.attempt, got, window/2, window)
+				}
+			}
+		})
+	}
+}
+```
+
+บันทึกไฟล์นี้เป็น `pkg/resilience/interceptor_test.go` `TestJitteredBackoff` เป็น case เดียวที่ assert ค่าเดียวที่คาดหวังไม่ได้ — backoff ตั้งใจให้ random — ดังนั้นมัน assert *invariant* ที่สำคัญแทน (`window/2 <= backoff <= window`) ตลอดการ draw หนึ่งพันครั้ง ซึ่งเป็นวิธีทดสอบ function ที่มีความ random ทุกตัว: ปักที่ property ไม่ใช่ output ที่เป๊ะ
+
+## Verify
+
+รัน test ของสอง package นี้เท่านั้นแบบ verbose เพื่อให้ทุกชื่อ subtest print ออกมา:
+
+```bash
+go test -v ./pkg/resilience/ ./services/payment/internal/processor/
+```
+
+```txt
+=== RUN   TestHandle
+=== RUN   TestHandle/under_the_limit_succeeds
+=== RUN   TestHandle/exactly_at_the_limit_succeeds
+=== RUN   TestHandle/over_the_limit_fails_with_a_reason
+=== RUN   TestHandle/a_non-order.created_event_is_ignored
+--- PASS: TestHandle (0.00s)
+    --- PASS: TestHandle/under_the_limit_succeeds (0.00s)
+    ...
+=== RUN   TestIdempotent
+=== RUN   TestRetryable
+=== RUN   TestJitteredBackoff
+--- PASS: TestIdempotent (0.00s)
+--- PASS: TestRetryable (0.00s)
+--- PASS: TestJitteredBackoff (0.00s)
+PASS
+ok      github.com/avetavos/shopmicro/pkg/resilience
+ok      github.com/avetavos/shopmicro/services/payment/internal/processor
+```
+
+รัน subtest เดียวเพื่อยืนยันว่า slash syntax ของ `-run` เจาะไปที่ table row เดียว:
+
+```bash
+go test -v -run 'TestHandle/over_the_limit' ./services/payment/internal/processor/
+```
+
+จากนั้นยืนยันทั้งหมด — production code และ test ของทุก package — ว่ายัง build และผ่าน:
+
+```bash
+go build ./...
+go test ./...
+```
+
+ไม่มี output แปลว่าสำเร็จ
+
+ตรวจสอบความเข้าใจ:
+
+- `idempotent`, `retryable`, และ `jitteredBackoff` ไม่ต้องใช้ fake เลย แต่ `Processor.Handle` ต้องใช้ `fakePublisher` สามตัวแรกมี property อะไรที่ `Handle` ไม่มี และทำไม property นั้นถึงทำให้ test เป็นเรื่องง่าย?
+- package `processor` เป็นตัวนิยาม `publisher` interface ไม่ใช่ package `kafka` ทำไม "consumer ประกาศ interface ที่มันต้องการ" ถึงเป็นทิศทางที่ถูกตรงนี้ และอะไรใน `main.go` ที่ไม่เปลี่ยนเพราะเรื่องนี้?
+- `TestJitteredBackoff` assert `window/2 <= got <= window` หนึ่งพันครั้งแทนที่จะ check ค่าเดียวที่เป๊ะ ทำไมมัน assert ค่าเป๊ะไม่ได้ และเทคนิคนี้ generalize ไปยัง function class ไหน?
+- ทำไมต้องรันแต่ละ table case เป็น subtest `t.Run` แทน `for` loop เปล่า ๆ กับ `t.Errorf`? บอกสองอย่างที่คุณได้จาก subtest ที่ loop เปล่า ๆ ไม่ให้
+
+## Recap
+
+บทนี้ตั้ง table-driven unit test เป็นรูปแบบ default ของคอร์สสำหรับ "logic เดียวกัน หลาย input" `pkg/resilience/interceptor_test.go` ทดสอบ pure helper สามตัว — `idempotent`, `retryable`, `jitteredBackoff` — ด้วยแค่ table เพราะ pure function ไม่มี external dependency ให้ mock `TestJitteredBackoff` แสดงวิธีทดสอบ function ที่มี randomness ด้วยการ assert invariant bounds ตลอดหลาย draw แทนค่าเดียวที่เป๊ะ `Processor.Handle` ไม่ pure — มัน publish ไป Kafka — บทนี้จึงทำให้ `Processor` depend บน `publisher` interface method เดียวที่มันเป็นเจ้าของ ทิ้ง `*kafka.Publisher` และ `main.go` ไว้ไม่แตะตอน runtime พร้อมให้ `fakePublisher` จับสิ่งที่ `Handle` สร้างได้เป๊ะ ๆ: topic ที่ถูก, key ที่เป็น order-id, id ที่ derive เป็น `e.ID + ":payment"`, และ branch succeeded/failed/ignored ทั้งหมดโดยไม่มี broker subtest `t.Run` และ `t.Parallel()` ให้ case ที่เป็นอิสระ มีชื่อ และรัน concurrent ได้ ทุกอย่างในนี้รันในหลัก millisecond และพิสูจน์ *decision* บทถัดไป [Integration tests →](/shopmicro/th/testing/integration-tests/) cover สิ่งที่ fake ทำไม่ได้ — SQL จริง, transaction จริง, redelivery จริง — ด้วยการรัน `repo.OrderRepo` กับ PostgreSQL ของจริงที่ spin ขึ้นมาแบบ on demand ด้วย testcontainers
