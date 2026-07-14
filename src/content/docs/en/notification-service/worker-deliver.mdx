@@ -1,0 +1,224 @@
+---
+title: The Send Worker
+description: "services/notification/cmd/worker/main.go and internal/sender/sender.go — the Notification worker: a standalone binary that drains the notification.send RabbitMQ queue with pkg/amqp.Consume unmodified, unmarshals each SendJob, and 'delivers' it (logging stands in for a real email/SMS provider), acking on success and dead-lettering a job it can't parse. Why delivery is a separate process from the Kafka consumer, and competing consumers for horizontal scale. Verified end to end, and with two workers splitting a burst of jobs."
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+`services/notification/cmd/worker/main.go` and `services/notification/internal/sender/sender.go` — the Notification worker, a second, standalone binary in the same service. Where [Consuming events →](/shopmicro/en/notification-service/consume-events/)'s process *produced* jobs onto `notification.send`, this one *consumes* them: it calls `amqp.Client.Consume("notification.send", ...)` — the exact method [Exchanges & Queues →](/shopmicro/en/rabbitmq/exchanges-queues/) promised "the Notification service will use unmodified" — hands each delivery to a `Sender` that unmarshals the `SendJob` and "delivers" it, and lets `Consume`'s existing ack-on-success / nack-to-dead-letter logic do the rest.
+
+"Deliver" here is a log line, not a real SMTP or SMS call — the same honest stand-in [Process & Publish →](/shopmicro/en/payment-service/process-publish/) used when it decided payments with a `TotalCents` rule instead of a real card network. The point of this lesson isn't integrating SendGrid; it's the *shape*: a separate process, draining a work queue, that can crash, scale, retry, and dead-letter completely independently of the Kafka side.
+
+## Why
+
+The Notification service and the Notification worker are **two processes on purpose** — the architecture drew them as two boxes [Architecture →](/shopmicro/en/introduction/architecture/), and the split is the whole reason to enqueue a job rather than send it inline. The Kafka side ([Consuming events →](/shopmicro/en/notification-service/consume-events/)) must stay fast: it commits an offset only after its handler returns, so anything slow in that handler stalls `"payments"` consumption. The delivery side is the opposite — inherently slow and failable, because it talks to an external provider that can be down, rate-limited, or just latent. Keeping them in separate processes means the one thing that's slow (delivery) can never stall the one thing that must be fast (Kafka consumption), and each scales on its own axis: more Kafka partitions for more event throughput, more *workers* for more delivery throughput.
+
+That second axis is what RabbitMQ's work queue is *for*. [Exchanges & Queues →](/shopmicro/en/rabbitmq/exchanges-queues/) built `notification.send` as a **competing-consumers** queue: run one worker and it gets every job; run three and RabbitMQ splits the jobs across them, each doing roughly a third, with the `prefetchCount` of 10 [Acks, Retry & Dead Letters →](/shopmicro/en/rabbitmq/acks-retry-dlq/) set keeping that split fair. Adding a worker adds delivery capacity with *no* code change and *no* coordination — you just start another copy of this binary. That's the deliberate opposite of Kafka, where a consumer group's parallelism is capped by the topic's partition count; a RabbitMQ work queue scales by process count alone, which is exactly right for "there's a pile of sends to get through, spread them over however many workers we've got."
+
+The worker inherits its correctness from `Consume` unchanged, and it's worth being explicit about what that buys — and what it demands. `Consume` uses `autoAck=false`, so a job is only removed from the queue once `Sender.Deliver` returns `nil`; if the worker crashes mid-delivery, RabbitMQ redelivers that job to another worker [Acks, Retry & Dead Letters →](/shopmicro/en/rabbitmq/acks-retry-dlq/) — at-least-once, the same guarantee Kafka gave on the way in. Both hops being at-least-once is the catch: a single order can, in the worst case, produce a duplicate `payment.succeeded` (Kafka redelivery) → a duplicate send-job (the notifier runs twice) → a duplicate delivery (the worker runs twice). A production `Deliver` would therefore dedupe — a `sent_notifications` table keyed by `order_id` + outcome, checked before sending, the same persisted-idempotency pattern [Process & Publish →](/shopmicro/en/payment-service/process-publish/) said a real card charge would need. This lesson's logging `Deliver` is trivially idempotent (logging twice harms nothing), so it doesn't build that table — but it's the first thing a real provider integration would add.
+
+And the failure path is already wired: if `Deliver` returns an error, `Consume` calls `Nack(false, false)`, which routes the job to `notification.send.dead` via the dead-letter arguments `DeclareTopology` set — no requeue loop, no lost job, just a job set aside somewhere a human can look [Acks, Retry & Dead Letters →](/shopmicro/en/rabbitmq/acks-retry-dlq/). For the worker, the natural "this job can never succeed" failure is a body that isn't a valid `SendJob` at all — a poison message — and dead-lettering it on the first try is exactly right. A *transient* failure (the provider timed out once) is the case straight one-strike dead-lettering handles poorly, which is where Module 7's TTL+DLX-cycling or retry-count-header patterns would slot in; they're not wired here, and the Pros & cons below is honest about that gap.
+
+## Pros & cons
+
+**A dedicated worker binary** vs. **delivering inline inside the Notification Kafka consumer**
+
+- **Pros:** the slow, failable delivery step runs in its own process, so a hung or rate-limited provider can never stall Kafka `"payments"` consumption or freeze offset progress; delivery scales independently as competing consumers — add workers, not partitions, when there's a backlog to clear; and a crash while delivering loses nothing, because the job stays unacked on `notification.send` and RabbitMQ redelivers it.
+- **Cons:** it's a second binary to build, deploy, and operate for one logical feature, and the `SendJob` JSON is now a contract *between two processes* rather than two functions in one — change its shape and you have to roll the producer and every worker together, or version the message.
+
+**Dead-letter a failed job on the first failure (`Nack(false, false)`)** vs. **automatic delayed retries (TTL+DLX cycling or a retry-count header)**
+
+- **Pros:** dead-simple and exactly right for a poison message — a body that will never parse or a job that will always be rejected gets out of the live queue after one attempt and lands in `notification.send.dead`, visible and inspectable, never blocking the jobs behind it [Acks, Retry & Dead Letters →](/shopmicro/en/rabbitmq/acks-retry-dlq/).
+- **Cons:** a purely transient failure — the email provider timed out once and would have succeeded on a retry seconds later — is *also* dead-lettered on the first try, with no automatic second attempt, so recovering it means someone notices it in the dead-letter queue and republishes. A queue whose downstream is flaky enough would want the TTL+DLX or retry-count machinery from Module 7 layered on first; `notification.send` doesn't yet.
+
+## Set it up
+
+### 1. `services/notification/internal/sender/sender.go`
+
+```go
+// Package sender is the Notification worker's core: it takes one raw
+// notification.send job body, parses it back into a SendJob, and
+// "delivers" the notification. Delivery here is a log line standing in for
+// a real email/SMS provider — the mechanics (parse, deliver, succeed or
+// fail) are identical to a real integration; only the last step differs.
+package sender
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+
+	"github.com/avetavos/shopmicro/services/notification/internal/notifier"
+)
+
+// Sender delivers notification.send jobs.
+type Sender struct{}
+
+// New returns a Sender.
+func New() *Sender {
+	return &Sender{}
+}
+
+// Deliver implements the amqp.Client.Consume handle signature. It parses
+// the raw job body into a notifier.SendJob and delivers it. Returning nil
+// tells Consume to ack the message (it's removed from the queue);
+// returning an error tells Consume to Nack(requeue=false), routing the job
+// to notification.send.dead. A body that isn't a valid SendJob is a poison
+// message — it will never parse no matter how many times it's retried, so
+// dead-lettering it on the first failure is exactly the right call.
+func (s *Sender) Deliver(_ context.Context, body []byte) error {
+	var job notifier.SendJob
+	if err := json.Unmarshal(body, &job); err != nil {
+		return fmt.Errorf("sender: unmarshal send-job: %w", err)
+	}
+	if job.OrderID == "" {
+		return fmt.Errorf("sender: send-job missing order_id")
+	}
+
+	// In a real service this is where an email/SMS provider gets called,
+	// and where a persisted dedupe (keyed by order_id + outcome) would
+	// guard against redelivery sending the same notification twice.
+	log.Printf("sender: delivered notification for order %s (%s): %s", job.OrderID, job.Outcome, job.Message)
+
+	return nil
+}
+```
+
+Save this as `services/notification/internal/sender/sender.go`. It imports `notifier.SendJob` — the producer's struct is the single source of truth for the job's shape, so the worker and the Notification service can never drift out of sync on it. `Deliver`'s signature, `func(context.Context, []byte) error`, is exactly what `Client.Consume` calls each delivery with — the same "thin handler, delegate the real work" split every consumer in this course uses, one broker further down.
+
+### 2. `services/notification/cmd/worker/main.go`
+
+```go
+// Command worker runs the Notification worker: it drains the
+// notification.send RabbitMQ queue and delivers each job. It's a separate
+// binary from the Notification service (cmd) on purpose — delivery is slow
+// and failable and must scale and fail independently of the Kafka consumer
+// that fills the queue. Run as many copies as you need; RabbitMQ splits the
+// jobs across them as competing consumers.
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/avetavos/shopmicro/pkg/amqp"
+	"github.com/avetavos/shopmicro/pkg/config"
+	"github.com/avetavos/shopmicro/services/notification/internal/sender"
+)
+
+func main() {
+	rabbitURL := config.Get("RABBITMQ_URL", "amqp://shopmicro:shopmicro@localhost:5672/")
+
+	client, err := amqp.Connect(rabbitURL)
+	if err != nil {
+		log.Fatalf("worker: connect to rabbitmq: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.DeclareTopology(); err != nil {
+		log.Fatalf("worker: declare rabbitmq topology: %v", err)
+	}
+
+	s := sender.New()
+
+	go func() {
+		if err := client.Consume("notification.send", s.Deliver); err != nil {
+			log.Printf("worker: consume stopped: %v", err)
+		}
+	}()
+
+	log.Println("worker: consuming notification.send")
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Println("worker: shutting down")
+}
+```
+
+Save this as `services/notification/cmd/worker/main.go`. There's no `kafka` import anywhere in the worker — it only touches RabbitMQ, which is the whole point of splitting it out. `client.Consume` blocks until the delivery channel closes, so it runs in a goroutine; on `SIGINT`/`SIGTERM`, `main` falls through to the deferred `client.Close()`, which closes the channel and unblocks `Consume`. It calls `DeclareTopology()` too — idempotent, so it's harmless whether the Notification service already declared the queue or the worker is the first thing to start; either way `notification.send` and `notification.send.dead` exist before this worker tries to consume.
+
+## Verify
+
+Have the whole pipeline from [Consuming events →](/shopmicro/en/notification-service/consume-events/) running — Postgres, Kafka, RabbitMQ, and Catalog, Order, the gateway, Payment, and the Notification service. If you left a job or two on `notification.send` from that lesson, even better; if not, place a small order now to enqueue one:
+
+```bash
+cd deploy/compose && docker compose up -d postgres kafka rabbitmq
+```
+
+```bash
+go run ./services/notification/cmd
+```
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
+```
+
+Now start the worker. Whatever is already waiting on `notification.send` drains immediately:
+
+```bash
+go run ./services/notification/cmd/worker
+```
+
+```txt
+worker: consuming notification.send
+sender: delivered notification for order 3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90 (succeeded): Your order 3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90 is confirmed — payment of 2598 cents went through.
+```
+
+That's the entire system, end to end, on its own: a REST `POST /v1/orders` became an `order.created` outbox row → Kafka `orders` → Payment → Kafka `payments` → the Notification service → a RabbitMQ `notification.send` job → this worker delivering it — five services and two brokers, with the client never waiting on any of it. In the management UI at [http://localhost:15672](http://localhost:15672) → **Queues and Streams**, `notification.send` is back at `0` messages ready: the job was acked and removed.
+
+Now prove the **competing-consumers** property. Stop the worker, and open **two** new terminals, each running a worker:
+
+```bash
+go run ./services/notification/cmd/worker
+```
+
+```bash
+go run ./services/notification/cmd/worker
+```
+
+Fire a burst of orders so several jobs land on the queue at once:
+
+```bash
+for i in 1 2 3 4 5 6; do
+  curl -s -X POST localhost:8080/v1/orders \
+    -H 'Content-Type: application/json' \
+    -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":1}]}' > /dev/null
+done
+```
+
+Watch the two workers' terminals: the six `sender: delivered ...` lines are **split across both processes**, not repeated in each — RabbitMQ handed each job to exactly one worker, the load-balancing that Kafka's model can't give you on a single partition. Stop both workers with `Ctrl-C`:
+
+```txt
+worker: shutting down
+```
+
+The dead-letter path is the same `Consume` machinery [Acks, Retry & Dead Letters →](/shopmicro/en/rabbitmq/acks-retry-dlq/) already proved under failure: a job whose body isn't a valid `SendJob` (or is missing `order_id`) makes `Deliver` return an error, `Consume` nacks it without requeue, and it lands on `notification.send.dead` for inspection — identical to the `-fail` demonstration in Module 7, one layer up. You can confirm the queue and its dead-letter twin both exist in the management UI under **Queues and Streams**.
+
+Then confirm the module still builds:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+Check your understanding:
+
+- You ran two workers and a burst of six orders produced six deliveries total, not twelve. What RabbitMQ property is that, and why can't a single-partition Kafka topic give you the same load-split across two consumers in one group?
+- Both the Kafka hop and the RabbitMQ hop are at-least-once. Trace the worst case where one order results in the same notification being *delivered twice*. What would a production `Deliver` add to make that safe?
+- Why does a body that fails `json.Unmarshal` get dead-lettered on the first try instead of retried, while a real "the email provider timed out" failure arguably shouldn't be?
+- The worker imports `notifier.SendJob` instead of declaring its own copy of the struct. What breaks the first time the producer and worker disagree on that shape, and how does the shared import prevent it?
+
+## Recap
+
+`services/notification/cmd/worker/main.go` is a standalone binary — no Kafka anywhere in it — that calls `amqp.Client.Consume("notification.send", sender.Deliver)`, the same `pkg/amqp` method [Exchanges & Queues →](/shopmicro/en/rabbitmq/exchanges-queues/) built and promised Notification would use unmodified. `services/notification/internal/sender/sender.go`'s `Sender.Deliver` unmarshals each raw body back into the producer's own `notifier.SendJob`, "delivers" it (a log line standing in for a real provider), and returns `nil` to ack or an error to dead-letter — a body that will never parse being the poison-message case one-strike dead-lettering is right for. Splitting delivery into its own process is the entire payoff of enqueuing rather than sending inline: the slow, failable send can crash, retry, and scale — via **competing consumers**, proven by two workers splitting a burst of six jobs — without ever stalling the fast Kafka consumer that fills the queue. Both hops being at-least-once means a production `Deliver` would dedupe on `order_id` + outcome before actually sending, the same persisted-idempotency a real card charge would need. That completes the Notification service, and with it the two-broker architecture end to end: a single REST request now flows through five services and both Kafka and RabbitMQ with no synchronous coupling anywhere. Next, [Resilience →](/shopmicro/en/resilience/) steps back from features to hardening — timeouts, retries with backoff, and circuit breakers across every hop this system now has.

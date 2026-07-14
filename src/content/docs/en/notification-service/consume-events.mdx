@@ -1,0 +1,277 @@
+---
+title: Consuming events
+description: "services/notification/cmd/main.go and internal/notifier/notifier.go — the Notification service: a kafka.Consumer in its own \"notification\" group reading the \"payments\" topic, whose handler turns each payment.succeeded/payment.failed into a RabbitMQ send-job on the notification.send queue via pkg/amqp instead of sending inline. The one process in this system that speaks both brokers — Kafka in, RabbitMQ out. Verified by placing an order and watching a job appear on notification.send in the management UI."
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+`services/notification/cmd/main.go` and `services/notification/internal/notifier/notifier.go` — the Notification service. It's a `kafka.Consumer` in its own `"notification"` consumer group reading the `"payments"` topic [Process & Publish →](/shopmicro/en/payment-service/process-publish/) already fills with `payment.succeeded`/`payment.failed` events, exactly like Order's saga consumer [The Saga Handler →](/shopmicro/en/saga/orchestration/) built. But where the saga's `Handle` updates a database row, Notification's `Handle` does something no service in this course has done before: it takes the payment result it just consumed from **Kafka** and enqueues a send-job onto the `notification.send` **RabbitMQ** work queue [Exchanges & Queues →](/shopmicro/en/rabbitmq/exchanges-queues/) declared, using `pkg/amqp.Client.Publish` unchanged.
+
+This is the one process in the whole system that speaks both brokers at once — Kafka on the way in, RabbitMQ on the way out — and this lesson is where the two-broker architecture [Architecture →](/shopmicro/en/introduction/architecture/) drew finally runs end to end. The worker that pulls those jobs back off `notification.send` and actually "delivers" them is the next lesson, [The Send Worker →](/shopmicro/en/notification-service/worker-deliver/); this one stops the moment the job is safely on the queue.
+
+## Why
+
+The whole point of Notification is a question the architecture answered before a line of it existed: *why* consume a Kafka event only to immediately hand it to RabbitMQ, instead of just sending the email right there in the Kafka handler? Because "a payment result happened" and "send this one notification" are two genuinely different kinds of message, and this system already has the right tool for each. A `payment.succeeded` event on Kafka is a **fact** — durable, replayable, read independently by Order's saga *and* Notification *and* whatever service gets added next, none of them aware of the others. Sending the customer an email is a **job** — it needs to happen exactly once, by whichever worker is free, with a per-message ack, a retry, and a dead-letter queue when the email provider is down. [Exchanges & Queues →](/shopmicro/en/rabbitmq/exchanges-queues/) named that split precisely: Kafka's replayable log answers "has every interested party seen this fact," RabbitMQ's work queue answers "is there a job to do once." Notification is the seam where a fact becomes a job.
+
+Enqueuing rather than sending inline also keeps the Kafka consumer *fast*. [Producer & Consumer →](/shopmicro/en/kafka/producer-consumer/) established that `Consumer.Run` only commits an offset after `Handle` returns — so if `Handle` blocked on a slow email provider, the whole `"payments"` consumer would stall behind it, and a provider outage would freeze offset progress entirely, redelivering the same events on every restart. Handing the work to RabbitMQ instead means `Handle` returns in microseconds, the offset commits immediately, and every slow, failable part of actually delivering the notification lives in a separate process (the worker) reading a separate queue, where RabbitMQ's ack/retry/dead-letter machinery [Acks, Retry & Dead Letters →](/shopmicro/en/rabbitmq/acks-retry-dlq/) built is exactly the right tool for it.
+
+And Notification's consumer group is its own: `NewConsumer(brokers, "notification", "payments")`. Order's saga reads the same `"payments"` topic under the group `"order"` [The Saga Handler →](/shopmicro/en/saga/orchestration/); Notification reads it under `"notification"`. [Topics, Partitions & Consumer Groups →](/shopmicro/en/kafka/topics-groups/)'s rule is what makes that safe: two consumers in *different* groups each get a complete, independent read of the entire topic. Notification sees every `payment.*` event the saga sees, in full, and neither group's progress, lag, or downtime affects the other's — the saga confirming an order and Notification emailing the customer about it are the same fact, consumed twice, by two services that will never know the other exists. This is the first time this course has had *two* live consumer groups on one topic to prove that rule with, rather than just asserting it.
+
+## Pros & cons
+
+**Enqueue a RabbitMQ job from the Kafka handler** vs. **send the notification inline in the same handler**
+
+- **Pros:** the Kafka consumer stays fast and its offset commit never waits on an external email/SMS provider, so a slow or down provider can't stall `"payments"` consumption or trigger endless Kafka redelivery; the actual delivery gets RabbitMQ's per-message ack, retry, and dead-letter guarantees instead of Kafka's "reprocess the whole event" model, which is a much better fit for "this one send failed, try it again / set it aside"; and the delivery workers scale independently as competing consumers [Exchanges & Queues →](/shopmicro/en/rabbitmq/exchanges-queues/) — add workers when the provider is slow without touching the Kafka side at all.
+- **Cons:** it's a second broker to run and a second hop to trace — a notification now flows Kafka → Notification → RabbitMQ → worker rather than Kafka → handler → provider; and because *both* hops are at-least-once (Kafka redelivery on the way in, RabbitMQ redelivery on the way out), a single duplicated `payment.succeeded` can become a duplicated send-job, so the worker must be idempotent — a cost [The Send Worker →](/shopmicro/en/notification-service/worker-deliver/) has to account for, exactly as every consumer in this course has.
+
+**A dedicated `"notification"` consumer group** vs. **reusing Order's saga consumer to also emit notifications**
+
+- **Pros:** total decoupling — Notification and the saga read the same facts with zero shared code or coordination, so Notification can lag, restart, or be deployed independently without ever affecting whether orders reach `CONFIRMED`/`CANCELLED`, and adding Notification cost the saga, Payment, and Order *nothing* — no code in any of them changed to make this service exist.
+- **Cons:** two independent groups each deserialize every `payment.*` event off the topic — a small, constant duplication of work versus a single consumer that did both the state update and the notification in one pass, which at this scale is negligible but is the honest trade for the decoupling.
+
+## Set it up
+
+### 1. `services/notification/internal/notifier/notifier.go`
+
+```go
+// Package notifier is the Notification service's core: it consumes payment
+// result events from Kafka and enqueues one send-job per event onto the
+// notification.send RabbitMQ work queue, instead of delivering inline. The
+// worker (a separate process) drains that queue and does the actual send.
+package notifier
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/avetavos/shopmicro/pkg/amqp"
+	"github.com/avetavos/shopmicro/pkg/events"
+)
+
+// result is the payload Payment publishes on every payment.* event — the
+// same shape as processor.Result over in the Payment service. Notification
+// only needs to read it, so it declares its own local copy rather than
+// importing Payment's internal package.
+type result struct {
+	OrderID     string `json:"order_id"`
+	AmountCents int64  `json:"amount_cents"`
+	Reason      string `json:"reason,omitempty"`
+}
+
+// SendJob is the body of a notification.send message: everything the worker
+// needs to deliver one notification, and nothing it doesn't. The worker
+// (next lesson) unmarshals exactly this shape.
+type SendJob struct {
+	OrderID     string `json:"order_id"`
+	Outcome     string `json:"outcome"` // "succeeded" or "failed"
+	AmountCents int64  `json:"amount_cents"`
+	Message     string `json:"message"`
+}
+
+// Notifier turns each payment result event into a notification.send job.
+type Notifier struct {
+	amqp *amqp.Client
+}
+
+// New returns a Notifier that enqueues jobs through client.
+func New(client *amqp.Client) *Notifier {
+	return &Notifier{amqp: client}
+}
+
+// Handle implements the Consumer.Run handle signature. It ignores every
+// event.Type except "payment.succeeded"/"payment.failed", builds a
+// customer-facing SendJob from the payment result, and publishes it to the
+// notification.send queue. It never delivers anything itself — returning
+// nil commits the Kafka offset the instant the job is safely on the queue.
+func (n *Notifier) Handle(ctx context.Context, e events.Event) error {
+	if e.Type != "payment.succeeded" && e.Type != "payment.failed" {
+		return nil
+	}
+
+	var r result
+	if err := json.Unmarshal(e.Payload, &r); err != nil {
+		return fmt.Errorf("notifier: unmarshal payment result: %w", err)
+	}
+
+	job := SendJob{OrderID: r.OrderID, AmountCents: r.AmountCents}
+	if e.Type == "payment.succeeded" {
+		job.Outcome = "succeeded"
+		job.Message = fmt.Sprintf("Your order %s is confirmed — payment of %d cents went through.", r.OrderID, r.AmountCents)
+	} else {
+		job.Outcome = "failed"
+		job.Message = fmt.Sprintf("Your order %s could not be completed: %s.", r.OrderID, r.Reason)
+	}
+
+	body, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("notifier: marshal send-job: %w", err)
+	}
+
+	if err := n.amqp.Publish(ctx, "notification.send", body); err != nil {
+		return fmt.Errorf("notifier: enqueue send-job for order %s: %w", r.OrderID, err)
+	}
+
+	return nil
+}
+```
+
+Save this as `services/notification/internal/notifier/notifier.go`. A few things worth calling out:
+
+- **`Handle` has the exact `func(context.Context, events.Event) error` signature `Consumer.Run` expects** — the same shape Payment's `Processor.Handle` and the saga's `Handler.Handle` have, so wiring it into `consumer.Run` next needs no adapter. The filter — ignore anything that isn't a payment result, `return nil` so the offset still commits — is the same two-line pattern every Kafka handler in this course opens with.
+- **It unmarshals `e.Payload` (unlike the saga handler, which didn't).** The saga only needed the order id and success flag, both on the envelope; Notification wants the *amount* for the customer-facing message, and that only lives in the payload's `amount_cents`. `Reason` is only set on `payment.failed` (Payment marks it `omitempty`), which is exactly the failure branch that reads it.
+- **The recipient is a deliberate simplification.** A payment result event carries the `order_id` and amount but not the customer's email or phone — so `SendJob` describes *what happened to which order*, and leaves *who to contact and how* for the worker. A production Notification service would resolve the customer's contact details here (a lookup keyed by `order_id`, or a `customer_id` carried on the event), the same way [Process & Publish →](/shopmicro/en/payment-service/process-publish/) was explicit that a real Payment service would front a real card network. The two-broker mechanics this module teaches are identical either way.
+
+### 2. `services/notification/cmd/main.go`
+
+```go
+// Command notification runs the Notification service: a Kafka consumer in
+// its own "notification" group reading the "payments" topic, whose handler
+// enqueues a send-job onto the notification.send RabbitMQ queue for each
+// payment result. The worker that drains that queue is a separate binary
+// (cmd/worker). This process speaks both brokers: Kafka in, RabbitMQ out.
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+
+	"github.com/avetavos/shopmicro/pkg/amqp"
+	"github.com/avetavos/shopmicro/pkg/config"
+	"github.com/avetavos/shopmicro/pkg/kafka"
+	"github.com/avetavos/shopmicro/services/notification/internal/notifier"
+)
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	brokers := strings.Split(config.Get("KAFKA_BROKERS", "localhost:9092"), ",")
+	rabbitURL := config.Get("RABBITMQ_URL", "amqp://shopmicro:shopmicro@localhost:5672/")
+
+	amqpClient, err := amqp.Connect(rabbitURL)
+	if err != nil {
+		log.Fatalf("notification: connect to rabbitmq: %v", err)
+	}
+	defer amqpClient.Close()
+
+	if err := amqpClient.DeclareTopology(); err != nil {
+		log.Fatalf("notification: declare rabbitmq topology: %v", err)
+	}
+
+	n := notifier.New(amqpClient)
+
+	consumer := kafka.NewConsumer(brokers, "notification", "payments")
+	defer consumer.Close()
+
+	go func() {
+		if err := consumer.Run(ctx, n.Handle); err != nil {
+			log.Printf("notification: consumer stopped: %v", err)
+		}
+	}()
+
+	log.Println("notification: consumer started, group=notification topic=payments")
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Println("notification: shutting down")
+	cancel()
+}
+```
+
+Save this as `services/notification/cmd/main.go`. The shape is the same composition root every service in this course has: build dependencies, start the long-running loop in a goroutine, shut down on `SIGINT`/`SIGTERM`. The one thing that's new is that it builds *two* clients — a `kafka.Consumer` and an `amqp.Client` — and calls `amqpClient.DeclareTopology()` on startup. That call is idempotent [Exchanges & Queues →](/shopmicro/en/rabbitmq/exchanges-queues/): declaring the `notification.send` queue and its dead-letter setup again does nothing if the worker (or a previous run) already declared them, so it's safe for both the Notification service and the worker to declare the same topology independently — whichever starts first wins, and the other's call is a no-op. `consumer.Run` blocks until `ctx` is cancelled, so it's a goroutine; `cancel()` on shutdown unwinds it, and the deferred `amqpClient.Close()` and `consumer.Close()` release both brokers' connections.
+
+## Verify
+
+Bring up Postgres, Kafka, **and RabbitMQ** — Notification needs all three — then run Catalog, Order, the gateway, and Payment exactly as [The Saga Handler →](/shopmicro/en/saga/orchestration/) left them:
+
+```bash
+cd deploy/compose && docker compose up -d postgres kafka rabbitmq
+```
+
+```bash
+go run ./services/catalog/cmd
+```
+
+```bash
+go run ./services/order/cmd
+```
+
+```bash
+go run ./gateway/cmd
+```
+
+```bash
+go run ./services/payment/cmd
+```
+
+Start the Notification service — but **not** the worker yet, so the jobs it enqueues sit on the queue where you can see them:
+
+```bash
+go run ./services/notification/cmd
+```
+
+```txt
+notification: consumer started, group=notification topic=payments
+```
+
+Create a small order, well under Payment's $5,000 limit:
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
+```
+
+Within moments — the time for the outbox relay to publish `order.created`, Payment to publish `payment.succeeded`, and Notification to consume it — a send-job is now sitting on `notification.send`. Confirm it in the management UI at [http://localhost:15672](http://localhost:15672) (login `shopmicro` / `shopmicro`) → **Queues and Streams** → `notification.send`: **Messages Ready** is `1`. Click the queue, open **Get messages**, and read the body (use **Requeue: Yes** so you don't consume it):
+
+```json
+{"order_id":"3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90","outcome":"succeeded","amount_cents":2598,"message":"Your order 3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90 is confirmed — payment of 2598 cents went through."}
+```
+
+That job was produced by a **Kafka** event and is now waiting on a **RabbitMQ** queue — the two-broker hop, proven. Notice `notification.send` has a message *ready* and no consumer draining it: nothing is lost while the worker is down, because a durable queue holds the job until a worker acks it, exactly the guarantee [Exchanges & Queues →](/shopmicro/en/rabbitmq/exchanges-queues/) built. Now place a large order to see the failure message enqueued too:
+
+```bash
+curl -s -X POST localhost:8080/v1/products \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Server Rack","description":"42U enterprise rack","price_cents":600000,"stock":5}'
+```
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"7b23f5a1-4c9d-4e8a-b2a5-1e3f4a9b21c8","quantity":1}]}'
+```
+
+`notification.send` now shows `2` messages ready; the second one's body carries `"outcome":"failed"` and a `message` ending in `could not be completed: amount exceeds limit.` — the same handler, branching on `e.Type`. Stop Notification with `Ctrl-C`:
+
+```txt
+notification: shutting down
+```
+
+Then confirm the module still builds:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+Check your understanding:
+
+- Order's saga and Notification both consume the `"payments"` topic. What one line in each service guarantees they each see *every* payment event independently, and what would break if they shared it?
+- Why does `Handle` enqueue a RabbitMQ job and return, instead of sending the notification itself? What specifically would stall if it sent inline and the email provider hung for 30 seconds?
+- The send-job left `notification.send` with two messages *ready* and no consumer. Where would those messages be if `notification.send` had been declared non-durable, and the broker restarted?
+- `Handle` unmarshals `e.Payload`, but the saga's `Handler.Handle` never did. Why does Notification need the payload when the saga didn't?
+
+## Recap
+
+`services/notification/internal/notifier/notifier.go`'s `Notifier.Handle` is a Kafka handler with the same shape as every other in this course — filter for `payment.succeeded`/`payment.failed`, `return nil` for everything else — but instead of touching a database it builds a customer-facing `SendJob` and calls `amqp.Client.Publish(ctx, "notification.send", body)`, turning a Kafka **fact** into a RabbitMQ **job**. `services/notification/cmd/main.go` is the one process in this system that holds both a `kafka.Consumer` (its own `"notification"` group on `"payments"`) and an `amqp.Client`, declaring the RabbitMQ topology idempotently on startup and shutting both down on a shared cancellable context. Because it enqueues instead of sending inline, the Kafka offset commits in microseconds and every slow, failable part of delivery is pushed into a separate queue — and because `"notification"` is its own consumer group, it reads the same payment stream as Order's saga with zero coupling between them, the first time this course has had two live groups on one topic to prove that with. `curl` through the gateway put two real jobs on `notification.send`, visible and durable in the management UI, with no worker yet running to consume them. Next, [The Send Worker →](/shopmicro/en/notification-service/worker-deliver/) is the separate binary that drains that queue, "delivers" each notification, and acks it — putting the ack/retry/dead-letter machinery from [Acks, Retry & Dead Letters →](/shopmicro/en/rabbitmq/acks-retry-dlq/) to work for real.

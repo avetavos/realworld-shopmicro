@@ -1,0 +1,224 @@
+---
+title: The Send Worker
+description: "services/notification/cmd/worker/main.go และ internal/sender/sender.go — Notification worker: binary แยกที่ดึง queue notification.send ของ RabbitMQ ด้วย pkg/amqp.Consume แบบไม่แก้ unmarshal SendJob แต่ละอันแล้ว 'ส่ง' มัน (log แทน email/SMS provider จริง) ack เมื่อสำเร็จ และ dead-letter job ที่ parse ไม่ได้ ทำไมการส่งเป็น process แยกจาก Kafka consumer และ competing consumers สำหรับ scale แนวนอน ตรวจสอบ end to end และด้วย worker สองตัวแบ่ง burst ของ job"
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+`services/notification/cmd/worker/main.go` และ `services/notification/internal/sender/sender.go` — Notification worker, binary แยกตัวที่สองในเซอร์วิสเดียวกัน ตรงที่ process ของ [Consuming events →](/shopmicro/th/notification-service/consume-events/) *ผลิต* job ลงบน `notification.send`, ตัวนี้ *consume* มัน: มันเรียก `amqp.Client.Consume("notification.send", ...)` — method ที่ [Exchanges & Queues →](/shopmicro/th/rabbitmq/exchanges-queues/) สัญญาไว้ว่า "เซอร์วิส Notification จะใช้แบบไม่แก้" — ส่ง delivery แต่ละตัวให้ `Sender` ที่ unmarshal `SendJob` แล้ว "ส่ง" มัน และปล่อยให้ logic ack-on-success / nack-to-dead-letter ที่มีอยู่แล้วของ `Consume` จัดการที่เหลือ
+
+"ส่ง" ตรงนี้คือ log บรรทัดเดียว ไม่ใช่ SMTP หรือ SMS จริง — ตัวแทนที่ตรงไปตรงมาเดียวกับที่ [Process & Publish →](/shopmicro/th/payment-service/process-publish/) ใช้ตอนตัดสินการชำระเงินด้วยกฎ `TotalCents` แทน card network จริง ประเด็นของบทนี้ไม่ใช่การต่อ SendGrid แต่คือ *รูปร่าง*: process แยกที่ดึง work queue ที่ crash, scale, retry, และ dead-letter ได้อย่างเป็นอิสระจากฝั่ง Kafka โดยสิ้นเชิง
+
+## Why
+
+เซอร์วิส Notification และ Notification worker เป็น **สอง process อย่างตั้งใจ** — สถาปัตยกรรมวาดมันเป็นสองกล่อง [Architecture →](/shopmicro/th/introduction/architecture/) และการแยกนี้คือเหตุผลทั้งหมดที่ enqueue job แทนที่จะส่ง inline ฝั่ง Kafka ([Consuming events →](/shopmicro/th/notification-service/consume-events/)) ต้องเร็ว: มัน commit offset หลัง handler return เท่านั้น ดังนั้นอะไรที่ช้าใน handler นั้นจะหยุดการ consume `"payments"` ฝั่งการส่งตรงกันข้าม — ช้าและพังได้โดยธรรมชาติ เพราะมันคุยกับ provider ภายนอกที่ down, ถูก rate-limit, หรือแค่ latency สูงได้ การแยกเป็นคนละ process ทำให้สิ่งที่ช้า (การส่ง) ไม่มีวันหยุดสิ่งที่ต้องเร็ว (การ consume Kafka) และแต่ละอัน scale บนแกนของตัวเอง: เพิ่ม Kafka partition เพื่อ throughput ของ event เพิ่ม *worker* เพื่อ throughput ของการส่ง
+
+แกนที่สองนั้นคือสิ่งที่ work queue ของ RabbitMQ *มีไว้เพื่อ* [Exchanges & Queues →](/shopmicro/th/rabbitmq/exchanges-queues/) สร้าง `notification.send` เป็น queue แบบ **competing-consumers**: รัน worker ตัวเดียวมันได้ job ทุกอัน; รันสามตัว RabbitMQ แบ่ง job ข้ามพวกมัน แต่ละตัวทำราวหนึ่งในสาม โดย `prefetchCount` เป็น 10 ที่ [Acks, Retry & Dead Letters →](/shopmicro/th/rabbitmq/acks-retry-dlq/) set ไว้คอยทำให้การแบ่งนั้นยุติธรรม การเพิ่ม worker เพิ่มความจุการส่งโดย *ไม่* ต้องแก้โค้ดและ *ไม่* ต้องประสานงาน — คุณแค่เริ่ม binary ตัวนี้อีกก๊อป นั่นคือตรงข้ามอย่างตั้งใจกับ Kafka ที่ parallelism ของ consumer group ถูกจำกัดด้วยจำนวน partition ของ topic; work queue ของ RabbitMQ scale ด้วยจำนวน process เพียว ๆ ซึ่งเหมาะกับ "มีกอง job รออยู่ กระจายมันไปบน worker เท่าที่มี" พอดี
+
+worker สืบทอดความถูกต้องมาจาก `Consume` ที่ไม่แก้ และควรพูดให้ชัดว่ามันให้อะไร — และเรียกร้องอะไร `Consume` ใช้ `autoAck=false` ดังนั้น job ถูกลบออกจาก queue ก็ต่อเมื่อ `Sender.Deliver` return `nil`; ถ้า worker crash กลางการส่ง RabbitMQ redeliver job นั้นให้ worker อีกตัว [Acks, Retry & Dead Letters →](/shopmicro/th/rabbitmq/acks-retry-dlq/) — at-least-once, การรับประกันเดียวกับที่ Kafka ให้ขาเข้า การที่ทั้งสอง hop เป็น at-least-once คือจุดสะดุด: คำสั่งซื้อเดียวในกรณีเลวร้ายสุดสามารถผลิต `payment.succeeded` ซ้ำ (Kafka redeliver) → send-job ซ้ำ (notifier รันสองครั้ง) → การส่งซ้ำ (worker รันสองครั้ง) `Deliver` ระดับ production จึงต้อง dedupe — table `sent_notifications` ที่ key ด้วย `order_id` + outcome เช็คก่อนส่ง แบบเดียวกับ persisted-idempotency ที่ [Process & Publish →](/shopmicro/th/payment-service/process-publish/) บอกว่าการ charge card จริงต้องมี `Deliver` ที่ log ในบทนี้ idempotent อยู่แล้วอย่างง่าย (log สองครั้งไม่เสียหาย) จึงไม่สร้าง table นั้น — แต่มันคือสิ่งแรกที่การต่อ provider จริงจะเพิ่ม
+
+และ failure path ต่อสายไว้แล้ว: ถ้า `Deliver` return error, `Consume` เรียก `Nack(false, false)` ซึ่ง route job ไป `notification.send.dead` ผ่าน dead-letter argument ที่ `DeclareTopology` set ไว้ — ไม่มี requeue loop ไม่มี job หาย แค่ job ที่ถูกวางไว้ที่ ๆ คนดูได้ [Acks, Retry & Dead Letters →](/shopmicro/th/rabbitmq/acks-retry-dlq/) สำหรับ worker, failure แบบ "job นี้ไม่มีวันสำเร็จ" ตามธรรมชาติคือ body ที่ไม่ใช่ `SendJob` ที่ถูกต้องเลย — poison message — และ dead-letter มันตั้งแต่ครั้งแรกคือสิ่งที่ถูกต้องพอดี ส่วน failure แบบ *transient* (provider timeout ครั้งเดียว) คือกรณีที่ dead-letter ครั้งเดียวจัดการได้ไม่ดี ซึ่งเป็นจุดที่ pattern TTL+DLX-cycling หรือ retry-count-header ของ Module 7 จะเสียบเข้ามา พวกมันไม่ได้ต่อสายไว้ที่นี่ และ Pros & cons ด้านล่างพูดถึงช่องว่างนั้นตรง ๆ
+
+## Pros & cons
+
+**Worker binary แยกต่างหาก** เทียบกับ **ส่ง inline ใน Kafka consumer ของ Notification**
+
+- **Pros:** ขั้นตอนการส่งที่ช้าและพังได้รันใน process ของตัวเอง ดังนั้น provider ที่ค้างหรือถูก rate-limit ไม่มีวันหยุดการ consume `"payments"` ของ Kafka หรือ freeze offset progress; การส่ง scale เป็นอิสระแบบ competing consumers — เพิ่ม worker ไม่ใช่ partition ตอนมี backlog ต้องเคลียร์; และ crash กลางการส่งไม่ทำอะไรหาย เพราะ job ยังไม่ ack บน `notification.send` และ RabbitMQ redeliver มัน
+- **Cons:** มันคือ binary ตัวที่สองที่ต้อง build, deploy, และดูแลสำหรับ feature เชิงตรรกะเดียว และ JSON ของ `SendJob` ตอนนี้เป็น contract *ระหว่างสอง process* ไม่ใช่สอง function ใน process เดียว — เปลี่ยนรูปร่างมันแล้วคุณต้อง roll ทั้ง producer และ worker ทุกตัวพร้อมกัน หรือ version message
+
+**Dead-letter job ที่ล้มเหลวตั้งแต่ครั้งแรก (`Nack(false, false)`)** เทียบกับ **retry แบบหน่วงเวลาอัตโนมัติ (TTL+DLX cycling หรือ retry-count header)**
+
+- **Pros:** ง่ายสุด ๆ และถูกต้องพอดีสำหรับ poison message — body ที่ไม่มีวัน parse หรือ job ที่จะถูกปฏิเสธเสมอจะออกจาก live queue หลังหนึ่งครั้งแล้วไปตกที่ `notification.send.dead` เห็นได้ ตรวจสอบได้ ไม่เคยบล็อก job ที่อยู่ข้างหลัง [Acks, Retry & Dead Letters →](/shopmicro/th/rabbitmq/acks-retry-dlq/)
+- **Cons:** failure แบบ transient ล้วน ๆ — email provider timeout ครั้งเดียวและน่าจะสำเร็จถ้า retry อีกไม่กี่วินาที — ก็ถูก dead-letter ตั้งแต่ครั้งแรกด้วย ไม่มีความพยายามครั้งที่สองอัตโนมัติ ดังนั้นการกู้มันคืนหมายถึงมีคนสังเกตเห็นมันใน dead-letter queue แล้ว republish queue ที่ downstream flaky พอจะอยากได้กลไก TTL+DLX หรือ retry-count จาก Module 7 มาซ้อนก่อน; `notification.send` ยังไม่ต้องการ
+
+## Set it up
+
+### 1. `services/notification/internal/sender/sender.go`
+
+```go
+// Package sender is the Notification worker's core: it takes one raw
+// notification.send job body, parses it back into a SendJob, and
+// "delivers" the notification. Delivery here is a log line standing in for
+// a real email/SMS provider — the mechanics (parse, deliver, succeed or
+// fail) are identical to a real integration; only the last step differs.
+package sender
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+
+	"github.com/avetavos/shopmicro/services/notification/internal/notifier"
+)
+
+// Sender delivers notification.send jobs.
+type Sender struct{}
+
+// New returns a Sender.
+func New() *Sender {
+	return &Sender{}
+}
+
+// Deliver implements the amqp.Client.Consume handle signature. It parses
+// the raw job body into a notifier.SendJob and delivers it. Returning nil
+// tells Consume to ack the message (it's removed from the queue);
+// returning an error tells Consume to Nack(requeue=false), routing the job
+// to notification.send.dead. A body that isn't a valid SendJob is a poison
+// message — it will never parse no matter how many times it's retried, so
+// dead-lettering it on the first failure is exactly the right call.
+func (s *Sender) Deliver(_ context.Context, body []byte) error {
+	var job notifier.SendJob
+	if err := json.Unmarshal(body, &job); err != nil {
+		return fmt.Errorf("sender: unmarshal send-job: %w", err)
+	}
+	if job.OrderID == "" {
+		return fmt.Errorf("sender: send-job missing order_id")
+	}
+
+	// In a real service this is where an email/SMS provider gets called,
+	// and where a persisted dedupe (keyed by order_id + outcome) would
+	// guard against redelivery sending the same notification twice.
+	log.Printf("sender: delivered notification for order %s (%s): %s", job.OrderID, job.Outcome, job.Message)
+
+	return nil
+}
+```
+
+บันทึกไฟล์นี้เป็น `services/notification/internal/sender/sender.go` มัน import `notifier.SendJob` — struct ของ producer คือแหล่งความจริงเดียวของรูปร่าง job ดังนั้น worker กับเซอร์วิส Notification ไม่มีวัน drift ออกจากกันบนมัน signature ของ `Deliver`, `func(context.Context, []byte) error`, ตรงกับที่ `Client.Consume` เรียกด้วย delivery แต่ละตัวพอดี — การแยก "handler บาง delegate งานจริง" เดียวกับที่ consumer ทุกตัวในคอร์สนี้ใช้ ลึกลงไปอีกหนึ่ง broker
+
+### 2. `services/notification/cmd/worker/main.go`
+
+```go
+// Command worker runs the Notification worker: it drains the
+// notification.send RabbitMQ queue and delivers each job. It's a separate
+// binary from the Notification service (cmd) on purpose — delivery is slow
+// and failable and must scale and fail independently of the Kafka consumer
+// that fills the queue. Run as many copies as you need; RabbitMQ splits the
+// jobs across them as competing consumers.
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/avetavos/shopmicro/pkg/amqp"
+	"github.com/avetavos/shopmicro/pkg/config"
+	"github.com/avetavos/shopmicro/services/notification/internal/sender"
+)
+
+func main() {
+	rabbitURL := config.Get("RABBITMQ_URL", "amqp://shopmicro:shopmicro@localhost:5672/")
+
+	client, err := amqp.Connect(rabbitURL)
+	if err != nil {
+		log.Fatalf("worker: connect to rabbitmq: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.DeclareTopology(); err != nil {
+		log.Fatalf("worker: declare rabbitmq topology: %v", err)
+	}
+
+	s := sender.New()
+
+	go func() {
+		if err := client.Consume("notification.send", s.Deliver); err != nil {
+			log.Printf("worker: consume stopped: %v", err)
+		}
+	}()
+
+	log.Println("worker: consuming notification.send")
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Println("worker: shutting down")
+}
+```
+
+บันทึกไฟล์นี้เป็น `services/notification/cmd/worker/main.go` ไม่มี `kafka` import ที่ไหนใน worker เลย — มันแตะแค่ RabbitMQ ซึ่งคือประเด็นทั้งหมดของการแยกมันออกมา `client.Consume` block จนกว่า delivery channel จะปิด จึงรันใน goroutine; บน `SIGINT`/`SIGTERM`, `main` ตกลงไปที่ `client.Close()` ที่ defer ไว้ ซึ่งปิด channel แล้วปลด block `Consume` มันเรียก `DeclareTopology()` ด้วย — idempotent จึงไม่มีผลไม่ว่าเซอร์วิส Notification จะ declare queue ไว้แล้วหรือ worker เป็นตัวแรกที่เริ่ม; ไม่ว่าทางไหน `notification.send` และ `notification.send.dead` มีอยู่ก่อนที่ worker นี้จะพยายาม consume
+
+## Verify
+
+ให้ทั้ง pipeline จาก [Consuming events →](/shopmicro/th/notification-service/consume-events/) รันอยู่ — Postgres, Kafka, RabbitMQ, และ Catalog, Order, gateway, Payment, และเซอร์วิส Notification ถ้าคุณทิ้ง job ไว้บน `notification.send` จากบทนั้นสักหนึ่งสองอันก็ยิ่งดี; ถ้าไม่ วางคำสั่งซื้อขนาดเล็กตอนนี้เพื่อ enqueue หนึ่งอัน:
+
+```bash
+cd deploy/compose && docker compose up -d postgres kafka rabbitmq
+```
+
+```bash
+go run ./services/notification/cmd
+```
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
+```
+
+ทีนี้เริ่ม worker อะไรก็ตามที่รออยู่บน `notification.send` จะถูกดึงออกทันที:
+
+```bash
+go run ./services/notification/cmd/worker
+```
+
+```txt
+worker: consuming notification.send
+sender: delivered notification for order 3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90 (succeeded): Your order 3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90 is confirmed — payment of 2598 cents went through.
+```
+
+นั่นคือทั้งระบบ end to end ทำงานเอง: REST `POST /v1/orders` กลายเป็น outbox row `order.created` → Kafka `orders` → Payment → Kafka `payments` → เซอร์วิส Notification → job `notification.send` ของ RabbitMQ → worker นี้ส่งมัน — ห้าเซอร์วิสและสอง broker โดย client ไม่เคยรออะไรเลย ใน management UI ที่ [http://localhost:15672](http://localhost:15672) → **Queues and Streams**, `notification.send` กลับมาที่ `0` messages ready: job ถูก ack และลบแล้ว
+
+ทีนี้พิสูจน์ property **competing-consumers** หยุด worker แล้วเปิด terminal ใหม่ **สอง** อัน แต่ละอันรัน worker หนึ่งตัว:
+
+```bash
+go run ./services/notification/cmd/worker
+```
+
+```bash
+go run ./services/notification/cmd/worker
+```
+
+ยิง burst ของคำสั่งซื้อเพื่อให้หลาย job ตกบน queue พร้อมกัน:
+
+```bash
+for i in 1 2 3 4 5 6; do
+  curl -s -X POST localhost:8080/v1/orders \
+    -H 'Content-Type: application/json' \
+    -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":1}]}' > /dev/null
+done
+```
+
+ดู terminal ของ worker สองตัว: บรรทัด `sender: delivered ...` หกบรรทัด **ถูกแบ่งข้ามทั้งสอง process** ไม่ใช่ซ้ำในแต่ละตัว — RabbitMQ ส่งแต่ละ job ให้ worker ตัวเดียวเท่านั้น การ load-balance ที่ model ของ Kafka ให้คุณไม่ได้บน partition เดียว หยุด worker ทั้งสองด้วย `Ctrl-C`:
+
+```txt
+worker: shutting down
+```
+
+dead-letter path คือกลไก `Consume` เดียวกับที่ [Acks, Retry & Dead Letters →](/shopmicro/th/rabbitmq/acks-retry-dlq/) พิสูจน์ภายใต้ failure ไปแล้ว: job ที่ body ไม่ใช่ `SendJob` ที่ถูกต้อง (หรือขาด `order_id`) ทำให้ `Deliver` return error, `Consume` nack มันโดยไม่ requeue แล้วมันไปตกที่ `notification.send.dead` ให้ตรวจสอบ — เหมือนกับ demonstration `-fail` ใน Module 7 ขึ้นมาหนึ่งชั้น คุณยืนยันได้ว่า queue และ dead-letter คู่ของมันมีอยู่ทั้งคู่ใน management UI ใต้ **Queues and Streams**
+
+แล้วยืนยันว่า module ยังคง build ผ่าน:
+
+```bash
+go build ./...
+```
+
+ไม่มี output แปลว่าสำเร็จ
+
+ตรวจสอบความเข้าใจ:
+
+- คุณรัน worker สองตัวและ burst ของคำสั่งซื้อหกอันผลิตการส่งรวมหกครั้ง ไม่ใช่สิบสอง นั่นคือ property อะไรของ RabbitMQ และทำไม single-partition Kafka topic ให้ load-split เดียวกันข้าม consumer สองตัวใน group เดียวไม่ได้?
+- ทั้ง Kafka hop และ RabbitMQ hop เป็น at-least-once ลาก trace กรณีเลวร้ายสุดที่คำสั่งซื้อเดียวส่งผลให้ notification เดียวกันถูก *ส่งสองครั้ง* `Deliver` ระดับ production จะเพิ่มอะไรเพื่อให้ปลอดภัย?
+- ทำไม body ที่ล้มเหลว `json.Unmarshal` ถึงถูก dead-letter ตั้งแต่ครั้งแรกแทนที่จะ retry ในขณะที่ failure แบบ "email provider timeout" จริง ๆ ก็ไม่ควรถูกทำแบบนั้น?
+- worker import `notifier.SendJob` แทนที่จะ declare struct ก๊อปของตัวเอง อะไรพังครั้งแรกที่ producer กับ worker เห็นรูปร่างนั้นไม่ตรงกัน และการ import ร่วมกันป้องกันมันอย่างไร?
+
+## Recap
+
+`services/notification/cmd/worker/main.go` คือ binary แยกตัว — ไม่มี Kafka ที่ไหนในมัน — ที่เรียก `amqp.Client.Consume("notification.send", sender.Deliver)`, method `pkg/amqp` เดียวกับที่ [Exchanges & Queues →](/shopmicro/th/rabbitmq/exchanges-queues/) สร้างและสัญญาว่า Notification จะใช้แบบไม่แก้ `Sender.Deliver` ใน `services/notification/internal/sender/sender.go` unmarshal body ดิบแต่ละอันกลับเป็น `notifier.SendJob` ของ producer เอง "ส่ง" มัน (log บรรทัดเดียวแทน provider จริง) แล้ว return `nil` เพื่อ ack หรือ error เพื่อ dead-letter — body ที่ไม่มีวัน parse คือกรณี poison-message ที่ dead-letter ครั้งเดียวเหมาะพอดี การแยกการส่งเป็น process ของตัวเองคือ payoff ทั้งหมดของการ enqueue แทนที่จะส่ง inline: การส่งที่ช้าและพังได้จะ crash, retry, และ scale — ผ่าน **competing consumers** พิสูจน์ด้วย worker สองตัวแบ่ง burst หก job — โดยไม่เคยหยุด Kafka consumer ที่เร็วซึ่งเติม queue การที่ทั้งสอง hop เป็น at-least-once หมายความว่า `Deliver` ระดับ production จะ dedupe บน `order_id` + outcome ก่อนส่งจริง แบบเดียวกับ persisted-idempotency ที่การ charge card จริงต้องมี นั่นทำให้เซอร์วิส Notification สมบูรณ์ และพร้อมกับมันคือสถาปัตยกรรมสอง broker แบบ end to end: REST request เดียวตอนนี้ไหลผ่านห้าเซอร์วิสและทั้ง Kafka และ RabbitMQ โดยไม่มี synchronous coupling ที่ไหนเลย บทถัดไป [Resilience →](/shopmicro/th/resilience/) ถอยจาก feature มาที่การ hardening — timeout, retry พร้อม backoff, และ circuit breaker ข้ามทุก hop ที่ระบบนี้มีตอนนี้

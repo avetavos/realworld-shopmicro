@@ -1,0 +1,277 @@
+---
+title: Consuming events
+description: "services/notification/cmd/main.go และ internal/notifier/notifier.go — เซอร์วิส Notification: kafka.Consumer ใน group ของตัวเองชื่อ \"notification\" ที่อ่าน topic \"payments\" แล้วเปลี่ยน payment.succeeded/payment.failed แต่ละตัวให้เป็น send-job บน queue notification.send ของ RabbitMQ ผ่าน pkg/amqp แทนที่จะส่งแบบ inline process เดียวในระบบที่พูดทั้งสอง broker — Kafka เข้า RabbitMQ ออก ตรวจสอบด้วยการวางคำสั่งซื้อแล้วดู job โผล่บน notification.send ใน management UI"
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+`services/notification/cmd/main.go` และ `services/notification/internal/notifier/notifier.go` — เซอร์วิส Notification มันคือ `kafka.Consumer` ใน consumer group ของตัวเองชื่อ `"notification"` ที่อ่าน topic `"payments"` ซึ่ง [Process & Publish →](/shopmicro/th/payment-service/process-publish/) เติม event `payment.succeeded`/`payment.failed` ไว้แล้ว เหมือนกับ saga consumer ของ Order ที่ [The Saga Handler →](/shopmicro/th/saga/orchestration/) สร้าง แต่ตรงที่ `Handle` ของ saga อัปเดต row ใน database, `Handle` ของ Notification ทำสิ่งที่ยังไม่มีเซอร์วิสไหนในคอร์สนี้เคยทำ: มันเอาผลการชำระเงินที่เพิ่ง consume มาจาก **Kafka** ไป enqueue เป็น send-job บน queue `notification.send` ของ **RabbitMQ** ที่ [Exchanges & Queues →](/shopmicro/th/rabbitmq/exchanges-queues/) declare ไว้ โดยใช้ `pkg/amqp.Client.Publish` แบบไม่แก้เลย
+
+นี่คือ process เดียวในทั้งระบบที่พูดทั้งสอง broker พร้อมกัน — Kafka ขาเข้า RabbitMQ ขาออก — และบทนี้คือจุดที่สถาปัตยกรรมสอง broker ที่ [Architecture →](/shopmicro/th/introduction/architecture/) วาดไว้ได้รันจริงตั้งแต่ต้นจนจบ ส่วน worker ที่ดึง job พวกนั้นกลับออกมาจาก `notification.send` แล้ว "ส่ง" มันจริง ๆ คือบทถัดไป [The Send Worker →](/shopmicro/th/notification-service/worker-deliver/) บทนี้หยุดตรงวินาทีที่ job อยู่บน queue อย่างปลอดภัย
+
+## Why
+
+ประเด็นทั้งหมดของ Notification คือคำถามที่สถาปัตยกรรมตอบไว้ก่อนโค้ดจะมีสักบรรทัด: *ทำไม* ต้อง consume event จาก Kafka แค่เพื่อส่งต่อมันให้ RabbitMQ ทันที แทนที่จะส่งอีเมลตรงนั้นเลยใน Kafka handler? เพราะ "ผลการชำระเงินเกิดขึ้น" กับ "ส่ง notification อันนี้" เป็น message คนละชนิดกันจริง ๆ และระบบนี้มีเครื่องมือที่เหมาะกับแต่ละอันอยู่แล้ว event `payment.succeeded` บน Kafka คือ **fact** — ทนทาน replay ได้ อ่านแยกกันได้โดย saga ของ Order *และ* Notification *และ* เซอร์วิสตัวถัดไปที่จะถูกเพิ่มเข้ามา โดยไม่มีตัวไหนรู้จักตัวอื่น ส่วนการส่งอีเมลให้ลูกค้าคือ **job** — มันต้องเกิดขึ้นครั้งเดียว โดย worker ตัวที่ว่าง พร้อม ack ต่อ message, retry, และ dead-letter queue เมื่อ email provider ล่ม [Exchanges & Queues →](/shopmicro/th/rabbitmq/exchanges-queues/) ตั้งชื่อการแบ่งนี้ไว้ชัด: log ที่ replay ได้ของ Kafka ตอบ "ทุกฝ่ายที่สนใจเห็น fact นี้แล้วหรือยัง" ส่วน work queue ของ RabbitMQ ตอบ "มี job ที่ต้องทำครั้งเดียวไหม" Notification คือรอยต่อที่ fact กลายเป็น job
+
+การ enqueue แทนที่จะส่ง inline ยังทำให้ Kafka consumer *เร็ว* [Producer & Consumer →](/shopmicro/th/kafka/producer-consumer/) พูดไว้แล้วว่า `Consumer.Run` จะ commit offset หลัง `Handle` return เท่านั้น — ดังนั้นถ้า `Handle` ค้างรอ email provider ที่ช้า consumer ของ topic `"payments"` ทั้งตัวจะติดค้างอยู่ข้างหลังมัน และ provider ที่ล่มจะทำให้ offset หยุดเดินทั้งหมด แล้ว redeliver event เดิมทุกครั้งที่ restart การส่งงานให้ RabbitMQ แทนทำให้ `Handle` return ในระดับไมโครวินาที offset commit ทันที และทุกส่วนที่ช้าและพังได้ของการส่ง notification จริง ๆ ไปอยู่ใน process แยก (worker) ที่อ่าน queue แยก ซึ่งกลไก ack/retry/dead-letter ของ RabbitMQ ที่ [Acks, Retry & Dead Letters →](/shopmicro/th/rabbitmq/acks-retry-dlq/) สร้างไว้คือเครื่องมือที่เหมาะกับมันพอดี
+
+และ consumer group ของ Notification เป็นของตัวเอง: `NewConsumer(brokers, "notification", "payments")` saga ของ Order อ่าน topic `"payments"` เดียวกันภายใต้ group `"order"` [The Saga Handler →](/shopmicro/th/saga/orchestration/) ส่วน Notification อ่านมันภายใต้ `"notification"` กฎของ [Topics, Partitions & Consumer Groups →](/shopmicro/th/kafka/topics-groups/) คือสิ่งที่ทำให้ปลอดภัย: consumer สองตัวใน group *ต่างกัน* แต่ละตัวได้อ่าน topic ทั้งหมดแบบครบและเป็นอิสระ Notification เห็น event `payment.*` ทุกตัวที่ saga เห็น ครบถ้วน และ progress, lag, หรือ downtime ของ group ใด group หนึ่งไม่กระทบอีกฝั่ง — saga ยืนยันคำสั่งซื้อกับ Notification ส่งอีเมลแจ้งลูกค้าเรื่องเดียวกันคือ fact เดียวกัน ถูก consume สองครั้ง โดยสองเซอร์วิสที่จะไม่มีวันรู้ว่าอีกตัวมีอยู่ นี่เป็นครั้งแรกที่คอร์สนี้มี consumer group *สอง* ตัวที่รันจริงบน topic เดียวมาพิสูจน์กฎนั้น แทนที่จะแค่พูดลอย ๆ
+
+## Pros & cons
+
+**Enqueue RabbitMQ job จาก Kafka handler** เทียบกับ **ส่ง notification แบบ inline ใน handler เดียวกัน**
+
+- **Pros:** Kafka consumer ยังเร็วและ offset commit ไม่เคยรอ email/SMS provider ภายนอก ดังนั้น provider ที่ช้าหรือล่มไม่ทำให้การ consume `"payments"` ติดค้างหรือ trigger การ redeliver ของ Kafka ไม่จบ การส่งจริงได้การรับประกัน ack, retry, และ dead-letter ต่อ message ของ RabbitMQ แทน model "reprocess ทั้ง event" ของ Kafka ซึ่งเหมาะกับ "การส่งครั้งนี้ล้มเหลว ลองใหม่ / วางไว้ก่อน" มากกว่ามาก และ worker ที่ส่งจริง scale เป็นอิสระแบบ competing consumers [Exchanges & Queues →](/shopmicro/th/rabbitmq/exchanges-queues/) — เพิ่ม worker ตอน provider ช้าโดยไม่แตะฝั่ง Kafka เลย
+- **Cons:** มันคือ broker ตัวที่สองที่ต้องรัน และ hop ที่สองที่ต้องตามรอย — notification ตอนนี้ไหลผ่าน Kafka → Notification → RabbitMQ → worker แทนที่จะเป็น Kafka → handler → provider และเพราะทั้งสอง hop เป็น at-least-once (Kafka redeliver ขาเข้า, RabbitMQ redeliver ขาออก) `payment.succeeded` ที่ซ้ำตัวเดียวกลายเป็น send-job ที่ซ้ำได้ ดังนั้น worker ต้อง idempotent — ต้นทุนที่ [The Send Worker →](/shopmicro/th/notification-service/worker-deliver/) ต้องรับมือ เหมือนกับ consumer ทุกตัวในคอร์สนี้
+
+**Consumer group `"notification"` เฉพาะของตัวเอง** เทียบกับ **ใช้ saga consumer ของ Order ให้ส่ง notification ด้วย**
+
+- **Pros:** decouple สมบูรณ์ — Notification กับ saga อ่าน fact เดียวกันโดยไม่มีโค้ดหรือการประสานงานร่วมกันเลย ดังนั้น Notification จะ lag, restart, หรือ deploy เป็นอิสระได้โดยไม่เคยกระทบว่าคำสั่งซื้อจะไปถึง `CONFIRMED`/`CANCELLED` หรือไม่ และการเพิ่ม Notification ไม่ทำให้ saga, Payment, หรือ Order เสียอะไรเลย — ไม่มีโค้ดในตัวไหนเปลี่ยนเพื่อให้เซอร์วิสนี้เกิดขึ้น
+- **Cons:** สอง group อิสระต่าง deserialize event `payment.*` ทุกตัวจาก topic — การทำงานซ้ำคงที่เล็ก ๆ เทียบกับ consumer เดียวที่ทำทั้ง update state และ notification ในรอบเดียว ซึ่งในสเกลนี้เล็กน้อยมาก แต่คือ trade ที่ตรงไปตรงมาแลกกับการ decouple
+
+## Set it up
+
+### 1. `services/notification/internal/notifier/notifier.go`
+
+```go
+// Package notifier is the Notification service's core: it consumes payment
+// result events from Kafka and enqueues one send-job per event onto the
+// notification.send RabbitMQ work queue, instead of delivering inline. The
+// worker (a separate process) drains that queue and does the actual send.
+package notifier
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/avetavos/shopmicro/pkg/amqp"
+	"github.com/avetavos/shopmicro/pkg/events"
+)
+
+// result is the payload Payment publishes on every payment.* event — the
+// same shape as processor.Result over in the Payment service. Notification
+// only needs to read it, so it declares its own local copy rather than
+// importing Payment's internal package.
+type result struct {
+	OrderID     string `json:"order_id"`
+	AmountCents int64  `json:"amount_cents"`
+	Reason      string `json:"reason,omitempty"`
+}
+
+// SendJob is the body of a notification.send message: everything the worker
+// needs to deliver one notification, and nothing it doesn't. The worker
+// (next lesson) unmarshals exactly this shape.
+type SendJob struct {
+	OrderID     string `json:"order_id"`
+	Outcome     string `json:"outcome"` // "succeeded" or "failed"
+	AmountCents int64  `json:"amount_cents"`
+	Message     string `json:"message"`
+}
+
+// Notifier turns each payment result event into a notification.send job.
+type Notifier struct {
+	amqp *amqp.Client
+}
+
+// New returns a Notifier that enqueues jobs through client.
+func New(client *amqp.Client) *Notifier {
+	return &Notifier{amqp: client}
+}
+
+// Handle implements the Consumer.Run handle signature. It ignores every
+// event.Type except "payment.succeeded"/"payment.failed", builds a
+// customer-facing SendJob from the payment result, and publishes it to the
+// notification.send queue. It never delivers anything itself — returning
+// nil commits the Kafka offset the instant the job is safely on the queue.
+func (n *Notifier) Handle(ctx context.Context, e events.Event) error {
+	if e.Type != "payment.succeeded" && e.Type != "payment.failed" {
+		return nil
+	}
+
+	var r result
+	if err := json.Unmarshal(e.Payload, &r); err != nil {
+		return fmt.Errorf("notifier: unmarshal payment result: %w", err)
+	}
+
+	job := SendJob{OrderID: r.OrderID, AmountCents: r.AmountCents}
+	if e.Type == "payment.succeeded" {
+		job.Outcome = "succeeded"
+		job.Message = fmt.Sprintf("Your order %s is confirmed — payment of %d cents went through.", r.OrderID, r.AmountCents)
+	} else {
+		job.Outcome = "failed"
+		job.Message = fmt.Sprintf("Your order %s could not be completed: %s.", r.OrderID, r.Reason)
+	}
+
+	body, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("notifier: marshal send-job: %w", err)
+	}
+
+	if err := n.amqp.Publish(ctx, "notification.send", body); err != nil {
+		return fmt.Errorf("notifier: enqueue send-job for order %s: %w", r.OrderID, err)
+	}
+
+	return nil
+}
+```
+
+บันทึกไฟล์นี้เป็น `services/notification/internal/notifier/notifier.go` มีบางจุดที่ควรพูดถึง:
+
+- **`Handle` มี signature `func(context.Context, events.Event) error` ตรงกับที่ `Consumer.Run` ต้องการพอดี** — รูปแบบเดียวกับ `Processor.Handle` ของ Payment และ `Handler.Handle` ของ saga ดังนั้นการต่อสายมันเข้า `consumer.Run` ต่อไปไม่ต้องใช้ adapter เลย ตัว filter — ignore อะไรก็ตามที่ไม่ใช่ผลการชำระเงิน `return nil` เพื่อให้ offset ยัง commit — คือ pattern สองบรรทัดเดียวกับที่ Kafka handler ทุกตัวในคอร์สนี้เปิดหัวด้วย
+- **มัน unmarshal `e.Payload` (ต่างจาก saga handler ที่ไม่ทำ)** saga ต้องการแค่ order id กับ success flag ซึ่งอยู่บน envelope ทั้งคู่ ส่วน Notification อยากได้ *จำนวนเงิน* สำหรับ message ที่ส่งให้ลูกค้า และมันอยู่แค่ใน `amount_cents` ของ payload เท่านั้น `Reason` ถูก set เฉพาะบน `payment.failed` (Payment mark ไว้เป็น `omitempty`) ซึ่งก็คือ branch ล้มเหลวที่อ่านมันพอดี
+- **ผู้รับเป็นการทำให้ง่ายอย่างตั้งใจ** event ผลการชำระเงินพก `order_id` กับจำนวนเงิน แต่ไม่มีอีเมลหรือเบอร์ของลูกค้า — ดังนั้น `SendJob` อธิบาย *อะไรเกิดขึ้นกับคำสั่งซื้อไหน* และปล่อยเรื่อง *ติดต่อใครอย่างไร* ไว้ให้ worker เซอร์วิส Notification จริง ๆ จะ resolve ข้อมูลติดต่อของลูกค้าตรงนี้ (lookup ด้วย `order_id` หรือ `customer_id` ที่พกมากับ event) แบบเดียวกับที่ [Process & Publish →](/shopmicro/th/payment-service/process-publish/) พูดชัดว่าเซอร์วิส Payment จริงจะต่อ card network จริง กลไกสอง broker ที่ module นี้สอนเหมือนกันทั้งสองแบบ
+
+### 2. `services/notification/cmd/main.go`
+
+```go
+// Command notification runs the Notification service: a Kafka consumer in
+// its own "notification" group reading the "payments" topic, whose handler
+// enqueues a send-job onto the notification.send RabbitMQ queue for each
+// payment result. The worker that drains that queue is a separate binary
+// (cmd/worker). This process speaks both brokers: Kafka in, RabbitMQ out.
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+
+	"github.com/avetavos/shopmicro/pkg/amqp"
+	"github.com/avetavos/shopmicro/pkg/config"
+	"github.com/avetavos/shopmicro/pkg/kafka"
+	"github.com/avetavos/shopmicro/services/notification/internal/notifier"
+)
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	brokers := strings.Split(config.Get("KAFKA_BROKERS", "localhost:9092"), ",")
+	rabbitURL := config.Get("RABBITMQ_URL", "amqp://shopmicro:shopmicro@localhost:5672/")
+
+	amqpClient, err := amqp.Connect(rabbitURL)
+	if err != nil {
+		log.Fatalf("notification: connect to rabbitmq: %v", err)
+	}
+	defer amqpClient.Close()
+
+	if err := amqpClient.DeclareTopology(); err != nil {
+		log.Fatalf("notification: declare rabbitmq topology: %v", err)
+	}
+
+	n := notifier.New(amqpClient)
+
+	consumer := kafka.NewConsumer(brokers, "notification", "payments")
+	defer consumer.Close()
+
+	go func() {
+		if err := consumer.Run(ctx, n.Handle); err != nil {
+			log.Printf("notification: consumer stopped: %v", err)
+		}
+	}()
+
+	log.Println("notification: consumer started, group=notification topic=payments")
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Println("notification: shutting down")
+	cancel()
+}
+```
+
+บันทึกไฟล์นี้เป็น `services/notification/cmd/main.go` รูปแบบเป็น composition root เดียวกับที่ทุกเซอร์วิสในคอร์สนี้มี: สร้าง dependency เริ่ม loop ระยะยาวใน goroutine แล้ว shutdown บน `SIGINT`/`SIGTERM` สิ่งเดียวที่ใหม่คือมันสร้าง client *สอง* ตัว — `kafka.Consumer` กับ `amqp.Client` — แล้วเรียก `amqpClient.DeclareTopology()` ตอน startup call นั้น idempotent [Exchanges & Queues →](/shopmicro/th/rabbitmq/exchanges-queues/): การ declare queue `notification.send` และ dead-letter setup ของมันซ้ำไม่ทำอะไรถ้า worker (หรือ run ก่อนหน้า) declare ไว้แล้ว ดังนั้นปลอดภัยที่ทั้งเซอร์วิส Notification และ worker จะ declare topology เดียวกันแยกกัน — ตัวไหนเริ่มก่อนชนะ อีกตัว call เป็น no-op `consumer.Run` block จนกว่า `ctx` จะถูก cancel จึงเป็น goroutine `cancel()` ตอน shutdown คลายมันออก และ `amqpClient.Close()` กับ `consumer.Close()` ที่ defer ไว้ปล่อย connection ของทั้งสอง broker
+
+## Verify
+
+ยก Postgres, Kafka, **และ RabbitMQ** ขึ้นมา — Notification ต้องการทั้งสามตัว — แล้วรัน Catalog, Order, gateway, และ Payment แบบเดียวกับที่ [The Saga Handler →](/shopmicro/th/saga/orchestration/) ทิ้งไว้:
+
+```bash
+cd deploy/compose && docker compose up -d postgres kafka rabbitmq
+```
+
+```bash
+go run ./services/catalog/cmd
+```
+
+```bash
+go run ./services/order/cmd
+```
+
+```bash
+go run ./gateway/cmd
+```
+
+```bash
+go run ./services/payment/cmd
+```
+
+เริ่มเซอร์วิส Notification — แต่ **ยัง** ไม่ต้องเริ่ม worker เพื่อให้ job ที่มัน enqueue นั่งอยู่บน queue ที่คุณเห็นได้:
+
+```bash
+go run ./services/notification/cmd
+```
+
+```txt
+notification: consumer started, group=notification topic=payments
+```
+
+สร้างคำสั่งซื้อขนาดเล็ก ต่ำกว่า limit $5,000 ของ Payment:
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
+```
+
+ภายในไม่กี่วินาที — เวลาที่ outbox relay publish `order.created`, Payment publish `payment.succeeded`, และ Notification consume มัน — send-job หนึ่งอันนั่งอยู่บน `notification.send` แล้ว ยืนยันใน management UI ที่ [http://localhost:15672](http://localhost:15672) (login `shopmicro` / `shopmicro`) → **Queues and Streams** → `notification.send`: **Messages Ready** เป็น `1` คลิกที่ queue เปิด **Get messages** แล้วอ่าน body (ใช้ **Requeue: Yes** เพื่อไม่ให้ consume มันไป):
+
+```json
+{"order_id":"3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90","outcome":"succeeded","amount_cents":2598,"message":"Your order 3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90 is confirmed — payment of 2598 cents went through."}
+```
+
+job นั้นถูกผลิตโดย event ของ **Kafka** และตอนนี้รออยู่บน queue ของ **RabbitMQ** — hop สอง broker พิสูจน์แล้ว สังเกตว่า `notification.send` มี message *ready* และไม่มี consumer ดึงมันออก: ไม่มีอะไรหายระหว่างที่ worker ยัง down เพราะ durable queue เก็บ job ไว้จนกว่า worker จะ ack มัน ตรงตามการรับประกันที่ [Exchanges & Queues →](/shopmicro/th/rabbitmq/exchanges-queues/) สร้าง ทีนี้วางคำสั่งซื้อขนาดใหญ่เพื่อดู message ล้มเหลวถูก enqueue ด้วย:
+
+```bash
+curl -s -X POST localhost:8080/v1/products \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Server Rack","description":"42U enterprise rack","price_cents":600000,"stock":5}'
+```
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"7b23f5a1-4c9d-4e8a-b2a5-1e3f4a9b21c8","quantity":1}]}'
+```
+
+`notification.send` ตอนนี้แสดง `2` messages ready; body ของอันที่สองพก `"outcome":"failed"` และ `message` ที่ลงท้ายด้วย `could not be completed: amount exceeds limit.` — handler เดียวกัน branch บน `e.Type` หยุด Notification ด้วย `Ctrl-C`:
+
+```txt
+notification: shutting down
+```
+
+แล้วยืนยันว่า module ยังคง build ผ่าน:
+
+```bash
+go build ./...
+```
+
+ไม่มี output แปลว่าสำเร็จ
+
+ตรวจสอบความเข้าใจ:
+
+- saga ของ Order และ Notification ต่าง consume topic `"payments"` อะไรคือบรรทัดเดียวในแต่ละเซอร์วิสที่รับประกันว่าแต่ละตัวเห็น payment event *ทุกตัว* แบบเป็นอิสระ และอะไรจะพังถ้าพวกมันแชร์มัน?
+- ทำไม `Handle` ถึง enqueue RabbitMQ job แล้ว return แทนที่จะส่ง notification เอง? อะไรกันแน่ที่จะติดค้างถ้ามันส่ง inline แล้ว email provider ค้างไป 30 วินาที?
+- send-job ทิ้ง `notification.send` ไว้พร้อม message สองอันที่ *ready* และไม่มี consumer message พวกนั้นจะอยู่ที่ไหนถ้า `notification.send` ถูก declare เป็น non-durable แล้ว broker restart?
+- `Handle` unmarshal `e.Payload` แต่ `Handler.Handle` ของ saga ไม่เคยทำ ทำไม Notification ต้องการ payload ในเมื่อ saga ไม่ต้องการ?
+
+## Recap
+
+`Notifier.Handle` ใน `services/notification/internal/notifier/notifier.go` เป็น Kafka handler ที่มีรูปแบบเดียวกับตัวอื่นทุกตัวในคอร์สนี้ — filter หา `payment.succeeded`/`payment.failed`, `return nil` สำหรับทุกอย่างที่เหลือ — แต่แทนที่จะแตะ database มันสร้าง `SendJob` ที่ส่งให้ลูกค้าแล้วเรียก `amqp.Client.Publish(ctx, "notification.send", body)` เปลี่ยน **fact** ของ Kafka ให้เป็น **job** ของ RabbitMQ `services/notification/cmd/main.go` คือ process เดียวในระบบนี้ที่ถือทั้ง `kafka.Consumer` (group `"notification"` ของตัวเองบน `"payments"`) และ `amqp.Client` declare RabbitMQ topology แบบ idempotent ตอน startup แล้ว shutdown ทั้งคู่บน context ที่ cancel ได้ร่วมกัน เพราะมัน enqueue แทนที่จะส่ง inline, Kafka offset commit ในระดับไมโครวินาที และทุกส่วนที่ช้าและพังได้ของการส่งถูกดันไปอยู่ใน queue แยก — และเพราะ `"notification"` เป็น consumer group ของตัวเอง มันอ่าน payment stream เดียวกับ saga ของ Order โดยไม่มีการ coupling ระหว่างกันเลย ครั้งแรกที่คอร์สนี้มีสอง group รันจริงบน topic เดียวมาพิสูจน์สิ่งนั้น `curl` ผ่าน gateway วาง job จริงสองอันบน `notification.send` เห็นได้และ durable ใน management UI โดยยังไม่มี worker รันมา consume บทถัดไป [The Send Worker →](/shopmicro/th/notification-service/worker-deliver/) คือ binary แยกที่ดึง queue นั้น "ส่ง" notification แต่ละอัน แล้ว ack มัน — เอากลไก ack/retry/dead-letter จาก [Acks, Retry & Dead Letters →](/shopmicro/th/rabbitmq/acks-retry-dlq/) มาใช้จริง
