@@ -1,0 +1,283 @@
+---
+title: Timeouts & retries
+description: "pkg/resilience — two grpc.UnaryClientInterceptors (a per-call deadline and a retry-with-backoff for idempotent calls) plus a DialOptions helper, wired into the gateway's and Order's gRPC clients so every synchronous hop is bounded and self-healing. Why only idempotent RPCs retry, why chain order decides per-attempt vs total timeout, and full jitter. Verified by killing Catalog mid-request and watching a call retry, back off, and recover."
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+`pkg/resilience/interceptor.go` — a small package of `grpc.UnaryClientInterceptor`s and a `DialOptions()` helper that every gRPC *client* in this system routes through. Two interceptors this lesson: `TimeoutInterceptor` bounds each call with a `context.WithTimeout` deadline, and `RetryInterceptor` retries a call that failed with a transient code (`Unavailable`, `DeadlineExceeded`) up to a few times, with exponential backoff and jitter — but only for **idempotent** methods. Then a one-line change at both existing call sites: the gateway's `Register*ServiceHandlerFromEndpoint` dial options [grpc-gateway →](/shopmicro/en/gateway/grpc-gateway/) and Order's `grpc.NewClient` to Catalog [The gRPC Server →](/shopmicro/en/order-service/grpc-server/) both stop passing a bare `insecure.NewCredentials()` and pass `resilience.DialOptions()` instead.
+
+This is the module [The gRPC Server →](/shopmicro/en/order-service/grpc-server/) promised when it accepted, deliberately, that "calling Catalog live rather than caching price data locally keeps price accuracy free at the cost of a runtime dependency between the two services — a trade-off this course hardens later in Resilience." This is later. The async hops don't need this — Kafka redelivery [Producer & Consumer →](/shopmicro/en/kafka/producer-consumer/) and RabbitMQ's ack/retry/dead-letter [Acks, Retry & Dead Letters →](/shopmicro/en/rabbitmq/acks-retry-dlq/) already give the event and work-queue paths at-least-once delivery. It's the **synchronous gRPC** calls, where a caller blocks on a live network round trip to another process, that have had no timeout and no retry until now.
+
+## Why
+
+A gRPC call with no deadline is a call that can block forever. Every `invoker(ctx, ...)` in this system so far ran on a `context.Background()` that never expires — if Catalog accepts Order's TCP connection but then hangs (a deadlock, a saturated connection pool, a GC pause that never ends), Order's `CreateOrder` waits on that call with no upper bound, and every request piling up behind it waits too. That's how one slow dependency turns into a system-wide outage: not because the dependency returned an error, but because it *didn't return at all*, and nobody set a limit on the waiting. `TimeoutInterceptor` sets that limit centrally — a `context.WithTimeout` wrapped around every outgoing call — so a hung Catalog costs the caller at most `defaultTimeout`, then comes back as a clean `codes.DeadlineExceeded` the caller can actually handle. It's the exact same discipline the `http.Server` timeouts [grpc-gateway →](/shopmicro/en/gateway/grpc-gateway/) already applied to inbound HTTP, now applied to outbound gRPC.
+
+Retries answer a different failure: not "the dependency is hung" but "the dependency blipped." A rolling deploy of Catalog, a pod rescheduled onto another node, a brief network partition — these surface as `codes.Unavailable`, and they're usually gone within a second. Failing the whole request on the first blip is needlessly fragile when a single retry a few hundred milliseconds later would have sailed through. `RetryInterceptor` does exactly that: on a transient code, wait a short backoff and try again, up to `maxAttempts`. But retrying has a sharp edge — **it is only safe for idempotent calls**. Retrying `GetProduct` costs nothing but a second read; retrying `CreateOrder` after an `Unavailable` risks creating *two* orders, if the first attempt actually reached Catalog and committed but the *response* was lost on the way back. So the interceptor gates every retry behind an `idempotent(method)` check — it retries reads (`Get*`, `List*`) and never retries mutations, which is the concrete, code-level meaning of the "idempotency" [the roadmap](/shopmicro/en/introduction/roadmap/) lists as a resilience concern.
+
+Two design details are worth being explicit about, because both are easy to get subtly wrong:
+
+- **Backoff uses jitter, not a fixed delay.** If every caller that hit a blip retried after exactly 200ms, they'd all retry *at the same instant*, hammering the recovering dependency in synchronized waves — a "thundering herd" that can keep a service that's trying to come back down. `jitteredBackoff` spreads retries out: an exponentially growing window (`base`, then `2×base`, …) with a random component inside it, so no two callers retry in lockstep.
+- **Chain order decides whether the timeout is per-attempt or total.** `DialOptions` chains `RetryInterceptor` *outside* `TimeoutInterceptor`, which means each individual attempt gets its own fresh `defaultTimeout`, and the retry loop wraps all of them. Chain them the other way — timeout outside retry — and a single deadline would span the whole retry sequence, so a slow first attempt could leave no time for a second. Per-attempt timeout with a bounded attempt count is the more predictable of the two: worst-case latency is `maxAttempts × defaultTimeout`, and every attempt gets a real chance to succeed.
+
+## Pros & cons
+
+**A shared interceptor package every client dials through** vs. **timeouts and retries hand-written at each call site**
+
+- **Pros:** one place defines the policy, and every gRPC client in the system — the gateway's two connections, Order's Catalog client, and any service added later — gets identical, correct behavior by calling `resilience.DialOptions()`; the business code (`CreateOrder`, the gateway handlers) stays completely unaware that retries or deadlines exist, exactly as it should; changing the timeout or backoff is a one-line edit in one file, not a hunt across every `invoker` call.
+- **Cons:** an interceptor is invisible at the call site — someone reading `CreateOrder` sees a plain gRPC call and has no local hint that it may be retried or time out, so the behavior has to be *known*, not read; and a single global policy is blunt, since a fast read and a slow report-generation RPC really might want different deadlines, which a one-size `DialOptions` doesn't express until you add per-method configuration.
+
+**A hand-written retry interceptor (this lesson)** vs. **gRPC's built-in retry via `grpc.WithDefaultServiceConfig`**
+
+- **Pros:** the hand-written version is fully visible and debuggable — you can log each attempt, and the idempotency gate is plain Go you control; it needs no service-config JSON, and it makes the "only retry idempotent methods" rule explicit in code rather than buried in a per-method policy document.
+- **Cons:** gRPC ships a mature, well-tested retry mechanism configured through a service-config JSON (retryable codes, backoff, max attempts, hedging) that a production system would usually prefer over rolling its own; the hand-written interceptor is here because it makes every moving part *teachable*, not because it's more capable than the built-in one — a real deployment might well switch to the built-in policy once the concepts are understood.
+
+## Set it up
+
+First, the package:
+
+### 1. `pkg/resilience/interceptor.go`
+
+```go
+// Package resilience hardens this system's synchronous gRPC calls. It
+// provides grpc.UnaryClientInterceptors — a per-call timeout and a
+// retry-with-backoff for idempotent methods — and a DialOptions helper
+// that every gRPC client in the system dials through, so a slow or briefly
+// unavailable dependency degrades gracefully instead of hanging or failing
+// on the first blip.
+package resilience
+
+import (
+	"context"
+	"log"
+	"math/rand/v2"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+)
+
+const (
+	defaultTimeout = 3 * time.Second
+	maxAttempts    = 3
+	baseBackoff    = 100 * time.Millisecond
+)
+
+// DialOptions returns the grpc.DialOptions every service uses to reach
+// another: insecure transport (local dev), then a chain of client
+// interceptors. Chain order matters — RetryInterceptor is outermost and
+// TimeoutInterceptor is innermost, so each individual attempt gets its own
+// fresh deadline and the retry loop wraps all of them.
+func DialOptions() []grpc.DialOption {
+	return []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithChainUnaryInterceptor(
+			RetryInterceptor(maxAttempts, baseBackoff),
+			TimeoutInterceptor(defaultTimeout),
+		),
+	}
+}
+
+// TimeoutInterceptor bounds every call it wraps with timeout — unless the
+// caller already set an earlier deadline of their own, which is always
+// respected. A hung dependency now costs the caller at most timeout before
+// returning codes.DeadlineExceeded.
+func TimeoutInterceptor(timeout time.Duration) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if _, ok := ctx.Deadline(); !ok {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+}
+
+// RetryInterceptor retries a call that fails with a transient code, up to
+// maxAttempts times, waiting a jittered exponential backoff between tries —
+// but only for idempotent methods, since retrying a mutation risks
+// performing it twice. A non-idempotent method, or a non-transient error,
+// is returned on the first failure.
+func RetryInterceptor(maxAttempts int, base time.Duration) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		var err error
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			err = invoker(ctx, method, req, reply, cc, opts...)
+			if err == nil || !retryable(err) || !idempotent(method) {
+				return err
+			}
+			if attempt == maxAttempts {
+				break
+			}
+
+			backoff := jitteredBackoff(base, attempt)
+			log.Printf("resilience: %s failed (attempt %d/%d), retrying in %s: %v", method, attempt, maxAttempts, backoff, err)
+
+			select {
+			case <-ctx.Done():
+				return status.FromContextError(ctx.Err()).Err()
+			case <-time.After(backoff):
+			}
+		}
+		return err
+	}
+}
+
+// retryable reports whether err is a transient failure worth retrying — the
+// dependency was briefly unreachable or too slow, not a permanent rejection.
+func retryable(err error) bool {
+	switch status.Code(err) {
+	case codes.Unavailable, codes.DeadlineExceeded:
+		return true
+	default:
+		return false
+	}
+}
+
+// idempotent reports whether the RPC named by fullMethod is safe to call
+// more than once. This system follows the convention that Get* and List*
+// RPCs are reads with no side effect; everything else (Create*, and any
+// future mutation) is treated as unsafe to retry. It's a naming
+// convention, not a guarantee — a production system would mark idempotency
+// explicitly per method rather than infer it from a prefix.
+func idempotent(fullMethod string) bool {
+	name := fullMethod[strings.LastIndex(fullMethod, "/")+1:]
+	return strings.HasPrefix(name, "Get") || strings.HasPrefix(name, "List")
+}
+
+// jitteredBackoff returns a delay in [window/2, window], where window grows
+// exponentially with the attempt number (base, 2*base, 4*base, ...). The
+// random half is "equal jitter": it keeps a sensible minimum wait while
+// still spreading concurrent callers out, so a recovering dependency isn't
+// hit by synchronized retry waves.
+func jitteredBackoff(base time.Duration, attempt int) time.Duration {
+	window := base * time.Duration(1<<(attempt-1))
+	half := window / 2
+	return half + time.Duration(rand.Int64N(int64(half)+1))
+}
+```
+
+Save this as `pkg/resilience/interceptor.go`.
+
+### 2. Route the gateway's clients through it
+
+In `gateway/cmd/main.go`, replace the hand-built dial-options slice [grpc-gateway →](/shopmicro/en/gateway/grpc-gateway/):
+
+```go
+opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+```
+
+with the shared one:
+
+```go
+opts := resilience.DialOptions()
+```
+
+Add `"github.com/avetavos/shopmicro/pkg/resilience"` to the imports and drop the now-unused `"google.golang.org/grpc/credentials/insecure"` import. Both `RegisterCatalogServiceHandlerFromEndpoint` and `RegisterOrderServiceHandlerFromEndpoint` already take that `opts` slice, so both of the gateway's gRPC connections are now bounded and retrying with no further change.
+
+### 3. Route Order's Catalog client through it
+
+In `services/order/cmd/main.go`, replace the dial [The gRPC Server →](/shopmicro/en/order-service/grpc-server/):
+
+```go
+catalogConn, err := grpc.NewClient(catalogAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+```
+
+with:
+
+```go
+catalogConn, err := grpc.NewClient(catalogAddr, resilience.DialOptions()...)
+```
+
+Add the `pkg/resilience` import and, again, drop `insecure` if it's no longer referenced elsewhere in the file. Order's live `GetProduct` call to price each line item now retries automatically on a transient blip — and because `GetProduct` starts with `Get`, `idempotent` returns true, so it's allowed to.
+
+## Verify
+
+Bring up Postgres and run Catalog, Order, and the gateway:
+
+```bash
+cd deploy/compose && docker compose up -d postgres
+```
+
+```bash
+go run ./services/catalog/cmd
+```
+
+```bash
+go run ./services/order/cmd
+```
+
+```bash
+go run ./gateway/cmd
+```
+
+First, the happy path — the interceptors are completely transparent when nothing fails. Create a product and list it back:
+
+```bash
+curl -s -X POST localhost:8080/v1/products \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Coffee Mug","description":"350ml ceramic mug","price_cents":1299,"stock":50}'
+```
+
+```bash
+curl -s localhost:8080/v1/products
+```
+
+Both return exactly what they did before this module — a bounded, retrying call that *succeeds* looks identical to one with no interceptors at all.
+
+Now prove the retry. Stop the **Catalog** process with `Ctrl-C`, leaving Order and the gateway running. Then place an order, which forces Order to call Catalog for pricing:
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
+```
+
+In **Order's** terminal, watch the retry interceptor try, back off, and try again — the `GetProduct` call is idempotent, so it's allowed to retry:
+
+```txt
+resilience: /shopmicro.catalog.v1.CatalogService/GetProduct failed (attempt 1/3), retrying in 78ms: rpc error: code = Unavailable desc = ...
+resilience: /shopmicro.catalog.v1.CatalogService/GetProduct failed (attempt 2/3), retrying in 143ms: rpc error: code = Unavailable desc = ...
+```
+
+After the third attempt fails, `CreateOrder` returns `codes.Unavailable`, which the gateway maps to **HTTP 503** [REST Mapping →](/shopmicro/en/gateway/rest-mapping/) — a clean, fast failure, not a hung request. Now start Catalog again:
+
+```bash
+go run ./services/catalog/cmd
+```
+
+Re-run the same order within a second or two. This time an early attempt lands while Catalog is back, and the order is created — the call *self-healed* across a dependency restart, which is the entire point:
+
+```json
+{
+  "id": "3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90",
+  "status": "ORDER_STATUS_PENDING",
+  "totalCents": "2598"
+}
+```
+
+One thing you will *not* see: a retry on a write. `CreateOrder` itself is not idempotent, so if you stop **Order** and POST an order, the gateway's call to Order fails on the first attempt with no retry lines at all — `idempotent("/shopmicro.order.v1.OrderService/CreateOrder")` is false, exactly as intended, because retrying a create could place the same order twice.
+
+Then confirm the module still builds:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+Check your understanding:
+
+- `DialOptions` chains `RetryInterceptor` outside `TimeoutInterceptor`. What would change about the worst-case latency and per-attempt behavior if you swapped their order?
+- Why is `GetProduct` retried on `Unavailable` but `CreateOrder` is not? Walk through the specific bad outcome retrying `CreateOrder` could cause.
+- What failure does `TimeoutInterceptor` protect against that `RetryInterceptor` does nothing for, and vice versa? Why does the system need both?
+- Why does `jitteredBackoff` add randomness instead of waiting a fixed 100ms, 200ms, 400ms? What goes wrong for a *recovering* dependency if a hundred callers all retry on the same fixed schedule?
+
+## Recap
+
+`pkg/resilience/interceptor.go` gives this system two `grpc.UnaryClientInterceptor`s and a `DialOptions()` helper every gRPC client dials through. `TimeoutInterceptor` wraps each call in a `context.WithTimeout` so a hung dependency costs at most `defaultTimeout` instead of blocking forever; `RetryInterceptor` retries a transient `Unavailable`/`DeadlineExceeded` up to `maxAttempts` with jittered exponential backoff — but only for idempotent `Get*`/`List*` methods, never a mutation, because retrying a create could perform it twice. Chained retry-outside-timeout, each attempt gets its own fresh deadline with a predictable `maxAttempts × defaultTimeout` worst case. The gateway's two connections and Order's Catalog client all swapped their bare `insecure.NewCredentials()` for `resilience.DialOptions()`, so every synchronous hop is now bounded and self-healing while the business code stays oblivious to any of it. Killing Catalog mid-request proved it: an idempotent `GetProduct` retried, backed off, and either failed cleanly as HTTP 503 or self-healed the moment Catalog returned, while a non-idempotent `CreateOrder` correctly refused to retry at all. Next, [Circuit breakers →](/shopmicro/en/resilience/circuit-breaker/) adds the piece retries alone can't give you — when a dependency is *durably* down, retrying every request just wastes time and load, so the breaker trips and fails fast until the dependency proves it has recovered.

@@ -1,0 +1,239 @@
+---
+title: Circuit breakers
+description: "pkg/resilience/breaker.go — a gobreaker-backed grpc.UnaryClientInterceptor added to DialOptions, so a durably-down dependency trips the breaker and every call fails fast with codes.Unavailable instead of wasting a full timeout-and-retry budget. Why only infrastructure failures count toward tripping (not NotFound/InvalidArgument), the closed/open/half-open states, and what graceful degradation means on a write path. Verified by holding Catalog down and watching calls flip from slow-retry to instant-fail, then recover."
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+`pkg/resilience/breaker.go` — a third `grpc.UnaryClientInterceptor`, `BreakerInterceptor`, backed by `sony/gobreaker`, added as the *outermost* link in the chain `DialOptions()` [Timeouts & retries →](/shopmicro/en/resilience/timeouts-retries/) already builds. No call site changes: the gateway and Order already dial through `resilience.DialOptions()`, so wiring the breaker into that one helper hardens every synchronous hop at once. This lesson also frames the question the breaker forces the caller to answer — **graceful degradation**: when the breaker is open and a call fails instantly, what should `CreateOrder` actually *do*?
+
+## Why
+
+Retries fix a *blip* — a dependency that's down for a second and back. They actively hurt a *durable* outage. If Catalog is down for two minutes, every single order placed in those two minutes still pays the full price [Timeouts & retries →](/shopmicro/en/resilience/timeouts-retries/) charges for a failure: three attempts, each waiting up to a 3-second timeout, plus backoff between them — the better part of ten seconds of a caller's time and three doomed network attempts, per request, to arrive at the same `Unavailable` the first attempt already knew. Multiply that by every in-flight request and the retries themselves become load on a dependency that's trying to recover, and a pile of goroutines blocked for ten seconds each on the caller's side. Retrying is the right move for a blip and the wrong move for an outage, and the caller can't tell which it's in from a single request.
+
+A **circuit breaker** is the component that can tell, because it remembers. It watches the outcomes of recent calls to a dependency and keeps a state:
+
+- **Closed** (healthy): calls pass straight through. Every failure is counted.
+- **Open** (tripped): once failures cross a threshold, the breaker "opens" and every call returns *immediately* with an error — no network attempt, no timeout, no retry. This is the whole point: when the dependency is known-down, stop spending time and load discovering it over and over.
+- **Half-open** (testing recovery): after a cooldown, the breaker lets a single trial call through. If it succeeds, the breaker closes and normal traffic resumes; if it fails, the breaker opens again for another cooldown.
+
+Placed *outermost* in the interceptor chain, the breaker short-circuits before the retry loop even starts — so a tripped breaker means zero retries and zero timeouts, just an instant `codes.Unavailable`. That ordering is deliberate and the inverse of a mistake: if the breaker sat *inside* the retry loop, the retry interceptor would cheerfully retry the breaker's own open-state errors, which is exactly the wasted work the breaker exists to stop.
+
+The subtle correctness detail is **what counts as a failure**. A breaker must trip on *infrastructure* failures — the dependency is unreachable or hung (`Unavailable`, `DeadlineExceeded`) — and must **not** trip on *business* failures. A `GetProduct` that returns `codes.NotFound` because the product id doesn't exist, or `codes.InvalidArgument` because the request was malformed, is the dependency working *perfectly* — it correctly rejected a bad request. If those counted toward tripping, a burst of 404s from clients requesting missing products would open the breaker and knock out Catalog for every *valid* request too — a self-inflicted outage caused by normal client errors. So `BreakerInterceptor` reports only infrastructure-coded errors to the breaker, and passes every business error straight through to the caller without the breaker ever seeing it as a failure.
+
+Then there's the question the breaker hands to the caller. When the breaker is open, `CreateOrder`'s call to Catalog fails *instantly* with `Unavailable` — which is strictly better than failing slowly, but it's still a failure, and now the caller has to decide how to **degrade**:
+
+- On this **write path**, the honest answer is **fail fast and cleanly**. Order genuinely cannot price an order without Catalog's current prices — there is no safe fallback that invents a price — so `CreateOrder` returns the `Unavailable` up to the gateway, which becomes an HTTP 503 the client can retry later. Crucially, this failure happens *before* any database write or outbox row, so there is no half-created order, no orphaned state, nothing to clean up. Graceful degradation on a write that can't proceed means failing in a way that leaves the system exactly as it was.
+- On a **read path**, degradation can sometimes do better than fail. A product listing could serve slightly stale data from a cache, or return a partial response with a "some data unavailable" flag, rather than a hard error — trading freshness for availability. This course doesn't build that cache (it would be a lesson in its own right), but the breaker is what makes the *choice* explicit: fast failure is the floor, and a read path can choose to climb above it.
+
+## Pros & cons
+
+**A circuit breaker in front of a durably-down dependency** vs. **retries alone**
+
+- **Pros:** once tripped, calls fail in microseconds instead of burning a full timeout-and-retry budget each, which both frees the caller's goroutines and stops piling retry load onto a dependency that's trying to recover; the half-open state gives automatic, cheap recovery detection — one trial call, not a flood — so the system heals itself the moment the dependency is genuinely back.
+- **Cons:** a breaker adds real state and tuning that a bare retry doesn't — trip threshold, cooldown, half-open request count are all knobs that, set wrong, either trip too eagerly (hurting availability on a brief wobble) or too late (defeating the fast-fail purpose); and an open breaker fails requests that *might* have succeeded, since it's extrapolating from recent failures to the next call — a deliberate, occasionally-wrong bet that the dependency is still down.
+
+**Counting only infrastructure errors toward tripping** vs. **counting every non-nil error**
+
+- **Pros:** the breaker trips on what it's meant to detect — the dependency being unreachable — and stays closed through normal business rejections, so a storm of `NotFound`/`InvalidArgument` from bad client requests can never open the breaker and turn ordinary 404s into a full outage for valid traffic.
+- **Cons:** it means classifying every error by gRPC code, and the classification has to stay correct as the services evolve — a genuinely broken Catalog that (wrongly) returned `InvalidArgument` for everything would sail past the breaker, since the interceptor trusts the code to mean what it says; the breaker is only as good as the honesty of the status codes it inspects.
+
+## Set it up
+
+### 1. `pkg/resilience/breaker.go`
+
+Pull in the breaker library:
+
+```bash
+go get github.com/sony/gobreaker/v2
+```
+
+```go
+package resilience
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/sony/gobreaker/v2"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+// BreakerInterceptor returns a unary client interceptor guarded by one
+// circuit breaker. While closed, calls pass through and infrastructure
+// failures are counted; once ConsecutiveFailures crosses the threshold the
+// breaker opens and every call returns codes.Unavailable immediately — no
+// network attempt — until the cooldown elapses and a single half-open
+// trial call tests whether the dependency has recovered.
+func BreakerInterceptor(name string) grpc.UnaryClientInterceptor {
+	cb := gobreaker.NewCircuitBreaker[any](gobreaker.Settings{
+		Name:        name,
+		MaxRequests: 1,                // half-open: one trial call at a time
+		Timeout:     10 * time.Second, // open -> half-open cooldown
+		ReadyToTrip: func(c gobreaker.Counts) bool {
+			return c.ConsecutiveFailures >= 5
+		},
+	})
+
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		// The breaker sees a failure only for infrastructure-coded errors.
+		// A business error (NotFound, InvalidArgument) is the dependency
+		// working correctly, so it rides through as the *result* with a nil
+		// error, keeping the breaker closed.
+		res, err := cb.Execute(func() (any, error) {
+			callErr := invoker(ctx, method, req, reply, cc, opts...)
+			if callErr != nil && countsAsFailure(callErr) {
+				return nil, callErr
+			}
+			return callErr, nil
+		})
+
+		if err != nil {
+			// Either an infrastructure failure the breaker recorded, or the
+			// breaker itself refusing the call while open/half-open-full.
+			if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
+				return status.Errorf(codes.Unavailable, "%s: circuit open, failing fast", name)
+			}
+			return err
+		}
+
+		// A passed-through business error, or nil on success.
+		if businessErr, ok := res.(error); ok {
+			return businessErr
+		}
+		return nil
+	}
+}
+
+// countsAsFailure reports whether err is an infrastructure failure that
+// should count toward tripping the breaker — the same transient codes
+// RetryInterceptor treats as retryable. Business-level rejections
+// (NotFound, InvalidArgument, ...) deliberately do not count.
+func countsAsFailure(err error) bool {
+	switch status.Code(err) {
+	case codes.Unavailable, codes.DeadlineExceeded:
+		return true
+	default:
+		return false
+	}
+}
+```
+
+Save this as `pkg/resilience/breaker.go`. The `MaxRequests`, `Timeout`, and failure threshold are inline in the `gobreaker.Settings` to keep the whole breaker in one view; hoist them into named constants next to `defaultTimeout` if you prefer them tunable alongside the rest of the policy.
+
+### 2. Add it to the chain in `pkg/resilience/interceptor.go`
+
+The breaker goes *outermost*, ahead of retry, so an open breaker short-circuits before any retry or timeout runs:
+
+```go
+func DialOptions() []grpc.DialOption {
+	return []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithChainUnaryInterceptor(
+			BreakerInterceptor("grpc-client"),
+			RetryInterceptor(maxAttempts, baseBackoff),
+			TimeoutInterceptor(defaultTimeout),
+		),
+	}
+}
+```
+
+That's the only change to `interceptor.go`, and there are **no changes at any call site** — the gateway and Order already pass `resilience.DialOptions()`, so both now sit behind the breaker automatically. The full chain per call is now: breaker (fail fast if open) → retry (idempotent transient failures) → timeout (per-attempt deadline) → the real gRPC invoker.
+
+## Verify
+
+Bring up Postgres and run Catalog, Order, and the gateway:
+
+```bash
+cd deploy/compose && docker compose up -d postgres
+```
+
+```bash
+go run ./services/catalog/cmd
+```
+
+```bash
+go run ./services/order/cmd
+```
+
+```bash
+go run ./gateway/cmd
+```
+
+Create a product so there's something to price, then confirm the happy path is unchanged — a closed breaker is invisible:
+
+```bash
+curl -s -X POST localhost:8080/v1/products \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Coffee Mug","description":"350ml ceramic mug","price_cents":1299,"stock":50}'
+```
+
+Now **stop Catalog** and leave it down. Place several orders in a row — enough to cross the breaker's failure threshold. The first few behave exactly like [Timeouts & retries →](/shopmicro/en/resilience/timeouts-retries/): Order retries `GetProduct`, backs off, and fails slowly after exhausting its attempts:
+
+```bash
+for i in 1 2 3 4 5 6 7 8; do
+  time curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8080/v1/orders \
+    -H 'Content-Type: application/json' \
+    -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":1}]}'
+done
+```
+
+Watch the timing in the output. The first several requests take a second or more each — the full retry-and-backoff budget — and Order's log shows the retry lines. Then, once five consecutive `GetProduct` calls have failed, the breaker **trips**: the remaining requests return `503` in *milliseconds*, and the retry lines vanish from Order's log entirely, because the breaker is now short-circuiting every call before the retry loop even runs:
+
+```txt
+503   (real 3.1s)   ← retrying
+503   (real 3.2s)   ← retrying
+...
+503   (real 0.004s) ← breaker open, failing fast
+503   (real 0.003s) ← breaker open, failing fast
+```
+
+That flip from seconds to milliseconds is the breaker doing its job: it stopped paying the discovery cost once the outage was established. Every one of these is a clean HTTP 503 with no half-created order — Order failed on the pricing call before writing anything, so there's nothing to roll back.
+
+Now bring Catalog back:
+
+```bash
+go run ./services/catalog/cmd
+```
+
+Wait out the breaker's 10-second cooldown, then place one more order. The breaker is half-open, lets this trial call through, it succeeds against the now-healthy Catalog, and the breaker closes — traffic is fully restored with no manual intervention:
+
+```json
+{
+  "id": "3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90",
+  "status": "ORDER_STATUS_PENDING",
+  "totalCents": "1299"
+}
+```
+
+Finally, confirm business errors do **not** trip the breaker. With everything healthy, request a product id that doesn't exist, many times over:
+
+```bash
+for i in $(seq 1 10); do curl -s -o /dev/null -w "%{http_code}\n" localhost:8080/v1/products/does-not-exist; done
+```
+
+Every one returns `404`, and the breaker stays closed — a valid `GetProduct` right after still succeeds instantly. A storm of not-found errors is the dependency working correctly, and the breaker correctly ignores it.
+
+Then confirm the module still builds:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+Check your understanding:
+
+- Why is the breaker placed *outermost* in the chain, ahead of the retry interceptor? What wasted work happens if it sits inside the retry loop instead?
+- A burst of `codes.NotFound` from clients requesting missing products must not trip the breaker, but a burst of `codes.Unavailable` should. Where in `BreakerInterceptor` is that distinction made, and what outage would counting `NotFound` cause?
+- The breaker fails `CreateOrder` fast when open. Why is "fail fast and return 503" the right degradation for this write path, and why is there no orphaned order left behind?
+- Half-open lets exactly one trial call through (`MaxRequests: 1`). Why not let all traffic resume the instant the cooldown ends?
+
+## Recap
+
+`pkg/resilience/breaker.go` adds `BreakerInterceptor`, a `sony/gobreaker`-backed unary client interceptor, as the outermost link in `DialOptions()`'s chain — so a durably-down dependency trips the breaker after five consecutive infrastructure failures, and every subsequent call returns `codes.Unavailable` in microseconds with no network attempt, retry, or timeout, until a 10-second cooldown and a single half-open trial call confirm recovery and close it again. Only infrastructure-coded errors (`Unavailable`, `DeadlineExceeded`) count toward tripping; business rejections like `NotFound` and `InvalidArgument` ride through untouched, so ordinary client errors can never self-inflict an outage. Because the gateway and Order already dial through `resilience.DialOptions()`, the breaker hardened every synchronous hop with zero call-site changes, completing the chain breaker → retry → timeout → invoker. And it forced the caller's degradation question into the open: on the order write path, the honest answer is to fail fast and cleanly with a 503, leaving no half-created order, because there's no safe way to price without Catalog — while a read path could choose to serve stale or partial data instead. The synchronous side of ShopMicro is now bounded, self-healing, and outage-aware. Next, [Testing →](/shopmicro/en/testing/) puts all of it — the services, the events, and this resilience layer — under automated tests that prove the behavior instead of taking `curl`'s word for it.
