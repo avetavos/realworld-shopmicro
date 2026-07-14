@@ -1,0 +1,703 @@
+---
+title: The Saga Handler
+description: "services/order/internal/saga/handler.go — the consumer that closes the event loop: it reacts to payment.succeeded/payment.failed on the \"payments\" topic and calls the new OrderRepo.ApplyPaymentResult to move an order to CONFIRMED or CANCELLED. services/order/cmd/main.go now runs the gRPC server, the outbox relay, and this saga consumer concurrently. Choreography vs orchestration, and why this system is the former. Verified with a small order (PENDING → CONFIRMED) and a large one (PENDING → CANCELLED)."
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+`services/order/internal/saga/handler.go` — a `Handler` whose `Handle` method is Order's second Kafka consumer, alongside the gRPC server [The gRPC Server →](/shopmicro/en/order-service/grpc-server/) built and the outbox relay [Outbox & Relay →](/shopmicro/en/kafka/outbox-relay/) added. It subscribes to the `"payments"` topic [Process & Publish →](/shopmicro/en/payment-service/process-publish/) publishes to, and for every `payment.succeeded`/`payment.failed` event it sees, calls a new repository method — `OrderRepo.ApplyPaymentResult` — that moves the order named by the event from `pending` to `confirmed` or `cancelled`, idempotently. Then `services/order/cmd/main.go` grows a third concurrent piece: the gRPC server, the outbox relay, and this new payments consumer, all sharing one cancellable context and shutting down together.
+
+This is the lesson that closes the loop [Architecture →](/shopmicro/en/introduction/architecture/) drew all the way back in the introduction: `CreateOrder` → outbox → Kafka `orders` → Payment → Kafka `payments` → back to Order, which is exactly where this lesson picks up. Every piece on both sides of that loop already exists; this lesson is the missing consumer that reacts to the last leg.
+
+## Why
+
+Look at what already exists, end to end, before writing a line of new code. `OrderRepo.Create` (Module 4) writes `order.created` to the outbox in the same transaction as the order itself. The relay (Module 6) polls that table and publishes it to Kafka's `"orders"` topic. Payment (Module 8) consumes `"orders"`, decides an outcome from `TotalCents` alone, and publishes `payment.succeeded` or `payment.failed` to `"payments"`, keyed by `order_id`. Nothing in this system has ever consumed `"payments"` — every payment result Payment has ever published has been sitting in that topic's log, fully durable, waiting for a reader that doesn't exist yet. That reader is what this lesson builds.
+
+The design is deliberately the smallest thing that could close this loop: a `Handler` with one dependency (`*repo.OrderRepo`), one method (`Handle`), and a two-line filter — ignore anything that isn't a payment result, then hand the order id and the success/failure flag straight to the repository. All of the actual decision-making — what "success" means for an order's status, how to guard against a duplicate or out-of-order event — lives in `OrderRepo.ApplyPaymentResult`, not in the handler. That split matters: [Consuming Orders →](/shopmicro/en/payment-service/consume-order/) and [Process & Publish →](/shopmicro/en/payment-service/process-publish/) already established the pattern of a thin `Handle` method that filters by `event.Type` and delegates the real work elsewhere, and this handler follows it exactly, for the same reason — a Kafka handler's job is routing, not business logic.
+
+`ApplyPaymentResult`'s own correctness — the idempotency check and the terminal-state guard — is significant enough to earn its own lesson: [Idempotency & Consistency →](/shopmicro/en/saga/idempotency-consistency/) is next.
+
+## Pros & cons
+
+**Choreography (this system)** vs. **orchestration (a central saga coordinator)**
+
+Both are ways to keep a multi-step, multi-service process consistent without a distributed transaction spanning every service — the two established names for how a **saga** (this module's own name) can be implemented. It's worth being explicit that this course builds the first one, not the second, despite "saga" often being associated with an orchestrator in other systems:
+
+- **Choreography** (what Order and Payment do here): every service reacts to events it cares about and publishes events describing what it did, with no service aware of the others' existence beyond a shared topic name. Order publishes `order.created` and has no idea Payment exists; Payment publishes `payment.succeeded`/`payment.failed` and has no idea Order — or this saga `Handler` — exists either. The whole flow emerges from independently-written consumers, each reacting to the last thing that happened.
+  - **Pros:** no new service to build, deploy, or scale — the coordination logic is spread across the consumers that already exist for other reasons; adding a new participant (Notification, in [Notification Service →](/shopmicro/en/notification-service/)) costs the existing services nothing, since it's just another consumer of a topic that already exists; there's no single component whose outage stalls the entire saga, since each step only depends on Kafka being up, not on a coordinator process.
+  - **Cons:** the overall sequence of a saga — "first this, then that, unless this failed, in which case that instead" — isn't written down anywhere as a single piece of code; it has to be reconstructed by reading every consumer of every topic involved, which gets genuinely hard to follow past three or four steps. There's also no natural place to ask "where is order `X` in its saga right now" other than inferring it from the order's own `status` column plus whatever's sitting unconsumed in Kafka.
+- **Orchestration** (the alternative, not built here): a dedicated orchestrator service holds an explicit state machine per saga instance ("awaiting payment" → "payment received, awaiting shipment" → ...) and sends *commands* to each participant ("charge this order," "ship this order"), waiting for each to report back before advancing to the next state.
+  - **Pros:** the entire sequence — including every failure branch and its compensation — is visible in one place, the orchestrator's state machine, rather than scattered across independent consumers; the current state of any in-flight saga is a single row the orchestrator owns, trivial to query, alert on, or resume from after a crash.
+  - **Cons:** the orchestrator becomes a new service every participant now implicitly depends on being correct and available; participants often need a command-and-reply interface (frequently a second, synchronous channel alongside the event stream) rather than the pure "publish what happened" style choreography allows, which is more to build and reason about; the orchestrator itself needs the same care against crashing mid-saga that any single point of coordination does.
+
+For a two-hop loop like `order.created` → `payment.*` → order status, choreography's biggest downside — "the sequence isn't written down anywhere" — is mild: this lesson and [Idempotency & Consistency →](/shopmicro/en/saga/idempotency-consistency/) *are* that documentation. A saga with many more steps and richer compensation logic is where orchestration's single-state-machine visibility starts to outweigh the extra service it costs to build.
+
+## Set it up
+
+### 1. `migrations/order/0002_processed_events.sql`
+
+```sql
+create table processed_events ( event_id text primary key, processed_at timestamptz not null default now() );
+```
+
+Save this as `migrations/order/0002_processed_events.sql` and apply it:
+
+```bash
+migrate -path migrations/order -database "$ORDER_DB_URL" up
+```
+
+[Idempotency & Consistency →](/shopmicro/en/saga/idempotency-consistency/) explains exactly what this table is for; for this lesson, all that matters is that `ApplyPaymentResult` below needs it to exist.
+
+### 2. `OrderRepo.ApplyPaymentResult`
+
+```go
+// Package repo is the PostgreSQL-backed store for the Order service.
+package repo
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Item is the row shape of a single order_items row.
+type Item struct {
+	ProductID      string
+	Quantity       int32
+	UnitPriceCents int64
+}
+
+// Order is the row shape of the orders table, with its items attached.
+type Order struct {
+	ID         string
+	CustomerID string
+	Status     string
+	TotalCents int64
+	Items      []Item
+	CreatedAt  time.Time
+}
+
+// PricedItem is a line item whose unit price has already been looked up
+// (from the Catalog service) before Create is called.
+type PricedItem struct {
+	ProductID      string
+	Quantity       int32
+	UnitPriceCents int64
+}
+
+// OrderRepo is the PostgreSQL-backed store for orders.
+type OrderRepo struct {
+	db *pgxpool.Pool
+}
+
+// New returns an OrderRepo backed by db.
+func New(db *pgxpool.Pool) *OrderRepo {
+	return &OrderRepo{db: db}
+}
+
+type createdEventItem struct {
+	ProductID      string `json:"product_id"`
+	Quantity       int32  `json:"quantity"`
+	UnitPriceCents int64  `json:"unit_price_cents"`
+}
+
+type createdEventPayload struct {
+	OrderID    string             `json:"order_id"`
+	CustomerID string             `json:"customer_id"`
+	TotalCents int64              `json:"total_cents"`
+	Items      []createdEventItem `json:"items"`
+}
+
+// Create inserts a new pending order, its line items, and an "order.created"
+// outbox row in a single transaction — all three commit together or none do.
+func (r *OrderRepo) Create(ctx context.Context, customerID string, items []PricedItem) (*Order, error) {
+	var total int64
+	for _, it := range items {
+		total += int64(it.Quantity) * it.UnitPriceCents
+	}
+
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("repo: begin create order tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var o Order
+	err = tx.QueryRow(ctx, `
+		insert into orders (customer_id, status, total_cents)
+		values ($1, 'pending', $2)
+		returning id, customer_id, status, total_cents, created_at`,
+		customerID, total,
+	).Scan(&o.ID, &o.CustomerID, &o.Status, &o.TotalCents, &o.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("repo: insert order: %w", err)
+	}
+
+	eventItems := make([]createdEventItem, 0, len(items))
+	for _, it := range items {
+		if _, err := tx.Exec(ctx, `
+			insert into order_items (order_id, product_id, quantity, unit_price_cents)
+			values ($1, $2, $3, $4)`,
+			o.ID, it.ProductID, it.Quantity, it.UnitPriceCents,
+		); err != nil {
+			return nil, fmt.Errorf("repo: insert order item: %w", err)
+		}
+		o.Items = append(o.Items, Item{ProductID: it.ProductID, Quantity: it.Quantity, UnitPriceCents: it.UnitPriceCents})
+		eventItems = append(eventItems, createdEventItem{ProductID: it.ProductID, Quantity: it.Quantity, UnitPriceCents: it.UnitPriceCents})
+	}
+
+	payload, err := json.Marshal(createdEventPayload{
+		OrderID:    o.ID,
+		CustomerID: o.CustomerID,
+		TotalCents: o.TotalCents,
+		Items:      eventItems,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("repo: marshal order.created payload: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		insert into outbox (aggregate_id, event_type, payload)
+		values ($1, 'order.created', $2)`,
+		o.ID, payload,
+	); err != nil {
+		return nil, fmt.Errorf("repo: insert outbox row: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("repo: commit create order tx: %w", err)
+	}
+
+	return &o, nil
+}
+
+// Get returns the order with the given id, items included. The returned
+// error wraps pgx.ErrNoRows (checkable with errors.Is) when no such order
+// exists.
+func (r *OrderRepo) Get(ctx context.Context, id string) (*Order, error) {
+	var o Order
+	err := r.db.QueryRow(ctx, `
+		select id, customer_id, status, total_cents, created_at
+		from orders
+		where id = $1`, id).Scan(&o.ID, &o.CustomerID, &o.Status, &o.TotalCents, &o.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("repo: get order %s: %w", id, err)
+	}
+
+	items, err := r.itemsForOrder(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	o.Items = items
+
+	return &o, nil
+}
+
+// ListByCustomer returns every order placed by customerID, most recent
+// first, items included.
+func (r *OrderRepo) ListByCustomer(ctx context.Context, customerID string) ([]Order, error) {
+	rows, err := r.db.Query(ctx, `
+		select id, customer_id, status, total_cents, created_at
+		from orders
+		where customer_id = $1
+		order by created_at desc`, customerID)
+	if err != nil {
+		return nil, fmt.Errorf("repo: list orders: %w", err)
+	}
+	defer rows.Close()
+
+	var orders []Order
+	for rows.Next() {
+		var o Order
+		if err := rows.Scan(&o.ID, &o.CustomerID, &o.Status, &o.TotalCents, &o.CreatedAt); err != nil {
+			return nil, fmt.Errorf("repo: scan order: %w", err)
+		}
+		orders = append(orders, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("repo: iterate orders: %w", err)
+	}
+
+	for i := range orders {
+		items, err := r.itemsForOrder(ctx, orders[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		orders[i].Items = items
+	}
+
+	return orders, nil
+}
+
+// itemsForOrder returns every order_items row for orderID, in insertion
+// order. Shared by Get and ListByCustomer so both fetch items the same way.
+func (r *OrderRepo) itemsForOrder(ctx context.Context, orderID string) ([]Item, error) {
+	rows, err := r.db.Query(ctx, `
+		select product_id, quantity, unit_price_cents
+		from order_items
+		where order_id = $1
+		order by id`, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("repo: list order items: %w", err)
+	}
+	defer rows.Close()
+
+	var items []Item
+	for rows.Next() {
+		var it Item
+		if err := rows.Scan(&it.ProductID, &it.Quantity, &it.UnitPriceCents); err != nil {
+			return nil, fmt.Errorf("repo: scan order item: %w", err)
+		}
+		items = append(items, it)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("repo: iterate order items: %w", err)
+	}
+
+	return items, nil
+}
+
+type statusEventPayload struct {
+	OrderID string `json:"order_id"`
+	Status  string `json:"status"`
+}
+
+// UpdateStatus moves an order to status ("confirmed" or "cancelled") and
+// writes the matching "order.confirmed"/"order.cancelled" outbox row in the
+// same transaction. Unlike ApplyPaymentResult below, it neither dedupes by
+// event id nor guards against an order that has already left "pending" —
+// it exists for a caller (an admin tool, say) that already knows this
+// exact transition should happen exactly once. The Order saga must not
+// call this directly; see ApplyPaymentResult.
+func (r *OrderRepo) UpdateStatus(ctx context.Context, id, status string) error {
+	eventType := map[string]string{
+		"confirmed": "order.confirmed",
+		"cancelled": "order.cancelled",
+	}[status]
+	if eventType == "" {
+		return fmt.Errorf("repo: update order status: no outbox event for status %q", status)
+	}
+
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("repo: begin update status tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx, `update orders set status = $1 where id = $2`, status, id)
+	if err != nil {
+		return fmt.Errorf("repo: update order status: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("repo: update order status: no order with id %s", id)
+	}
+
+	payload, err := json.Marshal(statusEventPayload{OrderID: id, Status: status})
+	if err != nil {
+		return fmt.Errorf("repo: marshal %s payload: %w", eventType, err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		insert into outbox (aggregate_id, event_type, payload)
+		values ($1, $2, $3)`, id, eventType, payload,
+	); err != nil {
+		return fmt.Errorf("repo: insert outbox row: %w", err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+// ApplyPaymentResult applies a payment.succeeded/payment.failed event to
+// the order it's about — moving it from "pending" to "confirmed" or
+// "cancelled" and writing the matching outbox row — but only once per
+// eventID, and only while the order is still "pending". This is what the
+// Order saga (Handler.Handle) calls; see Idempotency & Consistency for why
+// both checks below are required under Kafka's at-least-once delivery.
+func (r *OrderRepo) ApplyPaymentResult(ctx context.Context, orderID, eventID string, success bool) error {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("repo: begin apply payment result tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx, `
+		insert into processed_events (event_id) values ($1)
+		on conflict do nothing`, eventID)
+	if err != nil {
+		return fmt.Errorf("repo: record processed event %s: %w", eventID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Already processed this exact event — commit the no-op and return
+		// without touching the order at all.
+		return tx.Commit(ctx)
+	}
+
+	var status string
+	if err := tx.QueryRow(ctx, `
+		select status from orders where id = $1 for update`, orderID,
+	).Scan(&status); err != nil {
+		return fmt.Errorf("repo: lock order %s: %w", orderID, err)
+	}
+	if status != "pending" {
+		// The order already left "pending" — a duplicate or out-of-order
+		// payment event arrived after the saga already resolved it. Commit
+		// the processed_events insert above and stop; the order's status
+		// is not touched a second time.
+		return tx.Commit(ctx)
+	}
+
+	newStatus, eventType := "cancelled", "order.cancelled"
+	if success {
+		newStatus, eventType = "confirmed", "order.confirmed"
+	}
+
+	if _, err := tx.Exec(ctx, `update orders set status = $1 where id = $2`, newStatus, orderID); err != nil {
+		return fmt.Errorf("repo: update order %s status: %w", orderID, err)
+	}
+
+	payload, err := json.Marshal(statusEventPayload{OrderID: orderID, Status: newStatus})
+	if err != nil {
+		return fmt.Errorf("repo: marshal %s payload: %w", eventType, err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		insert into outbox (aggregate_id, event_type, payload)
+		values ($1, $2, $3)`, orderID, eventType, payload,
+	); err != nil {
+		return fmt.Errorf("repo: insert outbox row: %w", err)
+	}
+
+	return tx.Commit(ctx)
+}
+```
+
+Save this over `services/order/internal/repo/orders.go`. Everything above `ApplyPaymentResult` is unchanged from [The Order Repository →](/shopmicro/en/order-service/order-repo/) — only `ApplyPaymentResult` itself is new. A few things worth calling out about it specifically:
+
+- **One `pgx.Tx`, the same `defer tx.Rollback(ctx)` discipline every other method here uses** — the idempotency insert, the status read-and-lock, the status update, and the outbox insert either all commit together or none of them do.
+- **`select status from orders where id = $1 for update`** takes a row-level lock on that specific order for the rest of the transaction. If two payment result events for the same order were somehow being processed concurrently (two saga consumer instances, say), the second transaction blocks on this `SELECT` until the first commits or rolls back — it can never read a stale `status` and act on it.
+- **Two separate early-return points, both after a `tx.Commit(ctx)` rather than a rollback** — the already-processed-event case and the already-terminal-order case are not errors; they're `ApplyPaymentResult` correctly doing nothing, and the transaction still needs to commit to persist the `processed_events` insert from the first check.
+
+### 3. `services/order/internal/saga/handler.go`
+
+```go
+// Package saga reacts to Payment's result events and moves each order to
+// its terminal status — the consumer that closes the event loop opened by
+// Order's outbox relay (Module 6) and Payment (Module 8).
+package saga
+
+import (
+	"context"
+
+	"github.com/avetavos/shopmicro/pkg/events"
+	"github.com/avetavos/shopmicro/services/order/internal/repo"
+)
+
+// Handler reacts to "payment.succeeded"/"payment.failed" events and
+// applies each one to the order it's about.
+type Handler struct {
+	repo *repo.OrderRepo
+}
+
+// New returns a Handler backed by orderRepo.
+func New(orderRepo *repo.OrderRepo) *Handler {
+	return &Handler{repo: orderRepo}
+}
+
+// Handle implements the Consumer.Run handle signature. It ignores every
+// event.Type except "payment.succeeded"/"payment.failed", and applies the
+// result to the order named by e.AggregateID — the order_id Payment keyed
+// its result event by — using e.ID as ApplyPaymentResult's idempotency key.
+func (h *Handler) Handle(ctx context.Context, e events.Event) error {
+	if e.Type != "payment.succeeded" && e.Type != "payment.failed" {
+		return nil
+	}
+
+	success := e.Type == "payment.succeeded"
+
+	return h.repo.ApplyPaymentResult(ctx, e.AggregateID, e.ID, success)
+}
+```
+
+Save this as `services/order/internal/saga/handler.go`. It never unmarshals `e.Payload` at all — everything `Handle` needs (which order, and whether payment succeeded) is already on the envelope itself: `e.AggregateID` is the `order_id` [Process & Publish →](/shopmicro/en/payment-service/process-publish/)'s `Processor.Handle` keys every `payment.*` event by, and `e.Type` alone distinguishes success from failure. That mirrors `Processor.Handle`'s own shape — filter by `event.Type`, delegate the rest — one layer further down the chain.
+
+### 4. Wiring `Handler` into `services/order/cmd/main.go`
+
+```go
+// Command order runs the Order gRPC server, the outbox relay, and the
+// payment-result saga consumer — three independent, concurrently running
+// pieces sharing one cancellable context so they all stop together on
+// shutdown.
+package main
+
+import (
+	"context"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+
+	catalogv1 "github.com/avetavos/shopmicro/gen/shopmicro/catalog/v1"
+	orderv1 "github.com/avetavos/shopmicro/gen/shopmicro/order/v1"
+	"github.com/avetavos/shopmicro/pkg/config"
+	"github.com/avetavos/shopmicro/pkg/kafka"
+	"github.com/avetavos/shopmicro/pkg/pg"
+	"github.com/avetavos/shopmicro/services/order/internal/outbox"
+	"github.com/avetavos/shopmicro/services/order/internal/repo"
+	"github.com/avetavos/shopmicro/services/order/internal/saga"
+	"github.com/avetavos/shopmicro/services/order/internal/server"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/reflection"
+)
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dbURL := config.Get("ORDER_DB_URL", "postgres://shopmicro:shopmicro@localhost:5432/orders?sslmode=disable")
+	grpcAddr := config.Get("ORDER_GRPC_ADDR", ":50052")
+	catalogAddr := config.Get("CATALOG_GRPC_ADDR", ":50051")
+	brokers := strings.Split(config.Get("KAFKA_BROKERS", "localhost:9092"), ",")
+
+	pool, err := pg.NewPool(ctx, dbURL)
+	if err != nil {
+		log.Fatalf("order: connect to postgres: %v", err)
+	}
+	defer pool.Close()
+
+	orderRepo := repo.New(pool)
+
+	publisher := kafka.NewPublisher(brokers)
+	defer publisher.Close()
+
+	var wg sync.WaitGroup
+
+	relay := outbox.New(pool, publisher)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		relay.Run(ctx)
+	}()
+	log.Println("order: outbox relay started")
+
+	sagaHandler := saga.New(orderRepo)
+	paymentsConsumer := kafka.NewConsumer(brokers, "order", "payments")
+	defer paymentsConsumer.Close()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := paymentsConsumer.Run(ctx, sagaHandler.Handle); err != nil {
+			log.Printf("order: saga consumer stopped: %v", err)
+		}
+	}()
+	log.Println("order: saga consumer started, group=order topic=payments")
+
+	catalogConn, err := grpc.NewClient(catalogAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("order: dial catalog at %s: %v", catalogAddr, err)
+	}
+	defer catalogConn.Close()
+	catalogClient := catalogv1.NewCatalogServiceClient(catalogConn)
+
+	lis, err := net.Listen("tcp", grpcAddr)
+	if err != nil {
+		log.Fatalf("order: listen on %s: %v", grpcAddr, err)
+	}
+
+	orderServer := server.New(orderRepo, catalogClient)
+
+	grpcServer := grpc.NewServer()
+	orderv1.RegisterOrderServiceServer(grpcServer, orderServer)
+	reflection.Register(grpcServer)
+
+	go func() {
+		log.Printf("order: gRPC server listening on %s", grpcAddr)
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("order: serve: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Println("order: shutting down")
+	cancel()
+	grpcServer.GracefulStop()
+	wg.Wait()
+}
+```
+
+Save this over `services/order/cmd/main.go`. What's new since [Outbox & Relay →](/shopmicro/en/kafka/outbox-relay/):
+
+- **`sync.WaitGroup`, one per background goroutine (`relay.Run`, `paymentsConsumer.Run`).** `wg.Add(1)` runs before each `go` statement, never inside the goroutine — the same rule that avoids a race where `wg.Wait()` could return before a goroutine has even started. `wg.Wait()` after `grpcServer.GracefulStop()` means `main` doesn't exit until both background loops have actually observed `ctx.Done()` and returned, not just until `cancel()` was called.
+- **`paymentsConsumer := kafka.NewConsumer(brokers, "order", "payments")`** — Order's own consumer group, `"order"`, reading the `"payments"` topic. It's a completely independent group from Payment's `"payment"` group reading `"orders"` — [Topics, Partitions & Consumer Groups →](/shopmicro/en/kafka/topics-groups/)'s rule applies again: Order sees every `payment.*` event ever published, regardless of what Notification's own consumer group (Module 10) does with the same topic.
+- **Three goroutines now share one `cancel()`.** `relay.Run(ctx)` returns when `ctx.Done()` fires (Module 6); `paymentsConsumer.Run(ctx, sagaHandler.Handle)` does too, since `FetchMessage` returns `ctx`'s error once cancelled (Module 6, `pkg/kafka`); and `grpcServer.GracefulStop()` finishes in-flight RPCs and stops accepting new ones. All three respond to the exact same shutdown signal, with no risk of one lingering after the process is meant to be gone.
+
+## Verify
+
+Bring up Postgres and Kafka, and run Catalog, Order, the gateway, and Payment:
+
+```bash
+cd deploy/compose && docker compose up -d postgres kafka
+```
+
+```bash
+go run ./services/catalog/cmd
+```
+
+```bash
+go run ./services/order/cmd
+```
+
+```txt
+order: outbox relay started
+order: saga consumer started, group=order topic=payments
+order: gRPC server listening on :50052
+```
+
+```bash
+go run ./gateway/cmd
+```
+
+```bash
+go run ./services/payment/cmd
+```
+
+Create a small order — well under Payment's $5,000 limit:
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
+```
+
+```json
+{
+  "id": "3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90",
+  "customerId": "cust-1",
+  "status": "ORDER_STATUS_PENDING",
+  "totalCents": "2598",
+  "items": [{"productId": "8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21", "quantity": 2, "unitPriceCents": "1299"}],
+  "createdAt": "2026-07-14T09:12:03Z"
+}
+```
+
+`status` is `ORDER_STATUS_PENDING`, exactly as [The Order Repository →](/shopmicro/en/order-service/order-repo/) left it. Poll it back a few seconds later — long enough for one outbox-relay tick to publish `order.created`, Payment to consume it and publish `payment.succeeded`, and Order's saga consumer to consume that in turn:
+
+```bash
+curl -s localhost:8080/v1/orders/3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90
+```
+
+```json
+{
+  "id": "3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90",
+  "customerId": "cust-1",
+  "status": "ORDER_STATUS_CONFIRMED",
+  "totalCents": "2598",
+  "items": [{"productId": "8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21", "quantity": 2, "unitPriceCents": "1299"}],
+  "createdAt": "2026-07-14T09:12:03Z"
+}
+```
+
+`PENDING` → `CONFIRMED`, with zero manual intervention — the entire loop from the diagram above ran on its own. Now create an expensive product and cross the $5,000 limit:
+
+```bash
+curl -s -X POST localhost:8080/v1/products \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Server Rack","description":"42U enterprise rack","price_cents":600000,"stock":5}'
+```
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"7b23f5a1-4c9d-4e8a-b2a5-1e3f4a9b21c8","quantity":1}]}'
+```
+
+Poll that order back the same way:
+
+```bash
+curl -s localhost:8080/v1/orders/9e4a2c11-8b3d-4f7a-a1c6-3d8b1e5a7c40
+```
+
+```json
+{
+  "id": "9e4a2c11-8b3d-4f7a-a1c6-3d8b1e5a7c40",
+  "customerId": "cust-1",
+  "status": "ORDER_STATUS_CANCELLED",
+  "totalCents": "600000",
+  "items": [{"productId": "7b23f5a1-4c9d-4e8a-b2a5-1e3f4a9b21c8", "quantity": 1, "unitPriceCents": "600000"}],
+  "createdAt": "2026-07-14T09:16:12Z"
+}
+```
+
+`600000` cents ($6,000) is over `limitCents`, so Payment published `payment.failed`, and the same saga `Handler` moved this order to `CANCELLED` instead of `CONFIRMED` — the exact same code path, branching only on `success := e.Type == "payment.succeeded"`. Here's the full loop that just ran, for both cases:
+
+```mermaid
+sequenceDiagram
+    actor Client
+    participant Gateway as API Gateway
+    participant OrderSvc as Order Service (gRPC)
+    participant OrderDB as orders + outbox (Postgres)
+    participant Relay as Outbox Relay
+    participant KOrders as Kafka: orders
+    participant Payment as Payment Service
+    participant KPayments as Kafka: payments
+    participant Saga as Order Saga (saga.Handler)
+
+    Client->>Gateway: POST /v1/orders
+    Gateway->>OrderSvc: CreateOrder (gRPC)
+    OrderSvc->>OrderDB: insert order + items + outbox row (order.created)
+    OrderSvc-->>Gateway: Order{status: PENDING}
+    Gateway-->>Client: 200 OK (PENDING)
+
+    loop every pollInterval
+        Relay->>OrderDB: select unpublished outbox rows
+    end
+    Relay->>KOrders: publish order.created
+    KOrders->>Payment: consume order.created
+    Payment->>Payment: decide (Processor.Handle)
+    Payment->>KPayments: publish payment.succeeded / payment.failed
+
+    KPayments->>Saga: consume payment.succeeded / payment.failed
+    Saga->>OrderDB: ApplyPaymentResult (dedupe, guard, update status, outbox row)
+
+    loop every pollInterval
+        Relay->>OrderDB: select unpublished outbox rows
+    end
+    Relay->>KOrders: publish order.confirmed / order.cancelled
+
+    Client->>Gateway: GET /v1/orders/{id}
+    Gateway->>OrderSvc: GetOrder (gRPC)
+    OrderSvc->>OrderDB: select order
+    OrderSvc-->>Gateway: Order{status: CONFIRMED / CANCELLED}
+    Gateway-->>Client: 200 OK
+```
+
+Then confirm the module still builds:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+Check your understanding:
+
+- Trace `order.created` through every hop in the sequence diagram above. At which points could a crash cause the same event to be redelivered, and what makes each of those points safe under redelivery?
+- Why does `Handler.Handle` never unmarshal `e.Payload`? What two fields does it need, and where does each one come from?
+- This module is called "saga," and its directory is `saga/` — but is what you just built choreography or orchestration? What is the one piece of evidence in `Handler.Handle` and `ApplyPaymentResult` that answers that question?
+- If this course later added a fourth service that also needed to react to `payment.succeeded`, what would it cost the Order service, Payment service, or this `Handler` to add it?
+
+## Recap
+
+`services/order/internal/saga/handler.go`'s `Handler.Handle` is Order's second Kafka consumer: it ignores everything except `payment.succeeded`/`payment.failed`, and calls the new `OrderRepo.ApplyPaymentResult(ctx, e.AggregateID, e.ID, success)` — passing the order id, the event's own id as an idempotency key, and whether payment succeeded. `ApplyPaymentResult` itself does the real work: it moves the order from `pending` to `confirmed` or `cancelled` and writes the matching outbox row, all inside one `pgx.Tx`. `services/order/cmd/main.go` now runs three concurrent, independent pieces — the gRPC server, the outbox relay, and this new payments consumer — sharing one cancellable `context.Context` and a `sync.WaitGroup` so all three stop cleanly together on shutdown. This is **choreography**, not orchestration: Order and Payment never call each other directly or share any coordinator; each simply reacts to the last event it saw and publishes the next one, and the full loop — `order.created` → `payment.*` → `order.confirmed`/`order.cancelled` — emerges from those independent reactions. `curl` against the gateway proved it end to end: a small order moves `PENDING` → `CONFIRMED` on its own within a few seconds, and a large one moves `PENDING` → `CANCELLED` the same way, through the identical code path. That closes the loop [Architecture →](/shopmicro/en/introduction/architecture/) drew in the very first lesson. Next, [Idempotency & Consistency →](/shopmicro/en/saga/idempotency-consistency/) looks hard at `ApplyPaymentResult`'s two guards — the `processed_events` dedupe and the `for update` terminal-state check — and at what this saga deliberately does *not* give you: exactly-once delivery, or a rollback if a step fails.

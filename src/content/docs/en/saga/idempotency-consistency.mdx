@@ -1,0 +1,215 @@
+---
+title: Idempotency & Consistency
+description: "No new code — a close read of the two guards ApplyPaymentResult already wrote in The Saga Handler: the processed_events dedupe against Kafka at-least-once redelivery, and the `select ... for update` terminal-state check against duplicate or out-of-order events, both inside one transaction. Then what this choreography saga deliberately does NOT give you: exactly-once delivery, and automatic distributed rollback. Verified by redelivering the same payment event and watching the order transition exactly once."
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+No new code. [The Saga Handler →](/shopmicro/en/saga/orchestration/) already wrote every line this lesson is about — the `insert into processed_events ... on conflict do nothing` dedupe, the `select status ... for update` terminal-state guard, and the single `pgx.Tx` that wraps them together with the status update and the outbox row — and used all of it without slowing down to explain *why* each piece is shaped the way it is. This lesson does exactly that: it names the two guards inside `OrderRepo.ApplyPaymentResult`, explains what failure each one exists to survive under Kafka's at-least-once delivery, and then is honest about the two guarantees this saga deliberately does *not* give you — exactly-once delivery, and an automatic rollback when a step fails.
+
+It's the same shape [Acks, Retry & Dead Letters →](/shopmicro/en/rabbitmq/acks-retry-dlq/) took for RabbitMQ: the machinery was already written a lesson earlier and used without ceremony; this lesson is the close read that turns "it works" into "I know exactly why it works, and where it stops."
+
+## Why
+
+Start from the thing that forces all of this: **at-least-once delivery**. [Producer & Consumer →](/shopmicro/en/kafka/producer-consumer/) established that `Consumer.Run` commits an offset only *after* the handler returns, so if the Order saga consumer crashes after `ApplyPaymentResult` commits but before the offset is committed, Kafka redelivers the exact same `payment.succeeded` event on restart. The saga *will* see some events more than once — not as a rare edge case, but as a guarantee of the delivery model it's built on. Every guard below exists because of that one fact.
+
+**Guard 1 — the `processed_events` dedupe.** The first thing `ApplyPaymentResult` does inside its transaction is try to record the event's id:
+
+```go
+tag, err := tx.Exec(ctx, `
+	insert into processed_events (event_id) values ($1)
+	on conflict do nothing`, eventID)
+if err != nil {
+	return fmt.Errorf("repo: record processed event %s: %w", eventID, err)
+}
+if tag.RowsAffected() == 0 {
+	// Already processed this exact event — commit the no-op and return
+	// without touching the order at all.
+	return tx.Commit(ctx)
+}
+```
+
+`processed_events` has `event_id text primary key` [The Saga Handler →](/shopmicro/en/saga/orchestration/)'s migration created it, so `on conflict do nothing` is a race-free "insert if I haven't seen this id before." If the row already exists — this exact event was processed on an earlier delivery — `RowsAffected()` is `0`, and the handler commits and returns having touched *nothing else*. The order's status is never re-evaluated, no second outbox row is written. The idempotency key is `eventID`, which is `e.ID` — the saga passes `e.ID` straight through [The Saga Handler →](/shopmicro/en/saga/orchestration/). And this works across Payment's *own* redeliveries too, not just the saga's, because [Process & Publish →](/shopmicro/en/payment-service/process-publish/) derives each `payment.*` event's id deterministically as `e.ID + ":payment"` — so a redelivered `order.created` always produces a `payment.succeeded` with the *same* id, which `processed_events` correctly recognizes as already-seen. Deterministic ids upstream are what make dedupe downstream possible.
+
+**Guard 2 — the `for update` terminal-state check.** Passing the dedupe means this is an event id the saga has genuinely never processed. That still isn't enough to blindly apply it:
+
+```go
+var status string
+if err := tx.QueryRow(ctx, `
+	select status from orders where id = $1 for update`, orderID,
+).Scan(&status); err != nil {
+	return fmt.Errorf("repo: lock order %s: %w", orderID, err)
+}
+if status != "pending" {
+	// The order already left "pending" — a duplicate or out-of-order
+	// payment event arrived after the saga already resolved it. Commit
+	// the processed_events insert above and stop; the order's status
+	// is not touched a second time.
+	return tx.Commit(ctx)
+}
+```
+
+Two distinct things are happening here. First, `for update` takes a **row-level lock** on that specific order for the rest of the transaction — so if two payment-result events for the same order were being processed concurrently (two saga consumer instances, say), the second transaction *blocks* on this `SELECT` until the first commits, and can never read a stale `status` and act on it. Second, the `if status != "pending"` check is the **terminal-state guard**: an order that has already reached `confirmed` or `cancelled` is done, and any further payment event about it — a `payment.failed` that arrives after a `payment.succeeded` already confirmed it, or simply a genuinely different-id event for an order some other event already resolved — must not move it a second time. It commits the `processed_events` insert (so that id is now recorded) and stops.
+
+Why both guards, when either sounds like it might be enough? Because they catch different things. Dedupe catches *the same event* arriving twice — same id. The terminal-state check catches *a different event* trying to re-resolve an order that's already terminal — different id, same order, which dedupe would happily wave through. A system with only the dedupe would correctly ignore a redelivered `payment.succeeded` but could still let a late `payment.failed` flip a `confirmed` order to `cancelled`. A system with only the terminal-state check would be safe against that, but would re-run the whole status-update-and-outbox-write for every redelivery of the same event until one of them happened to land first — wasteful, and racy without the lock. Together, inside one transaction, they make `ApplyPaymentResult` correct under any ordering, duplication, or concurrency the delivery layer can throw at it.
+
+**The transaction is the third guard, the quiet one.** All of it — the dedupe insert, the locked read, the status update, the outbox row — is one `pgx.Tx` with the same `defer tx.Rollback(ctx)` discipline [The Order Repository →](/shopmicro/en/order-service/order-repo/) uses everywhere. Either the order moves to its terminal status *and* the `processed_events` row is recorded *and* the `order.confirmed`/`order.cancelled` outbox row is written — all together — or none of them are. There is no window where the event is marked processed but the status didn't change, or the status changed but no outbox row exists to tell the rest of the system.
+
+Now the honesty. Two things this saga does **not** give you, on purpose:
+
+- **Not exactly-once *delivery* — at-least-once delivery with an exactly-once *effect*.** These guards do not stop Kafka from delivering the same event ten times; they make the tenth delivery a no-op. The event is *received* many times; its *effect on the order* happens once. That distinction matters because "exactly-once delivery" is, in the general distributed-messaging case, essentially unachievable — you cannot make a network deliver a message exactly once in the presence of crashes and retries. What you *can* build is an idempotent consumer whose observable outcome is the same whether an event arrives once or a hundred times, which is exactly what `ApplyPaymentResult` is. When someone says a system is "exactly-once," this — at-least-once delivery plus idempotent handling — is almost always what they actually mean.
+- **No automatic distributed rollback.** This is a **choreography** saga [The Saga Handler →](/shopmicro/en/saga/orchestration/), and it has no coordinator holding compensation logic. When payment fails, the order moves *forward* to `cancelled` — a terminal state — not *backward* by undoing earlier steps. In this course that's enough, because the only prior step with a side effect is creating the order row, and `cancelled` is a perfectly good end for it. But a richer system — one that reserved stock, or actually charged a card, before payment's decision — would need to *compensate*: release the stock, refund the charge. Those are forward actions (a refund is a new transaction, not an undo), and in choreography each service must react to the failure event and compensate its own step, with no central place that guarantees every compensation ran. An orchestration saga puts that sequence in one state machine; this one deliberately doesn't have those side effects to compensate, so it doesn't need one — a boundary worth knowing before you add a step that *does* have one.
+
+## Pros & cons
+
+**An idempotent consumer (dedupe + terminal-state guard)** vs. **trusting the delivery layer to be exactly-once**
+
+- **Pros:** it's correct under the delivery guarantee the system actually has (at-least-once), rather than one it can't have; the safety lives in the database, in one transaction, where it's durable and inspectable, not in fragile assumptions about the broker never redelivering; and it composes — any consumer that dedupes on `Event.ID` is safe against both its own redeliveries and any upstream producer that derives ids deterministically.
+- **Cons:** every stateful consumer now carries a `processed_events` table and the discipline to check it first, which is real schema and real code to get right; and the dedupe table grows unbounded without a retention policy (a periodic prune of old `event_id`s, out of scope here) — a small operational cost that trusting a mythical exactly-once broker wouldn't have, if such a broker existed.
+
+**Both guards (dedupe *and* terminal-state)** vs. **only one of them**
+
+- **Pros:** the two together are correct under duplication *and* out-of-order *and* concurrent delivery — dedupe handles same-id redelivery, the terminal-state check plus `for update` handles a different event racing to re-resolve an already-finished order — which is the full set of things at-least-once delivery can actually do to you.
+- **Cons:** it's more moving parts than a first reading suggests it needs, and the two guards look redundant until you construct the exact case each one alone would miss; a reviewer who removes "the redundant one" reintroduces a subtle bug that only shows up under a specific interleaving, which is precisely the kind of failure that's hardest to catch in testing.
+
+## Set it up
+
+Nothing new to write — the two guards this lesson is about are already in `services/order/internal/repo/orders.go` from [The Saga Handler →](/shopmicro/en/saga/orchestration/), and `processed_events` was created by that lesson's `migrations/order/0002_processed_events.sql`. Re-read the two guards with this lesson's framing, this time as the whole picture rather than a detail passed over:
+
+```go
+// Guard 1: dedupe. Already-seen event id -> commit the no-op, touch nothing.
+tag, err := tx.Exec(ctx, `
+	insert into processed_events (event_id) values ($1)
+	on conflict do nothing`, eventID)
+if err != nil {
+	return fmt.Errorf("repo: record processed event %s: %w", eventID, err)
+}
+if tag.RowsAffected() == 0 {
+	return tx.Commit(ctx)
+}
+
+// Guard 2: lock the order row, then refuse to re-resolve a terminal order.
+var status string
+if err := tx.QueryRow(ctx, `
+	select status from orders where id = $1 for update`, orderID,
+).Scan(&status); err != nil {
+	return fmt.Errorf("repo: lock order %s: %w", orderID, err)
+}
+if status != "pending" {
+	return tx.Commit(ctx)
+}
+```
+
+If you skipped applying `0002_processed_events.sql` earlier, it's just:
+
+```sql
+create table processed_events ( event_id text primary key, processed_at timestamptz not null default now() );
+```
+
+```bash
+migrate -path migrations/order -database "$ORDER_DB_URL" up
+```
+
+## Verify
+
+Bring up the stack and run Catalog, Order, the gateway, and Payment exactly as [The Saga Handler →](/shopmicro/en/saga/orchestration/) left them:
+
+```bash
+cd deploy/compose && docker compose up -d postgres kafka
+```
+
+```bash
+go run ./services/catalog/cmd
+```
+
+```bash
+go run ./services/order/cmd
+```
+
+```bash
+go run ./gateway/cmd
+```
+
+```bash
+go run ./services/payment/cmd
+```
+
+Create a small order and let the loop resolve it to `CONFIRMED`, the same way the previous lesson did:
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
+```
+
+Poll it back until it's `ORDER_STATUS_CONFIRMED`, and note its id. Now prove idempotency directly: **redeliver the exact same `payment.succeeded` event** onto the `payments` topic, with the same `id` the console consumer showed in [Process & Publish →](/shopmicro/en/payment-service/process-publish/) (`<order-id>:payment`). Produce one raw record straight to Kafka:
+
+```bash
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic payments <<'EOF'
+{"id":"3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90:payment","type":"payment.succeeded","aggregate_id":"3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90","payload":{"order_id":"3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90","amount_cents":2598},"occurred_at":"2026-07-14T09:15:40Z"}
+EOF
+```
+
+The saga consumes it again — but the id is already in `processed_events`, so Guard 1 short-circuits and nothing changes. Confirm the order status is untouched and the event was recorded exactly once:
+
+```bash
+docker compose exec -T postgres psql -U shopmicro -d orders -c \
+  "select status from orders where id = '3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90';"
+```
+
+```txt
+  status
+-----------
+ confirmed
+(1 row)
+```
+
+```bash
+docker compose exec -T postgres psql -U shopmicro -d orders -c \
+  "select count(*) from processed_events where event_id = '3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90:payment';"
+```
+
+```txt
+ count
+-------
+     1
+(1 row)
+```
+
+Still `confirmed`, exactly one `processed_events` row, and no second `order.confirmed` outbox row was written — the redelivery was a true no-op. Now test Guard 2 instead of Guard 1: produce a *different* event id for the same, already-`confirmed` order — a late `payment.failed` that dedupe would let through:
+
+```bash
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic payments <<'EOF'
+{"id":"late-failure-001","type":"payment.failed","aggregate_id":"3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90","payload":{"order_id":"3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90","amount_cents":2598,"reason":"amount exceeds limit"},"occurred_at":"2026-07-14T09:20:00Z"}
+EOF
+```
+
+This id is new, so Guard 1 lets it past — but the order is already `confirmed`, so Guard 2's `if status != "pending"` refuses to move it. Re-check the status:
+
+```bash
+docker compose exec -T postgres psql -U shopmicro -d orders -c \
+  "select status from orders where id = '3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90';"
+```
+
+Still `confirmed` — a late, contradictory event could not flip a resolved order, which is exactly the case dedupe alone would have missed. Then confirm the module still builds:
+
+```bash
+go build ./...
+```
+
+No output means success.
+
+Check your understanding:
+
+- Trace a redelivered `payment.succeeded` (same id) and a genuinely-new `payment.failed` for an already-`confirmed` order. Which guard stops each, and what would go wrong if that guard weren't there?
+- The system is "at-least-once delivery with an exactly-once effect." What is the precise difference between those two phrases, and why can't you have exactly-once *delivery* instead?
+- Why is `for update` on the `select status` line necessary, and not just the `if status != "pending"` check on its own? Construct the interleaving it protects against.
+- This saga has no compensation logic and no orchestrator. What specific new step would you have to add to the order flow before that becomes a real problem, and what would compensation for it look like?
+
+## Recap
+
+`OrderRepo.ApplyPaymentResult` is safe under Kafka's at-least-once delivery because of two guards inside one transaction. Guard 1, `insert into processed_events ... on conflict do nothing`, dedupes on the event's id — a redelivery of the *same* event finds its id already recorded, commits a no-op, and touches nothing; it works across Payment's own redeliveries too, because Payment derives each result event's id deterministically. Guard 2, `select status ... for update` plus `if status != "pending"`, takes a row lock (serializing concurrent consumers) and refuses to re-resolve an order that's already terminal — catching a *different* event trying to move an order dedupe would have waved through. Together, in one `pgx.Tx` with the status update and the outbox row, they make the handler correct under duplication, reordering, and concurrency. What this deliberately is *not*: exactly-once delivery (it's at-least-once delivery with an idempotent, exactly-once *effect* — the achievable version of the same goal), and it has no automatic distributed rollback, because a choreography saga with no side effects worth compensating moves failed orders *forward* to `cancelled` rather than undoing prior steps. Redelivering the same event and injecting a late contradictory one both proved it: the order transitioned exactly once, no matter what the delivery layer did. That completes the saga. Next, [Notification Service →](/shopmicro/en/notification-service/) consumes the very same `payments` stream under its own group and turns each result into a customer notification — a second independent reader of events this saga has been resolving all along.
