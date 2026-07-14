@@ -1,0 +1,299 @@
+---
+title: The Compose stack
+description: "deploy/compose/docker-compose.yml — the whole system in one file: postgres, kafka, and rabbitmq with healthchecks, one-shot migrate jobs, and all six app images built from the parameterized Dockerfile, wired by compose-network DNS and gated on service_healthy. One `docker compose up` stands up everything; the same curl smoke test runs entirely inside it."
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+`deploy/compose/docker-compose.yml` — a single Compose file that brings up the entire ShopMicro system: PostgreSQL, Kafka, and RabbitMQ (the infra [Infra & Compose →](/shopmicro/en/setup/infra-compose/) first stood up in Module 1), one-shot **migration** services that apply each service's SQL before the apps start, and all six application images — Catalog, Order, Payment, Notification, the Notification worker, and the gateway — each built from the one parameterized `Dockerfile` [Service images →](/shopmicro/en/docker/service-images/) with its own `TARGET`. Every dependency is wired by Compose-network DNS, every startup ordered by healthchecks, and the gateway published on `8080`. After this, `docker compose up` is the entire "run ShopMicro locally" instruction.
+
+## Why
+
+Up to now, running the system meant a terminal per process — Catalog here, Order there, the gateway, Payment, Notification, the worker — each `go run` pointed at infra on `localhost`, started in the right order by hand. That works for developing one service, but it's six terminals, a memorized boot order, and a pile of env vars to keep straight. Compose collapses all of it into one declarative file and one command, and three of its features are what make that reliable rather than just convenient.
+
+**Service DNS.** Every service in a Compose file is reachable from every other by its service *name* as a hostname, on the Compose network. So Order reaches Postgres at `postgres:5432`, Payment reaches Kafka at `kafka:9092`, Notification reaches RabbitMQ at `rabbitmq:5672` — no IP addresses, no `localhost` (which inside a container means the container itself, not the host). The env vars each service already reads — `ORDER_DB_URL`, `KAFKA_BROKERS`, `RABBITMQ_URL` [Consuming events →](/shopmicro/en/notification-service/consume-events/) — just get Compose hostnames instead of `localhost`, and nothing in the Go code changes at all.
+
+**Healthchecks and `depends_on: condition: service_healthy`.** Startup order is a real problem in a system like this: Order's migrations can't run until Postgres is actually accepting connections, and Order itself shouldn't start until its migrations are done. A bare `depends_on` only waits for a container to *start*, not to be *ready* — Postgres's container is "up" long before Postgres is answering queries. So Postgres, Kafka, and RabbitMQ each declare a `healthcheck`, and everything downstream depends on them with `condition: service_healthy`, which waits for the healthcheck to actually pass. The migration jobs gate on Postgres being healthy; the app services gate on the migrations having completed and the brokers being healthy.
+
+**One-shot migration services.** The SQL migrations [Repo Layout →](/shopmicro/en/setup/repo-layout/) aren't baked into the service images — [Service images →](/shopmicro/en/docker/service-images/)'s `.dockerignore` deliberately excludes them. Instead they run as their own short-lived Compose services using the `migrate/migrate` image, which starts, applies every pending migration against a database, and exits `0`. An app service then depends on its migration job with `condition: service_completed_successfully`, so Order never starts against a schema that hasn't been created yet. Keeping migrations a separate step from the service that uses the schema is the same discipline this course applies everywhere: the thing that *changes* the database is decoupled from the thing that *uses* it.
+
+## Pros & cons
+
+**Compose for the local stack** vs. **running each binary by hand with `go run`**
+
+- **Pros:** one file is the single source of truth for how the whole system is wired — ports, env vars, dependency order, image builds — and one `docker compose up` reproduces it identically on any machine with Docker, no memorized boot sequence; healthcheck gating removes the race where a service starts before its database is ready; and the whole thing tears down cleanly with `docker compose down`.
+- **Cons:** you now iterate through image builds rather than an instant `go run`, so the fast inner loop of editing one service is slower unless you fall back to running just that one binary locally against the Compose infra; and Compose is a local-development and single-host tool — it is *not* how this system runs in production, which is the entire reason [Kubernetes (Helm) →](/shopmicro/en/kubernetes/) exists.
+
+**A one-shot `migrate` service per database** vs. **each service running its own migrations at startup**
+
+- **Pros:** migrations run exactly once, in a dedicated step, with a clear success/failure that app startup can gate on — no ambiguity about which of three Order replicas "wins" the migration race, and no migration logic linked into the service binary at all.
+- **Cons:** it's one more service per database in the Compose file and one more thing to keep in sync when a new migration is added; a service that must self-migrate in some environments (a platform that can't run an init job) would need that logic in-process anyway, which this split doesn't provide.
+
+## Set it up
+
+### 1. `deploy/compose/initdb.sql`
+
+Postgres's official image creates a single database from `POSTGRES_DB`; this system needs two (`catalog` and `orders`). An init script mounted into the image's entrypoint directory creates both on first boot:
+
+```sql
+CREATE DATABASE catalog;
+CREATE DATABASE orders;
+```
+
+Save this as `deploy/compose/initdb.sql`.
+
+### 2. `deploy/compose/docker-compose.yml`
+
+```yaml
+name: shopmicro
+
+x-app-build: &app-build
+  context: ../..
+  dockerfile: Dockerfile
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: shopmicro
+      POSTGRES_PASSWORD: shopmicro
+    volumes:
+      - ./initdb.sql:/docker-entrypoint-initdb.d/initdb.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shopmicro"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "5432:5432"
+
+  kafka:
+    image: apache/kafka:3.7.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    environment:
+      RABBITMQ_DEFAULT_USER: shopmicro
+      RABBITMQ_DEFAULT_PASS: shopmicro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "15672:15672"
+
+  migrate-catalog:
+    image: migrate/migrate:v4.17.1
+    volumes:
+      - ../../migrations/catalog:/migrations:ro
+    command:
+      ["-path", "/migrations", "-database",
+       "postgres://shopmicro:shopmicro@postgres:5432/catalog?sslmode=disable", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  migrate-order:
+    image: migrate/migrate:v4.17.1
+    volumes:
+      - ../../migrations/order:/migrations:ro
+    command:
+      ["-path", "/migrations", "-database",
+       "postgres://shopmicro:shopmicro@postgres:5432/orders?sslmode=disable", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  catalog:
+    build:
+      <<: *app-build
+      args:
+        TARGET: ./services/catalog/cmd
+    environment:
+      CATALOG_GRPC_ADDR: ":50051"
+      CATALOG_DB_URL: "postgres://shopmicro:shopmicro@postgres:5432/catalog?sslmode=disable"
+    depends_on:
+      migrate-catalog:
+        condition: service_completed_successfully
+
+  order:
+    build:
+      <<: *app-build
+      args:
+        TARGET: ./services/order/cmd
+    environment:
+      ORDER_GRPC_ADDR: ":50052"
+      ORDER_DB_URL: "postgres://shopmicro:shopmicro@postgres:5432/orders?sslmode=disable"
+      CATALOG_GRPC_ADDR: "catalog:50051"
+      KAFKA_BROKERS: "kafka:9092"
+    depends_on:
+      migrate-order:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+      catalog:
+        condition: service_started
+
+  payment:
+    build:
+      <<: *app-build
+      args:
+        TARGET: ./services/payment/cmd
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  notification:
+    build:
+      <<: *app-build
+      args:
+        TARGET: ./services/notification/cmd
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+      RABBITMQ_URL: "amqp://shopmicro:shopmicro@rabbitmq:5672/"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  notification-worker:
+    build:
+      <<: *app-build
+      args:
+        TARGET: ./services/notification/cmd/worker
+    environment:
+      RABBITMQ_URL: "amqp://shopmicro:shopmicro@rabbitmq:5672/"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  gateway:
+    build:
+      <<: *app-build
+      args:
+        TARGET: ./gateway/cmd
+    environment:
+      GATEWAY_HTTP_ADDR: ":8080"
+      CATALOG_GRPC_ADDR: "catalog:50051"
+      ORDER_GRPC_ADDR: "order:50052"
+    ports:
+      - "8080:8080"
+    depends_on:
+      catalog:
+        condition: service_started
+      order:
+        condition: service_started
+```
+
+Save this as `deploy/compose/docker-compose.yml`. A few things worth calling out:
+
+- **`x-app-build` is a YAML anchor** reused by every app service via `<<: *app-build`, so the shared `context`/`dockerfile` is written once and each service adds only its own `TARGET` arg — the Compose-file echo of [Service images →](/shopmicro/en/docker/service-images/)'s "one Dockerfile, one arg per binary."
+- **Every dependency address is a Compose service name** — `postgres:5432`, `kafka:9092`, `catalog:50051`, `rabbitmq:5672` — never `localhost`, which inside a container refers to that container, not its neighbors.
+- **The startup graph is encoded, not assumed:** the `migrate-*` jobs wait for Postgres to be *healthy*, the app services wait for their migration to have *completed successfully* and for the brokers to be healthy, and the gateway waits for Catalog and Order to have started — so `docker compose up` brings the whole thing up in a correct order with no manual sequencing.
+- **Only the gateway (`8080`) and the management/debug ports (`5432`, `15672`) are published** to the host; the services talk to each other over the internal network and don't need host ports at all.
+
+## Verify
+
+From the compose directory, build every image and start the whole stack:
+
+```bash
+cd deploy/compose && docker compose up -d --build
+```
+
+Compose builds the six images, starts Postgres/Kafka/RabbitMQ, waits for them to pass their healthchecks, runs both migration jobs to completion, then starts the services. Watch it settle:
+
+```bash
+docker compose ps
+```
+
+```txt
+NAME                            STATUS
+shopmicro-catalog-1             Up
+shopmicro-gateway-1             Up
+shopmicro-kafka-1               Up (healthy)
+shopmicro-notification-1        Up
+shopmicro-notification-worker-1 Up
+shopmicro-order-1               Up
+shopmicro-payment-1             Up
+shopmicro-postgres-1            Up (healthy)
+shopmicro-rabbitmq-1            Up (healthy)
+```
+
+The two `migrate-*` jobs won't appear in `ps` — they ran, exited `0`, and are done. Now run the *exact* end-to-end smoke test from the earlier modules [The Saga Handler →](/shopmicro/en/saga/orchestration/), except every hop now happens between containers, and the only thing you talk to is the gateway on the host's `8080`:
+
+```bash
+curl -s localhost:8080/v1/products
+```
+
+```json
+{}
+```
+
+```bash
+curl -s -X POST localhost:8080/v1/products \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Coffee Mug","description":"350ml ceramic mug","price_cents":1299,"stock":50}'
+```
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
+```
+
+Poll the order back a few seconds later and watch it reach `CONFIRMED` on its own — the full `order.created` → Kafka → Payment → Kafka → saga loop ran entirely inside Compose, and Notification enqueued a RabbitMQ job the worker delivered, all without a single `go run`:
+
+```bash
+curl -s localhost:8080/v1/orders/<id-from-above>
+```
+
+```json
+{ "status": "ORDER_STATUS_CONFIRMED", "totalCents": "2598" }
+```
+
+Check the Notification worker actually delivered, straight from the container's logs:
+
+```bash
+docker compose logs notification-worker | tail -1
+```
+
+```txt
+sender: delivered notification for order ... (succeeded): Your order ... is confirmed ...
+```
+
+Tear the whole thing down — containers, network, and volumes — with one command:
+
+```bash
+docker compose down -v
+```
+
+Check your understanding:
+
+- Order's `CATALOG_GRPC_ADDR` is `catalog:50051`, not `localhost:50051`. What does `localhost` refer to inside the Order container, and why would `localhost:50051` fail there?
+- A bare `depends_on: [postgres]` only waits for Postgres's *container* to start. Why isn't that enough for `migrate-order`, and what does `condition: service_healthy` wait for instead?
+- The migrations run as their own `migrate/migrate` services rather than being baked into the Order image. What did [Service images →](/shopmicro/en/docker/service-images/)'s `.dockerignore` do that's consistent with this, and why keep migrations out of the service image?
+- The end-to-end curl test is byte-for-byte the same as in earlier modules, yet nothing ran with `go run`. What changed about *where* each hop happens, and what stayed identical about the system's behavior?
+
+## Recap
+
+`deploy/compose/docker-compose.yml` is the whole system in one file. Postgres, Kafka, and RabbitMQ come up with healthchecks; `migrate-catalog` and `migrate-order` apply each schema once and exit; and all six app images build from the single parameterized `Dockerfile` [Service images →](/shopmicro/en/docker/service-images/), each selecting its binary with a `TARGET` build arg via a shared YAML anchor. Everything is wired by Compose-network DNS — services address each other by name (`postgres:5432`, `kafka:9092`, `catalog:50051`), never `localhost` — and ordered by `depends_on` conditions so migrations wait for a healthy database and apps wait for completed migrations and healthy brokers. `docker compose up -d --build` stands the entire stack up, and the identical `curl` smoke test from earlier modules drove a real order to `CONFIRMED` with the notification delivered, every hop now between containers rather than local processes. Compose is the reproducible *local* stack, though — not production. Next, [Kubernetes (Helm) →](/shopmicro/en/kubernetes/) packages these same images into a Helm chart and deploys the system to a real cluster, trading Compose's single-host simplicity for scaling, self-healing, and rolling deploys.

@@ -1,0 +1,299 @@
+---
+title: The Compose stack
+description: "deploy/compose/docker-compose.yml — ทั้งระบบในไฟล์เดียว: postgres, kafka, และ rabbitmq พร้อม healthcheck, migrate job แบบ one-shot, และทั้งหก app image ที่ build จาก Dockerfile ที่ parameterize ได้ ต่อสายด้วย DNS ของ compose network และ gate ด้วย service_healthy `docker compose up` เดียวยกทุกอย่างขึ้น; smoke test curl เดิมรันข้างในทั้งหมด"
+sidebar:
+  order: 2
+---
+
+## What we're building
+
+`deploy/compose/docker-compose.yml` — Compose file ตัวเดียวที่ยกทั้งระบบ ShopMicro ขึ้นมา: PostgreSQL, Kafka, และ RabbitMQ (infra ที่ [Infra & Compose →](/shopmicro/th/setup/infra-compose/) ยกขึ้นครั้งแรกใน Module 1), เซอร์วิส **migration** แบบ one-shot ที่ apply SQL ของแต่ละเซอร์วิสก่อน app เริ่ม, และทั้งหก application image — Catalog, Order, Payment, Notification, Notification worker, และ gateway — แต่ละตัว build จาก `Dockerfile` ที่ parameterize ได้ตัวเดียว [Service images →](/shopmicro/th/docker/service-images/) ด้วย `TARGET` ของตัวเอง ทุก dependency ต่อสายด้วย DNS ของ Compose network ทุกลำดับการเริ่มจัดด้วย healthcheck และ gateway publish บน `8080` หลังจากนี้ `docker compose up` คือคำสั่ง "รัน ShopMicro บนเครื่อง" ทั้งหมด
+
+## Why
+
+จนถึงตอนนี้ การรันระบบหมายถึงหนึ่ง terminal ต่อ process — Catalog ตรงนี้, Order ตรงนั้น, gateway, Payment, Notification, worker — แต่ละตัว `go run` ชี้ไป infra บน `localhost` เริ่มในลำดับที่ถูกด้วยมือ มันใช้ได้สำหรับพัฒนาเซอร์วิสเดียว แต่มันคือหก terminal, boot order ที่ต้องจำ, และกอง env var ที่ต้องคุมให้ตรง Compose ยุบมันทั้งหมดเป็นไฟล์ declarative ตัวเดียวและคำสั่งเดียว และสาม feature ของมันคือสิ่งที่ทำให้เชื่อถือได้ ไม่ใช่แค่สะดวก
+
+**Service DNS** ทุกเซอร์วิสใน Compose file เข้าถึงได้จากทุกตัวด้วย *ชื่อ* เซอร์วิสเป็น hostname บน Compose network ดังนั้น Order เข้าถึง Postgres ที่ `postgres:5432`, Payment เข้าถึง Kafka ที่ `kafka:9092`, Notification เข้าถึง RabbitMQ ที่ `rabbitmq:5672` — ไม่มี IP address ไม่มี `localhost` (ซึ่งข้างใน container หมายถึงตัว container เอง ไม่ใช่ host) env var ที่แต่ละเซอร์วิสอ่านอยู่แล้ว — `ORDER_DB_URL`, `KAFKA_BROKERS`, `RABBITMQ_URL` [Consuming events →](/shopmicro/th/notification-service/consume-events/) — แค่ได้ hostname ของ Compose แทน `localhost` และไม่มีอะไรในโค้ด Go เปลี่ยนเลย
+
+**Healthcheck และ `depends_on: condition: service_healthy`** ลำดับการเริ่มเป็นปัญหาจริงในระบบแบบนี้: migration ของ Order รันไม่ได้จนกว่า Postgres จะรับ connection จริง และ Order เองไม่ควรเริ่มจนกว่า migration ของมันจะเสร็จ `depends_on` เปล่า ๆ รอแค่ container *เริ่ม* ไม่ใช่ *พร้อม* — container ของ Postgres "up" นานก่อน Postgres จะตอบ query ดังนั้น Postgres, Kafka, และ RabbitMQ ต่างประกาศ `healthcheck` และทุกอย่างข้างล่างพึ่งพวกมันด้วย `condition: service_healthy` ซึ่งรอให้ healthcheck ผ่านจริง migration job gate บน Postgres ที่ healthy; app service gate บน migration ที่เสร็จและ broker ที่ healthy
+
+**Migration service แบบ one-shot** SQL migration [Repo Layout →](/shopmicro/th/setup/repo-layout/) ไม่ถูก bake เข้า image ของเซอร์วิส — `.dockerignore` ของ [Service images →](/shopmicro/th/docker/service-images/) กันมันออกอย่างตั้งใจ แต่มันรันเป็นเซอร์วิส Compose อายุสั้นของตัวเองด้วย image `migrate/migrate` ซึ่งเริ่ม apply migration ที่ค้างทุกตัวกับ database แล้ว exit `0` app service แล้วพึ่ง migration job ของมันด้วย `condition: service_completed_successfully` ดังนั้น Order ไม่เริ่มกับ schema ที่ยังไม่ถูกสร้าง การแยก migration ออกจากเซอร์วิสที่ใช้ schema คือวินัยเดียวกับที่คอร์สนี้ใช้ทุกที่: สิ่งที่ *เปลี่ยน* database แยกจากสิ่งที่ *ใช้* มัน
+
+## Pros & cons
+
+**Compose สำหรับ local stack** เทียบกับ **รันแต่ละ binary ด้วยมือด้วย `go run`**
+
+- **Pros:** ไฟล์เดียวคือแหล่งความจริงเดียวของการต่อสายทั้งระบบ — port, env var, ลำดับ dependency, image build — และ `docker compose up` เดียวสร้างมันเหมือนกันเป๊ะบนเครื่องไหนก็ได้ที่มี Docker ไม่ต้องจำ boot sequence; การ gate ด้วย healthcheck ตัด race ที่เซอร์วิสเริ่มก่อน database พร้อม; และทั้งหมด tear down สะอาดด้วย `docker compose down`
+- **Cons:** ตอนนี้คุณ iterate ผ่านการ build image แทน `go run` ที่ทันที ดังนั้น inner loop ที่เร็วของการแก้เซอร์วิสเดียวช้าลงเว้นแต่คุณกลับไปรันแค่ binary นั้นบนเครื่องกับ Compose infra; และ Compose เป็นเครื่องมือ local-development และ single-host — มัน *ไม่ใช่* วิธีที่ระบบนี้รันบน production ซึ่งเป็นเหตุผลทั้งหมดที่ [Kubernetes (Helm) →](/shopmicro/th/kubernetes/) มีอยู่
+
+**เซอร์วิส `migrate` แบบ one-shot ต่อ database** เทียบกับ **แต่ละเซอร์วิสรัน migration ของตัวเองตอน startup**
+
+- **Pros:** migration รันครั้งเดียวพอดี ใน step เฉพาะ พร้อมผลสำเร็จ/ล้มเหลวชัดที่ app startup gate ได้ — ไม่มีความกำกวมว่า Order replica ตัวไหนใน 3 ตัว "ชนะ" race ของ migration และไม่มี migration logic link เข้า binary ของเซอร์วิสเลย
+- **Cons:** มันคือหนึ่งเซอร์วิสต่อ database เพิ่มใน Compose file และอีกหนึ่งอย่างที่ต้อง sync เมื่อเพิ่ม migration ใหม่; เซอร์วิสที่ต้อง self-migrate ในบาง environment (platform ที่รัน init job ไม่ได้) ต้องมี logic นั้นใน process อยู่ดี ซึ่งการแยกนี้ไม่ให้
+
+## Set it up
+
+### 1. `deploy/compose/initdb.sql`
+
+image ทางการของ Postgres สร้าง database เดียวจาก `POSTGRES_DB`; ระบบนี้ต้องการสอง (`catalog` และ `orders`) init script ที่ mount เข้า directory entrypoint ของ image สร้างทั้งคู่ตอน boot ครั้งแรก:
+
+```sql
+CREATE DATABASE catalog;
+CREATE DATABASE orders;
+```
+
+บันทึกไฟล์นี้เป็น `deploy/compose/initdb.sql`
+
+### 2. `deploy/compose/docker-compose.yml`
+
+```yaml
+name: shopmicro
+
+x-app-build: &app-build
+  context: ../..
+  dockerfile: Dockerfile
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: shopmicro
+      POSTGRES_PASSWORD: shopmicro
+    volumes:
+      - ./initdb.sql:/docker-entrypoint-initdb.d/initdb.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shopmicro"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "5432:5432"
+
+  kafka:
+    image: apache/kafka:3.7.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    environment:
+      RABBITMQ_DEFAULT_USER: shopmicro
+      RABBITMQ_DEFAULT_PASS: shopmicro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "15672:15672"
+
+  migrate-catalog:
+    image: migrate/migrate:v4.17.1
+    volumes:
+      - ../../migrations/catalog:/migrations:ro
+    command:
+      ["-path", "/migrations", "-database",
+       "postgres://shopmicro:shopmicro@postgres:5432/catalog?sslmode=disable", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  migrate-order:
+    image: migrate/migrate:v4.17.1
+    volumes:
+      - ../../migrations/order:/migrations:ro
+    command:
+      ["-path", "/migrations", "-database",
+       "postgres://shopmicro:shopmicro@postgres:5432/orders?sslmode=disable", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  catalog:
+    build:
+      <<: *app-build
+      args:
+        TARGET: ./services/catalog/cmd
+    environment:
+      CATALOG_GRPC_ADDR: ":50051"
+      CATALOG_DB_URL: "postgres://shopmicro:shopmicro@postgres:5432/catalog?sslmode=disable"
+    depends_on:
+      migrate-catalog:
+        condition: service_completed_successfully
+
+  order:
+    build:
+      <<: *app-build
+      args:
+        TARGET: ./services/order/cmd
+    environment:
+      ORDER_GRPC_ADDR: ":50052"
+      ORDER_DB_URL: "postgres://shopmicro:shopmicro@postgres:5432/orders?sslmode=disable"
+      CATALOG_GRPC_ADDR: "catalog:50051"
+      KAFKA_BROKERS: "kafka:9092"
+    depends_on:
+      migrate-order:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+      catalog:
+        condition: service_started
+
+  payment:
+    build:
+      <<: *app-build
+      args:
+        TARGET: ./services/payment/cmd
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  notification:
+    build:
+      <<: *app-build
+      args:
+        TARGET: ./services/notification/cmd
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+      RABBITMQ_URL: "amqp://shopmicro:shopmicro@rabbitmq:5672/"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  notification-worker:
+    build:
+      <<: *app-build
+      args:
+        TARGET: ./services/notification/cmd/worker
+    environment:
+      RABBITMQ_URL: "amqp://shopmicro:shopmicro@rabbitmq:5672/"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  gateway:
+    build:
+      <<: *app-build
+      args:
+        TARGET: ./gateway/cmd
+    environment:
+      GATEWAY_HTTP_ADDR: ":8080"
+      CATALOG_GRPC_ADDR: "catalog:50051"
+      ORDER_GRPC_ADDR: "order:50052"
+    ports:
+      - "8080:8080"
+    depends_on:
+      catalog:
+        condition: service_started
+      order:
+        condition: service_started
+```
+
+บันทึกไฟล์นี้เป็น `deploy/compose/docker-compose.yml` มีบางจุดที่ควรพูดถึง:
+
+- **`x-app-build` เป็น YAML anchor** ที่ทุก app service ใช้ซ้ำผ่าน `<<: *app-build` ดังนั้น `context`/`dockerfile` ที่ใช้ร่วมเขียนครั้งเดียวและแต่ละเซอร์วิสเพิ่มแค่ arg `TARGET` ของตัวเอง — เสียงสะท้อนใน Compose file ของ "หนึ่ง Dockerfile หนึ่ง arg ต่อ binary" ของ [Service images →](/shopmicro/th/docker/service-images/)
+- **ทุก address ของ dependency เป็นชื่อเซอร์วิส Compose** — `postgres:5432`, `kafka:9092`, `catalog:50051`, `rabbitmq:5672` — ไม่เคย `localhost` ซึ่งข้างใน container หมายถึง container นั้น ไม่ใช่เพื่อนบ้าน
+- **startup graph ถูก encode ไม่ใช่สมมติ:** `migrate-*` job รอ Postgres *healthy*, app service รอ migration *เสร็จสำเร็จ* และ broker healthy, และ gateway รอ Catalog กับ Order เริ่ม — ดังนั้น `docker compose up` ยกทั้งหมดขึ้นในลำดับที่ถูกโดยไม่ต้อง sequence ด้วยมือ
+- **มีแค่ gateway (`8080`) และ management/debug port (`5432`, `15672`) ที่ publish** ไป host; เซอร์วิสคุยกันผ่าน network ภายในและไม่ต้องการ host port เลย
+
+## Verify
+
+จาก compose directory build ทุก image แล้วเริ่มทั้ง stack:
+
+```bash
+cd deploy/compose && docker compose up -d --build
+```
+
+Compose build ทั้งหก image เริ่ม Postgres/Kafka/RabbitMQ รอให้ผ่าน healthcheck รัน migration job ทั้งสองให้เสร็จ แล้วเริ่มเซอร์วิส ดูมันเข้าที่:
+
+```bash
+docker compose ps
+```
+
+```txt
+NAME                            STATUS
+shopmicro-catalog-1             Up
+shopmicro-gateway-1             Up
+shopmicro-kafka-1               Up (healthy)
+shopmicro-notification-1        Up
+shopmicro-notification-worker-1 Up
+shopmicro-order-1               Up
+shopmicro-payment-1             Up
+shopmicro-postgres-1            Up (healthy)
+shopmicro-rabbitmq-1            Up (healthy)
+```
+
+`migrate-*` job สองตัวจะไม่ปรากฏใน `ps` — มันรัน exit `0` แล้วเสร็จ ทีนี้รัน end-to-end smoke test *เดิม* จากบทก่อน ๆ [The Saga Handler →](/shopmicro/th/saga/orchestration/) เพียงแต่ทุก hop ตอนนี้เกิดระหว่าง container และสิ่งเดียวที่คุณคุยด้วยคือ gateway บน `8080` ของ host:
+
+```bash
+curl -s localhost:8080/v1/products
+```
+
+```json
+{}
+```
+
+```bash
+curl -s -X POST localhost:8080/v1/products \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Coffee Mug","description":"350ml ceramic mug","price_cents":1299,"stock":50}'
+```
+
+```bash
+curl -s -X POST localhost:8080/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
+```
+
+Poll คำสั่งซื้อกลับมาไม่กี่วินาทีต่อมาแล้วดูมันถึง `CONFIRMED` เอง — loop เต็ม `order.created` → Kafka → Payment → Kafka → saga รันข้างใน Compose ทั้งหมด และ Notification enqueue RabbitMQ job ที่ worker ส่ง ทั้งหมดโดยไม่มี `go run` เดียว:
+
+```bash
+curl -s localhost:8080/v1/orders/<id-from-above>
+```
+
+```json
+{ "status": "ORDER_STATUS_CONFIRMED", "totalCents": "2598" }
+```
+
+เช็คว่า Notification worker ส่งจริง ตรงจาก log ของ container:
+
+```bash
+docker compose logs notification-worker | tail -1
+```
+
+```txt
+sender: delivered notification for order ... (succeeded): Your order ... is confirmed ...
+```
+
+รื้อทั้งหมดลง — container, network, และ volume — ด้วยคำสั่งเดียว:
+
+```bash
+docker compose down -v
+```
+
+ตรวจสอบความเข้าใจ:
+
+- `CATALOG_GRPC_ADDR` ของ Order เป็น `catalog:50051` ไม่ใช่ `localhost:50051` `localhost` หมายถึงอะไรข้างใน container ของ Order และทำไม `localhost:50051` ถึงจะล้มเหลวที่นั่น?
+- `depends_on: [postgres]` เปล่า ๆ รอแค่ *container* ของ Postgres เริ่ม ทำไมนั่นถึงไม่พอสำหรับ `migrate-order` และ `condition: service_healthy` รออะไรแทน?
+- migration รันเป็นเซอร์วิส `migrate/migrate` ของตัวเองแทนที่จะ bake เข้า image ของ Order `.dockerignore` ของ [Service images →](/shopmicro/th/docker/service-images/) ทำอะไรที่สอดคล้องกับสิ่งนี้ และทำไมกัน migration ออกจาก image ของเซอร์วิส?
+- curl test แบบ end-to-end เหมือนบทก่อนเป๊ะทุก byte แต่ไม่มีอะไรรันด้วย `go run` อะไรเปลี่ยนเกี่ยวกับ *ที่* แต่ละ hop เกิด และอะไรเหมือนเดิมเกี่ยวกับ behavior ของระบบ?
+
+## Recap
+
+`deploy/compose/docker-compose.yml` คือทั้งระบบในไฟล์เดียว Postgres, Kafka, และ RabbitMQ ขึ้นมาพร้อม healthcheck; `migrate-catalog` และ `migrate-order` apply แต่ละ schema ครั้งเดียวแล้ว exit; และทั้งหก app image build จาก `Dockerfile` ที่ parameterize ได้ตัวเดียว [Service images →](/shopmicro/th/docker/service-images/) แต่ละตัวเลือก binary ด้วย build arg `TARGET` ผ่าน YAML anchor ที่ใช้ร่วม ทุกอย่างต่อสายด้วย DNS ของ Compose network — เซอร์วิส address กันด้วยชื่อ (`postgres:5432`, `kafka:9092`, `catalog:50051`) ไม่เคย `localhost` — และเรียงด้วย `depends_on` condition ดังนั้น migration รอ database ที่ healthy และ app รอ migration ที่เสร็จและ broker ที่ healthy `docker compose up -d --build` ยกทั้ง stack ขึ้น และ `curl` smoke test เดิมจากบทก่อนขับคำสั่งซื้อจริงถึง `CONFIRMED` พร้อม notification ที่ส่งแล้ว ทุก hop ตอนนี้ระหว่าง container แทนที่จะเป็น process บนเครื่อง แต่ Compose คือ local stack ที่สร้างซ้ำได้ — ไม่ใช่ production บทถัดไป [Kubernetes (Helm) →](/shopmicro/th/kubernetes/) package image เดียวกันเหล่านี้เป็น Helm chart แล้ว deploy ระบบไปยัง cluster จริง แลกความเรียบง่าย single-host ของ Compose กับ scaling, self-healing, และ rolling deploy

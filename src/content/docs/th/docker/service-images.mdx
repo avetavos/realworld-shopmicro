@@ -1,0 +1,146 @@
+---
+title: Service images
+description: "Dockerfile แบบ multi-stage ที่ parameterize ได้ตัวเดียว build ทุก Go binary ในโมโนเรโป — build stage ที่ cache module และสร้าง static binary แบบไม่มี CGO และ runtime stage บน distroless:nonroot ที่ ship เฉพาะ binary นั้น ทำไม multi-stage, static linking, distroless เทียบกับ alpine, และ non-root ตรวจสอบด้วยการ build shopmicro/order ดูขนาด image เล็ก ๆ แล้วรันกับ infra บน host"
+sidebar:
+  order: 1
+---
+
+## What we're building
+
+`Dockerfile` ตัวเดียวที่ repo root ที่ build binary *ตัวไหนก็ได้* ในระบบนี้ — `services/catalog/cmd`, `services/order/cmd`, `services/payment/cmd`, `services/notification/cmd`, `services/notification/cmd/worker`, และ `gateway/cmd` — เลือกด้วย build argument `TARGET` พร้อม `.dockerignore` ที่ทำให้ build context เล็ก มันคือ build สอง stage: **build stage** บน `golang` ที่ cache `go mod download` แยกจาก source แล้ว compile เป็น static binary ไม่มี CGO และ **runtime stage** บน `gcr.io/distroless/static:nonroot` ที่ copy เข้ามาเฉพาะ binary ตัวเดียวนั้น ไม่มีอะไรอื่น
+
+ทุกเซอร์วิสในคอร์สนี้ถูกรันแบบเดียวกันมาตลอด — `go run ./services/<x>/cmd` กับ infra บน `localhost` [Infra & Compose →](/shopmicro/th/setup/infra-compose/) บทนี้คือก้าวแรกสู่การรันมันเป็น container แทน: หนึ่ง image ต่อ binary ทั้งหมดผลิตจาก Dockerfile ตัวเดียว [The Compose stack →](/shopmicro/th/docker/compose-stack/) แล้วต่อ image เหล่านั้น, database, Kafka, และ RabbitMQ เข้าเป็น `docker compose up` เดียว
+
+## Why
+
+Dockerfile แบบง่าย — `FROM golang`, copy ทุกอย่าง, `go build`, `ENTRYPOINT` binary — ship ทั้ง Go toolchain, module cache, และ source tree ทั้งก้อนไว้ใน runtime image: หลายร้อยเมกะไบต์เพื่อรัน binary ที่ใหญ่แค่ไม่กี่สิบ **Multi-stage build** แก้ปัญหานั้นด้วยการแยก compilation ออกจาก runtime build stage มี compiler แล้วผลิต `/out/app`; runtime stage เริ่มจาก base ใหม่ที่เล็กที่สุดแล้ว copy *เฉพาะ* binary นั้นข้าม stage boundary ดังนั้นไม่มีอะไรจาก build stage — ไม่ใช่ toolchain ไม่ใช่ source ไม่ใช่ `.git` — จบลงใน image ที่ ship ผลลัพธ์คือ image ที่ขนาดเท่ากับ binary บวก base ไม่กี่เมกะไบต์
+
+รายละเอียดสองอย่างทำให้ binary นั้น copy เข้า base ที่เล็กที่สุดได้ **`CGO_ENABLED=0`** compile เป็น binary ที่ *link แบบ static* ไม่พึ่ง system C library ดังนั้นมันไม่ต้องการ glibc (หรืออะไรก็ตาม) ตอน runtime — รันบน `scratch` หรือ distroless ที่ไม่มี shared library เลยได้ **`-ldflags "-s -w"`** ตัด symbol table และ DWARF debug info ออก ลดขนาด binary ลงอีก รวมกันแล้วเปลี่ยนโปรแกรม Go เป็นไฟล์เดียวที่ self-contained ที่ runtime image ไม่ต้องมีอะไรอื่นมารัน
+
+runtime base คือ `gcr.io/distroless/static:nonroot` "Distroless" หมายถึงมันไม่มี shell ไม่มี package manager ไม่มี coreutils — มีแค่ไฟล์ไม่กี่ตัวที่ static binary ต้องการ (CA certificate, timezone data, `/etc/passwd`) นั่นคือการเลือกด้าน **security** อย่างตั้งใจ: image ที่ไม่มี shell คือ image ที่ attacker ที่เข้ามาได้ `curl | sh` ข้างในไม่ได้ และ image ที่ไม่มี package แทบไม่มี CVE surface ให้ patch variant `:nonroot` ยัง ship user แบบ non-root (uid 65532) ที่ Dockerfile เลือกด้วย `USER nonroot:nonroot` — ดังนั้น process ไม่มีวันรันเป็น root ซึ่งเป็น default การ hardening container ที่พบบ่อยที่สุด
+
+ชิ้นสุดท้ายคือ **layer caching** และเป็นเหตุผลที่ `go.mod`/`go.sum` ถูก copy แล้วรัน `go mod download` *ก่อน* source ที่เหลือ Docker cache แต่ละ step แล้วรัน step ใหม่เฉพาะเมื่อ input เปลี่ยน dependency เปลี่ยนน้อย; source เปลี่ยนตลอด การ copy แค่สองไฟล์ module ก่อนหมายความว่า layer `go mod download` ที่แพงถูกใช้ซ้ำทุก build ที่ dependency ไม่เปลี่ยน — มีแค่ step `go build` ที่เร็วเท่านั้นที่รันใหม่เมื่อคุณแก้ไฟล์ `.go` copy ทั้ง tree ก่อนแล้วทุกการแก้ source ทำลาย cache ของ download แล้ว fetch ทุก module ใหม่ทุก build
+
+## Pros & cons
+
+**Distroless runtime base** เทียบกับ **`alpine` (หรือ `debian` เต็ม) runtime base**
+
+- **Pros:** distroless ไม่มี shell และไม่มี package manager ดังนั้น CVE surface ของมันเป็นเศษเสี้ยวของ distro และไม่มี shell ให้ attacker ใช้; final image เล็กกว่าแม้กระทั่ง alpine เพราะไม่มี busybox ไม่มี apk ไม่มีอะไรนอกจากไฟล์ runtime ที่จำเป็นของ binary
+- **Cons:** ไม่มี shell หมายถึงคุณ `docker exec -it … sh` เข้า container ที่รันอยู่เพื่อสำรวจไม่ได้ — debug ผ่าน log, `docker cp`, หรือ ephemeral debug container แทน; และโปรแกรมที่ shell out ไป binary อื่นตอน runtime จริง ๆ จะทำงานบน distroless ไม่ได้ถ้าไม่เพิ่ม binary นั้นเข้ามาชัด ๆ ซึ่งเป็นข้อจำกัดจริงสำหรับบาง workload (ไม่ใช่เซอร์วิส pure-Go เหล่านี้)
+
+**Dockerfile ตัวเดียวที่ parameterize สำหรับทุก binary** เทียบกับ **Dockerfile แยกต่อเซอร์วิส**
+
+- **Pros:** ทุกเซอร์วิสถูก build ด้วยวิธีเดียวกันและถูกต้อง — caching, static flag, non-root, base image กำหนดครั้งเดียว ดังนั้นการ harden image เดียว harden ทั้งหมด และไม่มี drift ที่ Dockerfile ของเซอร์วิสหนึ่งลืม `CGO_ENABLED=0`; เซอร์วิสใหม่ไม่เสียไฟล์ Docker ใหม่ แค่ `TARGET` ใหม่
+- **Cons:** เซอร์วิสที่สุดท้ายต้องการอะไรพิเศษใน image (embedded asset, base ต่าง, CA bundle) แสดงมันในไฟล์ร่วมไม่ได้โดยไม่เพิ่ม conditional ที่กัดกร่อนประโยชน์ "ไฟล์ง่าย ๆ ตัวเดียว" — ถึงจุดนั้น Dockerfile เฉพาะสำหรับเซอร์วิสตัวนั้นสะอาดกว่าการแตกกิ่งไฟล์ร่วม
+
+## Set it up
+
+### 1. `Dockerfile`
+
+```dockerfile
+# syntax=docker/dockerfile:1
+ARG GO_VERSION=1.23
+
+# --- build stage: has the toolchain, produces one static binary ---
+FROM golang:${GO_VERSION}-alpine AS build
+WORKDIR /src
+
+# Copy only the module files first and download deps, so this layer is
+# cached and reused on every build where go.mod/go.sum didn't change.
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Now the source. Editing a .go file busts only from here down.
+COPY . .
+
+# TARGET selects which binary to build — passed with --build-arg.
+ARG TARGET=./services/catalog/cmd
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w" -o /out/app ${TARGET}
+
+# --- runtime stage: just the binary, no shell, non-root ---
+FROM gcr.io/distroless/static:nonroot AS runtime
+COPY --from=build /out/app /app
+USER nonroot:nonroot
+ENTRYPOINT ["/app"]
+```
+
+บันทึกไฟล์นี้เป็น `Dockerfile` ที่ repo root ค่า default ของ `TARGET` (`./services/catalog/cmd`) ใช้เฉพาะเมื่อคุณ build โดยไม่มี `--build-arg`; ทุก build จริงส่ง binary ที่ต้องการเข้ามา
+
+### 2. `.dockerignore`
+
+```txt
+.git
+.gitignore
+*.md
+migrations
+deploy
+**/*_test.go
+```
+
+บันทึกไฟล์นี้เป็น `.dockerignore` มันทำให้ build context — ทุกอย่างที่ Docker upload ไป daemon ก่อน build — เล็กและปลอดจากสิ่งที่ image ไม่เคยต้องการ: ประวัติ version-control, docs, SQL migration (รันแยก ไม่ bake เข้า image ของเซอร์วิส), deploy manifest, และไฟล์ test
+
+## Verify
+
+Build image ของ Order binary เลือกมันด้วย `TARGET`:
+
+```bash
+docker build --build-arg TARGET=./services/order/cmd -t shopmicro/order:dev .
+```
+
+ทีนี้ดูว่ามันเล็กแค่ไหน:
+
+```bash
+docker images shopmicro/order:dev
+```
+
+```txt
+REPOSITORY        TAG   IMAGE ID       CREATED         SIZE
+shopmicro/order   dev   a1b2c3d4e5f6   2 seconds ago   14.2MB
+```
+
+ราว ~15MB — คือ static binary บวก base ที่เล็กที่สุดของ distroless ไม่ใช่ ~800MB ที่ single-stage `golang` image จะผลิต build binary ตัวที่สองจาก Dockerfile *เดียวกัน* เพื่อพิสูจน์การ parameterize — notification worker อยู่ลึกลงไปอีกหนึ่ง directory:
+
+```bash
+docker build --build-arg TARGET=./services/notification/cmd/worker -t shopmicro/notification-worker:dev .
+```
+
+รัน image ของ Order กับ infra ที่ขึ้นอยู่บน host แล้ว [Infra & Compose →](/shopmicro/th/setup/infra-compose/) ชี้มันไปที่ host จากใน container ด้วย `host.docker.internal`:
+
+```bash
+docker run --rm \
+  -e ORDER_DB_URL="postgres://shopmicro:shopmicro@host.docker.internal:5432/orders?sslmode=disable" \
+  -e CATALOG_GRPC_ADDR="host.docker.internal:50051" \
+  -e KAFKA_BROKERS="host.docker.internal:9092" \
+  -p 50052:50052 \
+  shopmicro/order:dev
+```
+
+```txt
+order: outbox relay started
+order: saga consumer started, group=order topic=payments
+order: gRPC server listening on :50052
+```
+
+Order ที่เป็น container เริ่มเหมือนกับ `go run` เป๊ะ อ่าน env var เดียวกัน [The Saga Handler →](/shopmicro/th/saga/orchestration/) — เพียงแต่ตอนนี้มันเป็น image 15MB ที่ไม่มี shell และไม่มี toolchain ข้างใน หยุดมันด้วย `Ctrl-C`
+
+การส่ง env และ dependency ของทุกเซอร์วิสด้วยมือแบบนี้คือสิ่งที่น่าเบื่อเร็ว — ซึ่งเป็นเหตุผลทั้งหมดของบทถัดไป ก่อนอื่นยืนยันว่า image อยู่ครบ:
+
+```bash
+docker images | grep shopmicro
+```
+
+```txt
+shopmicro/order                dev   ...   14.2MB
+shopmicro/notification-worker  dev   ...   13.9MB
+```
+
+ตรวจสอบความเข้าใจ:
+
+- runtime image ~15MB แต่ single-stage `FROM golang` build ~800MB อะไรกันแน่ที่อยู่ใน image ที่สองแต่ไม่อยู่ในตัวแรก และ stage boundary ไหนที่กันมันออก?
+- ทำไม `go mod download` ถึงรันกับ copy ของแค่ `go.mod`/`go.sum` แทนที่จะรันหลัง `COPY . .`? เกิดอะไรกับ build time ถ้าคุณ copy ทั้ง tree ก่อน?
+- `CGO_ENABLED=0` เปลี่ยนอะไรเกี่ยวกับ binary ที่ compile ออกมา และทำไมนั่นถึงเป็นเงื่อนไขก่อนของการใช้ base แบบ `scratch` หรือ distroless?
+- Distroless ไม่มี shell บอกสิ่งหนึ่งที่ทำกับ container ที่รันอยู่ได้ยากขึ้นเพราะเหตุนี้ — และ attack หนึ่งประเภทที่มันป้องกัน
+
+## Recap
+
+`Dockerfile` ตัวเดียวที่ root build ทุก binary ในโมโนเรโป เลือกด้วย build arg `TARGET` build stage ของมัน copy `go.mod`/`go.sum` แล้วรัน `go mod download` ก่อน source เพื่อให้ dependency layer cache อยู่ แล้ว compile static binary ที่ strip แล้วด้วย `CGO_ENABLED=0 -ldflags "-s -w"`; runtime stage ของมัน copy เฉพาะ binary นั้นลงบน `gcr.io/distroless/static:nonroot` แล้วรันเป็น non-root user ที่ไม่มี shell และแทบไม่มี CVE surface ผลลัพธ์คือ image ~15MB ต่อเซอร์วิสแทนที่จะเป็น ~800MB ที่ single-stage build ship และ `docker run` พิสูจน์ว่า Order ที่เป็น container ทำงานเหมือน `go run` เป๊ะ อ่าน env var เดียวกัน แค่ถูก package `.dockerignore` ทำให้ build context ปลอดจากประวัติ, docs, migration, และ test การ build และต่อสายหกตัวนี้ด้วยมือน่าเบื่อ ซึ่งคือประเด็นของบทถัดไป: [The Compose stack →](/shopmicro/th/docker/compose-stack/) เอาทั้งหก image, ทั้งสอง database, Kafka, และ RabbitMQ ขึ้นมาด้วยกัน — พร้อมรัน migration และต่อ env var — ใน `docker compose up` เดียว
