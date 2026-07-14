@@ -7,5 +7,11 @@
   "compatibility_date": "2024-09-23",
   "assets": {
     "directory": "./.cf-assets"
-  }
+  },
+  // projects.avetavos.com is the shared host (taskflow owns it as a custom
+  // domain). ShopMicro is served under /shopmicro/* (Astro base) via a
+  // more-specific Workers route, the same way DevBlog is routed.
+  "routes": [
+    { "pattern": "projects.avetavos.com/shopmicro/*", "zone_name": "avetavos.com" }
+  ]
 }
