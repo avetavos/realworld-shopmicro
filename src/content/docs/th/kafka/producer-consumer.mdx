@@ -5,19 +5,19 @@ sidebar:
   order: 1
 ---
 
-## What we're building
+## สิ่งที่จะสร้าง
 
 `pkg/events/event.go` — struct `Event` เดียวที่เป็น JSON envelope ของ*ทุก*ข้อความที่ระบบนี้ publish ไป Kafka ไม่ว่าเซอร์วิสไหนจะเป็นคน produce หรือ consume ก็ตาม และ `pkg/kafka/kafka.go` — `Publisher` กับ `Consumer` ทั้งคู่เป็น wrapper บาง ๆ รอบ `segmentio/kafka-go` เพื่อให้ทุกเซอร์วิส produce และ consume envelope นั้นด้วยวิธีเดียวกัน แทนที่แต่ละตัวจะไปตั้งค่า `kafka.Writer`/`kafka.Reader` ของตัวเองใหม่ตั้งแต่ต้น ทั้งสอง package เป็นโค้ดที่ใช้ร่วมกัน: [The Transactional Outbox →](/shopmicro/th/order-service/outbox/) ระบุชื่อ relay ที่จะใช้ `Publisher` ไว้แล้ว (สร้างในบทถัดไป) และ Payment, Notification, และ Order Saga — Module 8, 9, และ 10 — จะใช้ `Consumer` เพื่อตอบสนองต่อ event เดียวกันเหล่านี้ทั้งหมด
 
-เพื่อพิสูจน์ว่า wrapper นี้ใช้งานได้จริงกับ broker จริงก่อนที่จะมีอะไรมาพึ่งพามัน บทนี้ยังเขียนโปรแกรมเล็ก ๆ ที่ใช้แล้วทิ้งสองตัว — `cmd/kafkademo/produce` กับ `cmd/kafkademo/consume` — ที่ publish event หนึ่งตัวแล้ว consume มันกลับมา กับ container Kafka ที่ [Infra & Compose →](/shopmicro/th/setup/infra-compose/) สร้างไว้แล้วใน Module 1
+เพื่อพิสูจน์ว่า wrapper นี้ใช้งานได้จริงกับ broker จริงก่อนจะมีใครมาพึ่งพา บทนี้ยังเขียนโปรแกรมเล็ก ๆ แบบใช้แล้วทิ้งสองตัว — `cmd/kafkademo/produce` กับ `cmd/kafkademo/consume` — ที่ publish event หนึ่งตัวแล้ว consume กลับมา กับ container Kafka ที่ [Infra & Compose →](/shopmicro/th/setup/infra-compose/) สร้างไว้แล้วใน Module 1
 
-## Why
+## ทำไม
 
-ทุกเซอร์วิสในระบบนี้สุดท้ายต้องทั้ง publish หรือ consume ข้อความ Kafka — Order (โมดูลนี้), Payment, Notification, และ Order Saga ทำทั้งหมด ถ้าไม่มี envelope ร่วมกัน แต่ละเซอร์วิสจะคิดรูปแบบ JSON ของ "สิ่งที่เกิดขึ้น" ขึ้นมาเอง แล้ว consumer ที่ทีมหนึ่งเขียนก็ต้องรู้ quirk เฉพาะของรูปแบบที่ producer ของอีกทีมเลือกใช้ `events.Event` แก้ปัญหานี้: struct เดียว รูปแบบ JSON เดียว ใช้เหมือนกันทุกที่ `ID` ระบุ event นั้นแบบไม่ซ้ำกัน (และใน [Outbox & Relay →](/shopmicro/th/kafka/outbox-relay/) จะกลายเป็น key ที่ consumer ที่ idempotent ใช้ dedupe), `Type` คือชื่อ event (`order.created`, `payment.succeeded` และอื่น ๆ), `AggregateID` คือ id ของ entity ที่ event นี้พูดถึง, `Payload` คือข้อมูลเฉพาะของ event นั้นในรูป JSON ดิบ และ `OccurredAt` คือเวลาที่มันเกิดขึ้น
+ทุกเซอร์วิสในระบบนี้สุดท้ายต้องทั้ง publish หรือ consume ข้อความ Kafka — Order (โมดูลนี้), Payment, Notification, และ Order Saga ทำทั้งหมด ถ้าไม่มี envelope ร่วมกัน แต่ละเซอร์วิสจะคิดรูปแบบ JSON ของ "สิ่งที่เกิดขึ้น" ขึ้นมาเอง แล้ว consumer ที่ทีมหนึ่งเขียนก็ต้องรู้ quirk เฉพาะของรูปแบบที่ producer ของอีกทีมเลือกใช้ `events.Event` แก้ปัญหานี้ด้วย struct เดียว รูปแบบ JSON เดียว ใช้เหมือนกันทุกที่ `ID` ระบุ event นั้นแบบไม่ซ้ำกัน (และใน [Outbox & Relay →](/shopmicro/th/kafka/outbox-relay/) จะกลายเป็น key ที่ consumer ที่ idempotent ใช้ dedupe), `Type` คือชื่อ event (`order.created`, `payment.succeeded` และอื่น ๆ), `AggregateID` คือ id ของ entity ที่ event นี้พูดถึง, `Payload` คือข้อมูลเฉพาะของ event นั้นในรูป JSON ดิบ และ `OccurredAt` คือเวลาที่ event เกิดขึ้น
 
-เมธอด `Run` ของ `Consumer` commit offset ด้วยมือ — `CommitMessages` จะรันก็ต่อเมื่อ `handle` คืนค่าสำเร็จเท่านั้น ไม่เคยรันก่อนหน้านั้นเลย การจัดลำดับแบบนี้เพียงอย่างเดียวคือสิ่งที่ทำให้ consumer ของ Kafka ในระบบนี้เป็น **at-least-once** ไม่ใช่ **at-most-once**: ถ้า consumer crash ระหว่างที่ `handle` ทำเสร็จแล้วกับตอนที่ commit ไปถึง Kafka ไม่มีบันทึกเลยว่าข้อความนี้ถูกประมวลผลแล้ว แล้ว Kafka จะ redeliver มันอีกครั้งหลัง restart นี่คือการตัดสินใจโดยตั้งใจ ไม่ใช่ความผิดพลาด — ทางเลือกอื่น (commit ก่อนแล้วค่อยประมวลผล) คือ *at-most-once* และการ crash ระหว่างสองขั้นตอนนั้นจะทำให้ event หายไปตลอดกาลอย่างเงียบ ๆ การทำ `order.created` หรือ `payment.succeeded` หายไปแย่กว่าการประมวลผลมันซ้ำเป็นบางครั้งมาก นี่คือเหตุผลที่ consumer ทุกตัวที่สร้างบน `Consumer.Run` ต้องเป็น idempotent — ข้อกำหนดที่ [Architecture →](/shopmicro/th/introduction/architecture/) ระบุไว้ตั้งแต่โมดูลแรก
+เมธอด `Run` ของ `Consumer` commit offset ด้วยมือ — `CommitMessages` จะรันก็ต่อเมื่อ `handle` คืนค่าสำเร็จเท่านั้น ไม่เคยรันก่อนหน้านั้นเลย การจัดลำดับแบบนี้เพียงอย่างเดียวคือสิ่งที่ทำให้ consumer ของ Kafka ในระบบนี้เป็น **at-least-once** ไม่ใช่ **at-most-once**: ถ้า consumer crash ระหว่างที่ `handle` ทำเสร็จแล้วกับตอนที่ commit ไปถึง Kafka ไม่มีบันทึกเลยว่าข้อความนี้ถูกประมวลผลแล้ว แล้ว Kafka จะ redeliver อีกครั้งหลัง restart นี่คือการตัดสินใจโดยตั้งใจ ไม่ใช่ความผิดพลาด ทางเลือกอีกแบบคือ commit ก่อนแล้วค่อยประมวลผล ที่เป็น *at-most-once* และการ crash ระหว่างสองขั้นตอนนั้นจะทำให้ event หายไปตลอดกาลอย่างเงียบ ๆ การทำ `order.created` หรือ `payment.succeeded` หายไปแย่กว่าการประมวลผลซ้ำเป็นบางครั้งมาก นี่คือเหตุผลที่ consumer ทุกตัวที่สร้างบน `Consumer.Run` ต้องเป็น idempotent — ข้อกำหนดที่ [Architecture →](/shopmicro/th/introduction/architecture/) ระบุไว้ตั้งแต่โมดูลแรก
 
-## Pros & cons
+## ข้อดีข้อเสีย
 
 **`pkg/kafka` wrapper ที่ใช้ร่วมกัน** เทียบกับ **แต่ละเซอร์วิสตั้งค่า `kafka.Writer`/`kafka.Reader` เอง**
 
@@ -29,7 +29,7 @@ sidebar:
 - **Pros:** commit จะเกิดขึ้นก็ต่อเมื่อข้อความถูกจัดการเสร็จสมบูรณ์แล้วเท่านั้น ดังนั้น crash กลางทางระหว่างประมวลผลจะจบด้วยการ redeliver เสมอ ไม่มีทางหายไปเงียบ ๆ — นี่คือการรับประกันที่ข้อกำหนด idempotency ของระบบนี้ถูกสร้างขึ้นมาบนฐานนั้น
 - **Cons:** consumer ทุกตัวตอนนี้ต้องเป็น idempotent จริง ๆ เพราะข้อความเดียวกันมาถึงสองครั้งได้จริง; auto-commit เข้าใจง่ายกว่าสำหรับ handler ที่ไม่สนใจความต่างนี้ (แลกกับช่วงเวลาสั้น ๆ แบบ at-most-once ที่ offset commit วิ่งแซงหน้าการประมวลผลไปก่อน)
 
-## Set it up
+## ติดตั้ง
 
 ### 1. `pkg/events/event.go`
 
@@ -55,7 +55,7 @@ type Event struct {
 }
 ```
 
-เซฟไฟล์นี้เป็น `pkg/events/event.go` `Payload` เป็น `json.RawMessage` ไม่ใช่ struct ที่เจาะจง — `events.Event` ไม่รู้และไม่สนใจว่า payload ของ event ตัวใดตัวหนึ่งหน้าตาเป็นอย่างไร มันแค่พา byte ที่ marshal ไว้แล้วผ่านไป แล้วให้แต่ละ consumer unmarshal `Payload` เป็น struct ที่ event type นั้นต้องการจริง ๆ
+เซฟไฟล์นี้เป็น `pkg/events/event.go` `Payload` เป็น `json.RawMessage` ไม่ใช่ struct ที่เจาะจง — `events.Event` ไม่รู้และไม่สนใจว่า payload ของ event ตัวไหนหน้าตาเป็นอย่างไร เพียงแค่พา byte ที่ marshal ไว้แล้วส่งผ่านไป จากนั้นให้แต่ละ consumer unmarshal `Payload` เป็น struct ที่ event type นั้นต้องการเอง
 
 ### 2. `pkg/kafka/kafka.go`
 
@@ -271,7 +271,7 @@ func main() {
 
 เซฟไฟล์นี้เป็น `cmd/kafkademo/consume/main.go` ทั้งสองไฟล์ default เป็น `KAFKA_BROKERS=localhost:9092` ตัวแปรและค่าเริ่มต้นเดียวกับที่ `.env.example` ของ [Repo Layout →](/shopmicro/th/setup/repo-layout/) ระบุไว้แล้ว
 
-## Verify
+## ตรวจสอบผล
 
 ตรวจสอบว่า container Kafka ของ Module 1 รันอยู่:
 
@@ -279,7 +279,7 @@ func main() {
 cd deploy/compose && docker compose up -d kafka
 ```
 
-เทอร์มินัลแรก รัน consumer ก่อนเป็นอันดับแรก เพื่อให้มัน subscribe ไว้แล้วตอนที่ message ถูก publish:
+เทอร์มินัลแรก ให้รัน consumer ก่อน เพื่อให้ subscribe รออยู่แล้วตอนที่ message ถูก publish:
 
 ```bash
 go run ./cmd/kafkademo/consume
@@ -301,7 +301,7 @@ published: demo-1
 consumed: id=demo-1 type=order.created aggregate_id=order-abc payload={"order_id":"order-abc","total_cents":2598}
 ```
 
-`AllowAutoTopicCreation` หมายความว่า topic `orders` ไม่ต้องมีอยู่มาก่อนเลย — การ publish ครั้งแรกสร้างมันขึ้นมาเอง หยุด consumer ด้วย `Ctrl-C`
+`AllowAutoTopicCreation` หมายความว่า topic `orders` ไม่ต้องมีอยู่มาก่อน เพราะการ publish ครั้งแรกจะสร้างขึ้นมาเอง หยุด consumer ด้วย `Ctrl-C`
 
 จากนั้นยืนยันว่า module ยัง build ผ่าน:
 
@@ -317,6 +317,6 @@ go build ./...
 - ถ้า `Consumer.Run` เรียก `CommitMessages` *ก่อน* เรียก `handle` แทนที่จะเรียกทีหลัง จะเปลี่ยนอะไรบ้าง?
 - ถ้า `handle` คืนค่า error ทำไม `Run` ถึงข้ามการ commit แล้วไปต่อ แทนที่จะคืน error ทันทีแล้วหยุด consumer ทั้งตัว?
 
-## Recap
+## สรุป
 
-`pkg/events.Event` คือ JSON envelope เดียวที่ทุก message บน Kafka ในระบบนี้ใช้ — `ID`, `Type`, `AggregateID`, `Payload`, `OccurredAt` — ดังนั้นไม่มีสองเซอร์วิสไหนคิดรูปแบบของตัวเองที่เข้ากันไม่ได้สำหรับ "สิ่งที่เกิดขึ้น" `pkg/kafka.Publisher` ห่อ `kafka.Writer` ที่ตั้งค่าด้วย `&kafka.Hash{}` (partition ตาม key), `AllowAutoTopicCreation`, และ `RequiredAcks: RequireAll` `pkg/kafka.Consumer` ห่อ `kafka.Reader` แล้ว expose `Run` ซึ่ง loop fetch → handle → commit จะเรียก `CommitMessages` ก็ต่อเมื่อ `handle` สำเร็จเท่านั้น — manual-commit, delivery แบบ **at-least-once** ซึ่งเป็นเหตุผลว่าทำไม consumer ทุกตัวที่สร้างบนนี้ต้องเป็น idempotent `cmd/kafkademo/produce` กับ `cmd/kafkademo/consume` พิสูจน์แล้วว่าทั้งสองฝั่งทำงานได้กับ Kafka broker จริงจาก Module 1 publish แล้ว consume event หนึ่งตัวแบบ end-to-end ต่อไป [Topics, Partitions & Consumer Groups →](/shopmicro/th/kafka/topics-groups/) จะอธิบายแนวคิดที่บทนี้ใช้ไปโดยไม่ได้เอ่ยชื่อ — partition, key, consumer group, และความ replay ได้ของ log — ก่อนที่ [Outbox & Relay →](/shopmicro/th/kafka/outbox-relay/) จะเอา `Publisher` ไปใช้งานจริง ปิด outbox pattern ที่ [The Transactional Outbox →](/shopmicro/th/order-service/outbox/) เริ่มไว้
+`pkg/events.Event` คือ JSON envelope เดียวที่ทุก message บน Kafka ในระบบนี้ใช้ — `ID`, `Type`, `AggregateID`, `Payload`, `OccurredAt` — ดังนั้นไม่มีสองเซอร์วิสไหนคิดรูปแบบของตัวเองที่เข้ากันไม่ได้สำหรับ "สิ่งที่เกิดขึ้น" `pkg/kafka.Publisher` ห่อ `kafka.Writer` ที่ตั้งค่าด้วย `&kafka.Hash{}` (partition ตาม key), `AllowAutoTopicCreation`, และ `RequiredAcks: RequireAll` `pkg/kafka.Consumer` ห่อ `kafka.Reader` แล้ว expose `Run` ซึ่ง loop fetch → handle → commit จะเรียก `CommitMessages` ก็ต่อเมื่อ `handle` สำเร็จเท่านั้น — manual-commit, delivery แบบ **at-least-once** นั่นคือเหตุผลว่าทำไม consumer ทุกตัวที่สร้างบนนี้ต้องเป็น idempotent `cmd/kafkademo/produce` กับ `cmd/kafkademo/consume` พิสูจน์แล้วว่าทั้งสองฝั่งทำงานได้กับ Kafka broker จริงจาก Module 1 publish แล้ว consume event หนึ่งตัวแบบ end-to-end ต่อไป [Topics, Partitions & Consumer Groups →](/shopmicro/th/kafka/topics-groups/) จะอธิบายแนวคิดที่บทนี้ใช้ไปโดยไม่ได้เอ่ยชื่อ — partition, key, consumer group, และความ replay ได้ของ log — ก่อนที่ [Outbox & Relay →](/shopmicro/th/kafka/outbox-relay/) จะเอา `Publisher` ไปใช้งานจริง ปิด outbox pattern ที่ [The Transactional Outbox →](/shopmicro/th/order-service/outbox/) เริ่มไว้

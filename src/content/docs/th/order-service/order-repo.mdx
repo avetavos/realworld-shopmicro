@@ -5,29 +5,33 @@ sidebar:
   order: 2
 ---
 
-## What we're building
+## สิ่งที่จะสร้าง
 
-`migrations/order/0001_init.sql` (ตาราง `orders`, `order_items`, และ `outbox`) และ `services/order/internal/repo/orders.go` — `OrderRepo` ที่มีเมธอด `Create` insert คำสั่งซื้อ รายการสินค้าของมัน และ outbox row ที่อธิบาย event ทั้งหมดอยู่ใน `pgx.Tx` **เดียว** จากนั้น `services/order/internal/server/server.go` — `Server` ตัวจริงที่ implement ทั้งสามเมธอดของ `OrderServiceServer` แทนที่ placeholder จาก [The gRPC Server →](/shopmicro/th/order-service/grpc-server/) และในที่สุดก็นำ Catalog client ที่ inject ไว้มาใช้งานจริง: `CreateOrder` หาราคาปัจจุบันของแต่ละรายการจาก Catalog ก่อนที่จะแตะ repository เลย
+`migrations/order/0001_init.sql` (ตาราง `orders`, `order_items`, และ `outbox`) และ `services/order/internal/repo/orders.go` — `OrderRepo` ที่มีเมธอด `Create` insert ตัวคำสั่งซื้อ รายการสินค้า และ outbox row ที่อธิบาย event ทั้งหมดไว้ใน `pgx.Tx` **เดียว** จากนั้น `services/order/internal/server/server.go` — `Server` ตัวจริงที่ implement ทั้งสามเมธอดของ `OrderServiceServer` แทนที่ placeholder จาก [The gRPC Server →](/shopmicro/th/order-service/grpc-server/) และในที่สุดก็นำ Catalog client ที่ inject ไว้มาใช้งานจริง: `CreateOrder` หาราคาปัจจุบันของแต่ละรายการจาก Catalog ก่อนที่จะแตะ repository เลย
 
-## Why
+## ทำไม
 
-`OrderRepo.Create` เขียนลงสามตาราง — `orders`, `order_items`, และ `outbox` — และทั้งสามการเขียนใช้ transaction เดียวกันโดยตั้งใจ คำสั่งซื้อ รายการสินค้าที่ประกอบเป็นมัน และข้อเท็จจริงที่ว่า event นี้เกิดขึ้นแล้ว คือความจริงชุดเดียวที่เป็นอะตอมิก: ถ้า crash เกิดขึ้นระหว่างการ insert order กับการ insert outbox row คำสั่งซื้อนั้นจะมีอยู่ในฐานข้อมูลโดยไม่มีบันทึกที่ไหนเลยว่า `order.created` ควรถูก publish — ทุก consumer ปลายทาง (Payment ใน [Order Saga →](/shopmicro/th/saga/) — Module 9) จะไม่มีวันรู้ว่าคำสั่งซื้อนี้มีอยู่จริง transaction เดียวทำให้ failure mode นี้เป็นไปไม่ได้ด้วยโครงสร้าง: ทั้งสามการเขียนสำเร็จพร้อมกัน หรือไม่สำเร็จเลยสักอย่าง [The Transactional Outbox →](/shopmicro/th/order-service/outbox/) คือจุดที่ *เหตุผล* เบื้องหลังการเขียน event ลงตารางฐานข้อมูลแทนที่จะ publish ตรงไปที่ Kafka จะได้รับคำอธิบายเต็มรูปแบบ — บทนี้แค่เขียนโค้ดที่ทำให้การรับประกันแบบ transaction เดียวเป็นจริง
+`OrderRepo.Create` เขียนลงสามตาราง — `orders`, `order_items`, และ `outbox` — และทั้งสามการเขียนใช้ transaction เดียวกันโดยตั้งใจ ตัวคำสั่งซื้อ รายการสินค้าที่ประกอบขึ้นเป็นคำสั่งซื้อนั้น และข้อเท็จจริงว่า event นี้เกิดขึ้นแล้ว คือความจริงชุดเดียวที่ต้องเป็นอะตอมิก
+
+ถ้า crash เกิดขึ้นระหว่างการ insert order กับการ insert outbox row คำสั่งซื้อจะมีอยู่ในฐานข้อมูลโดยไม่มีบันทึกที่ไหนเลยว่า `order.created` ควร publish ออกไป consumer ปลายทางทุกตัว รวมถึง Payment ใน [Order Saga →](/shopmicro/th/saga/) Module 9 จะไม่มีวันรู้ว่าคำสั่งซื้อใบนี้มีอยู่จริง transaction เดียวทำให้ failure mode นี้เป็นไปไม่ได้ด้วยโครงสร้าง คือทั้งสามการเขียนสำเร็จพร้อมกัน หรือไม่สำเร็จเลยสักอย่าง
+
+[The Transactional Outbox →](/shopmicro/th/order-service/outbox/) คือจุดที่ *เหตุผล* เบื้องหลังการเขียน event ลงตารางฐานข้อมูลแทนการ publish ตรงไป Kafka จะได้รับคำอธิบายเต็มรูปแบบ ส่วนบทนี้แค่เขียนโค้ดที่ทำให้การรับประกันแบบ transaction เดียวเป็นจริง
 
 การตั้งราคาอยู่ในชั้น `Server` ไม่ใช่ repository ด้วยเหตุผลเดียวกับที่ validation อยู่ใน [The Product API →](/shopmicro/th/catalog-service/product-api/): `OrderRepo.Create` รับรายการที่ตั้งราคาไว้แล้ว (`[]PricedItem`) และไม่รู้เลยด้วยซ้ำว่า Catalog มีอยู่ การตัดสินใจว่า *จะหาราคาอย่างไร* — เรียก gRPC สด ๆ ในกรณีของคอร์สนี้ — เป็นการตัดสินใจระดับชั้น API ที่ repository ไม่ควรต้องรู้
 
-## Pros & cons
+## ข้อดีข้อเสีย
 
 **`pgx.Tx` เดียวที่ห่อการ insert order, การ insert แต่ละรายการ, และการ insert outbox**
 
-- **Pros:** เป็นอะตอมิกด้วยโครงสร้าง — ไม่มี code path ไหนที่คำสั่งซื้อถูกบันทึกโดยไม่มีรายการสินค้าของมัน หรือบันทึกโดยไม่มี event ที่จะประกาศมันในที่สุด; `defer tx.Rollback(ctx)` เดียวหลัง `Begin` หมายความว่า error ใด ๆ ที่ไหนก็ตามใน function นี้ — insert ผิดพลาด, JSON marshal ล้มเหลว, อะไรก็ตาม — จะย้อนกลับทุกอย่างที่เขียนไปแล้วใน call นี้อย่างปลอดภัย
-- **Cons:** transaction ตอนนี้ถือ row lock คร่อมสามตารางตลอดช่วงเวลาของมัน แทนที่จะเป็นตารางเดียว ซึ่งเป็น critical section ที่ยาวกว่าการ insert ตารางเดียว; ความล้มเหลวของ JSON marshal สำหรับ outbox payload (ไม่น่าเกิดแต่เป็นไปได้ ถ้า field ในอนาคตไม่สามารถ serialize ได้) ตอนนี้ทำให้การสร้างคำสั่งซื้อล้มเหลวทั้งหมด ผูก reliability ของการ serialize event เข้ากับ reliability ของการสั่งซื้อเลย
+- **Pros:** เป็นอะตอมิกด้วยโครงสร้าง ไม่มี code path ไหนที่บันทึกคำสั่งซื้อโดยไม่มีรายการสินค้า หรือบันทึกโดยไม่มี event ไว้ประกาศในภายหลัง `defer tx.Rollback(ctx)` เพียงบรรทัดเดียวหลัง `Begin` ทำให้ error ที่จุดไหนก็ตามใน function นี้ ไม่ว่าจะ insert ผิดพลาดหรือ JSON marshal ล้มเหลว ย้อนกลับทุกอย่างที่เขียนไปใน call นี้ได้อย่างปลอดภัย
+- **Cons:** transaction ถือ row lock คร่อมสามตารางตลอดช่วงชีวิตของตัวเอง แทนที่จะล็อกแค่ตารางเดียว ทำให้ critical section ยาวกว่าการ insert ตารางเดียว และความล้มเหลวของ JSON marshal สำหรับ outbox payload ซึ่งไม่น่าเกิดแต่เป็นไปได้ถ้าอนาคตมี field ที่ serialize ไม่ได้ จะทำให้การสร้างคำสั่งซื้อล้มเหลวทั้งหมด เท่ากับผูก reliability ของการ serialize event เข้ากับ reliability ของการสั่งซื้อไปเลย
 
 **`codes.FailedPrecondition` สำหรับสินค้าที่ Catalog รายงานว่าไม่พบ แทนที่จะเป็น `codes.InvalidArgument`**
 
 - **Pros:** ตัว request เองถูกต้องตามไวยากรณ์ — `product_id` เป็น string ที่มีรูปแบบถูกต้อง — ปัญหาคือ *ข้อเท็จจริงเกี่ยวกับสถานะระบบปัจจุบัน* (ไม่มีสินค้านั้นอยู่ตอนนี้) ซึ่งตรงกับความหมายของ `codes.FailedPrecondition` ตามแนวทาง status code ของ gRPC เอง แตกต่างจาก request ที่ผิดรูปแบบ client แยกความแตกต่างสองอย่างนี้ได้: "คุณส่งสิ่งที่ server ไม่มีวันรับได้" (`InvalidArgument`) กับ "สิ่งที่คุณส่งอาจถูกต้องขึ้นอยู่กับสถานะ" (`FailedPrecondition`)
 - **Cons:** ความแตกต่างนี้ค่อนข้างละเอียดอ่อนและถูกใช้ไม่สม่ำเสมอใน API จริง — caller ต้องรู้ธรรมเนียม status code ของ gRPC จริง ๆ ถึงจะแยกสองแบบนี้ได้ และ client จำนวนมากก็แค่ปฏิบัติกับทั้งคู่เหมือนเป็น "bad request" แล้วไปต่อโดยไม่สนใจความแตกต่าง
 
-## Set it up
+## ติดตั้ง
 
 ### 1. Migration
 
@@ -48,8 +52,8 @@ migrate -path migrations/order -database "$ORDER_DB_URL" up
 มีการตัดสินใจเรื่องรูปร่างสองสามอย่างที่ควรพูดถึงตอนนี้ (ตาราง `outbox` จะได้รับคำอธิบายของตัวเองเต็ม ๆ ใน [The Transactional Outbox →](/shopmicro/th/order-service/outbox/)):
 
 - **`status` ถูกเก็บเป็น `text` ตัวพิมพ์เล็ก** — `'pending'`, `'confirmed'`, `'cancelled'` — ไม่ใช่ enum `OrderStatus` ของ proto ฐานข้อมูลไม่รู้จัก protobuf เลย `toProtoStatus` ของ `Server` (ด้านล่าง) คือจุดเดียวที่ map ระหว่างทั้งสองรูปแบบ
-- **`order_items.order_id references orders(id) on delete cascade`** หมายความว่าการลบคำสั่งซื้อ (คอร์สนี้ไม่เคยทำ แต่เครื่องมือ admin ในอนาคตอาจทำ) จะลบรายการสินค้าของมันโดยอัตโนมัติ — ไม่มีแถวกำพร้าให้ต้องเก็บกวาดเอง
-- **`outbox.aggregate_id`** คือ id ของแถวที่ event นี้พูดถึง — ทุก event ที่เกี่ยวกับคำสั่งซื้อในคอร์สนี้ชี้กลับไปที่ `orders.id` ซึ่งเป็นสิ่งที่ทำให้ consumer ในอนาคต (หรือ query สำหรับ debug) หา "ทุก event ของคำสั่งซื้อนี้" ได้ด้วย `where aggregate_id = $1` เดียว
+- **`order_items.order_id references orders(id) on delete cascade`** หมายความว่าการลบคำสั่งซื้อ ซึ่งคอร์สนี้ไม่เคยทำ แต่เครื่องมือ admin ในอนาคตอาจทำ จะลบรายการสินค้าของคำสั่งซื้อนั้นโดยอัตโนมัติ — ไม่มีแถวกำพร้าให้ต้องเก็บกวาดเอง
+- **`outbox.aggregate_id`** คือ id ของแถวที่ event นี้พูดถึง — ทุก event ที่เกี่ยวกับคำสั่งซื้อในคอร์สนี้ชี้กลับไปที่ `orders.id` นั่นคือสิ่งที่ทำให้ consumer ในอนาคต (หรือ query สำหรับ debug) หา "ทุก event ของคำสั่งซื้อนี้" ได้ด้วย `where aggregate_id = $1` เดียว
 
 ### 2. `OrderRepo`
 
@@ -313,9 +317,9 @@ func (r *OrderRepo) UpdateStatus(ctx context.Context, id, status string) error {
 
 บันทึกไฟล์นี้เป็น `services/order/internal/repo/orders.go` มีรายละเอียดที่ควรพูดถึงนอกเหนือจาก transaction เดียวของ `Create`:
 
-- **`Get` และ `ListByCustomer` เรียก helper ส่วนตัว `itemsForOrder` เหมือนกัน** แทนที่จะเขียน query `select ... from order_items` ซ้ำสองครั้ง `ListByCustomer` ยอมจ่ายด้วย query เพิ่มต่อคำสั่งซื้อหนึ่งครั้ง (N+1) — ยอมรับได้ในระดับของคอร์สนี้ และเป็นตัวเลือกที่จะทำเป็น query แบบ join เดียวได้ถ้าจุดนี้กลายเป็น hot path จริง ๆ ซึ่งเป็น trade-off แบบเดียวกับที่ [The Postgres Repository →](/shopmicro/th/catalog-service/postgres-repo/) พูดถึงไปแล้วสำหรับ repository ที่เรียบง่ายขนาดนี้
+- **`Get` และ `ListByCustomer` เรียก helper ส่วนตัว `itemsForOrder` เหมือนกัน** แทนที่จะเขียน query `select ... from order_items` ซ้ำสองครั้ง `ListByCustomer` ยอมจ่ายด้วย query เพิ่มต่อคำสั่งซื้อหนึ่งครั้ง (N+1) — ยอมรับได้ในระดับของคอร์สนี้ และเป็นตัวเลือกที่จะทำเป็น query แบบ join เดียวได้ถ้าจุดนี้กลายเป็น hot path จริง ๆ ที่เป็น trade-off แบบเดียวกับที่ [The Postgres Repository →](/shopmicro/th/catalog-service/postgres-repo/) พูดถึงไปแล้วสำหรับ repository ที่เรียบง่ายขนาดนี้
 - **`UpdateStatus` เช็ค `eventType == ""` ก่อนเปิด transaction เลย** — สถานะที่ไม่ถูกต้อง (อะไรก็ตามที่ไม่ใช่ `"confirmed"` หรือ `"cancelled"`) จะถูกปฏิเสธทันที ดังนั้น function นี้ไม่มีทางเริ่ม transaction ที่ต้องมา rollback อยู่ดี
-- **`tag.RowsAffected() == 0` คือวิธีที่ `UpdateStatus` ตรวจจับ "ไม่มีคำสั่งซื้อนี้"** `UPDATE` ไม่คืน `pgx.ErrNoRows` แบบที่ `SELECT` ที่ได้ศูนย์แถวทำ — มันสำเร็จพร้อม command tag ที่บอกว่าแตะกี่แถว และศูนย์คือสัญญาณที่ต้องถือว่าไม่พบในที่นี้
+- **`tag.RowsAffected() == 0` คือวิธีที่ `UpdateStatus` ตรวจจับ "ไม่มีคำสั่งซื้อนี้"** `UPDATE` ไม่คืน `pgx.ErrNoRows` แบบที่ `SELECT` ซึ่งได้ศูนย์แถวคืนมา แต่จะสำเร็จพร้อม command tag ที่บอกว่าแตะไปกี่แถว และเลขศูนย์คือสัญญาณที่เราถือว่า "ไม่พบ" ในที่นี้
 - **ทุกค่าในทุก query ยังคงถูก bind เป็น `$1`, `$2`, ...** — วินัยป้องกัน SQL injection แบบเดียวกับ `ProductRepo` ไม่มีข้อยกเว้นแม้แต่กับ payload ที่ถูก marshal เป็น JSON แล้ว
 
 ### 3. `CreateOrder` RPC handler
@@ -457,8 +461,8 @@ func toProtoStatus(s string) orderv1.OrderStatus {
 
 บันทึกไฟล์นี้เป็น `services/order/internal/server/server.go` มีรายละเอียดเรื่องการ map และ validation ที่ควรพูดถึง:
 
-- **`CreateOrder` ตั้งราคาทีละรายการ ใน loop ตามลำดับ** แต่ละ call `s.catalog.GetProduct` คือ gRPC round trip ของตัวมันเอง ดังนั้นคำสั่งซื้อที่มีห้ารายการต่างกันจะเรียกตามลำดับห้าครั้งก่อนที่ transaction จะเริ่มด้วยซ้ำ นี่คือต้นทุน latency จริงที่ควรพูดตรง ๆ — เวอร์ชันโปรดักชันอาจตั้งราคาแบบขนานหรือรวมเป็น Catalog RPC เดียว แต่ทั้งสองอย่างไม่มีอยู่ใน `.proto` contract ของคอร์สนี้ ดังนั้น loop ตามลำดับคือสิ่งที่ถูกต้องจริง ๆ ในตอนนี้
-- **`status.FromError(err)` แกะ error ของ gRPC กลับมาเป็น `codes.Code` กับข้อความ** นี่คือวิธีที่ `CreateOrder` แยก "Catalog บอกว่าสินค้านี้ไม่มีอยู่" (`codes.NotFound` จาก `GetProduct` ของ Catalog เอง) ออกจาก "การเรียก Catalog เองล้มเหลว" (network error, timeout) — มีแค่กรณีแรกเท่านั้นที่กลายเป็น `codes.FailedPrecondition`; กรณีที่สองกลายเป็น `codes.Internal` เพราะมันไม่ใช่ข้อเท็จจริงเกี่ยวกับสินค้าเลย
+- **`CreateOrder` ตั้งราคาทีละรายการ ใน loop ตามลำดับ** แต่ละ call `s.catalog.GetProduct` คือ gRPC round trip หนึ่งครั้ง คำสั่งซื้อที่มีห้ารายการต่างกันจึงยิงเรียงกันห้าครั้งก่อนที่ transaction จะเริ่มด้วยซ้ำ นี่คือต้นทุน latency จริงที่ควรพูดตรง ๆ — เวอร์ชันโปรดักชันอาจตั้งราคาแบบขนานหรือรวมเป็น Catalog RPC เดียว แต่ทั้งสองอย่างไม่มีอยู่ใน `.proto` contract ของคอร์สนี้ ดังนั้น loop ตามลำดับคือสิ่งที่ถูกต้องจริง ๆ ในตอนนี้
+- **`status.FromError(err)` แกะ error ของ gRPC กลับมาเป็น `codes.Code` กับข้อความ** นี่คือวิธีที่ `CreateOrder` แยก "Catalog บอกว่าสินค้านี้ไม่มีอยู่" (`codes.NotFound` จาก `GetProduct` ของ Catalog เอง) ออกจาก "การเรียก Catalog เองล้มเหลว" (network error, timeout) — มีแค่กรณีแรกเท่านั้นที่กลายเป็น `codes.FailedPrecondition` ส่วนกรณีที่สองกลายเป็น `codes.Internal` เพราะไม่ได้บอกข้อเท็จจริงอะไรเกี่ยวกับตัวสินค้าเลย
 - **`errors.Is(err, pgx.ErrNoRows)` เหมือนกับ `ProductRepo`/`Server` ใน Catalog ทุกประการ** `OrderRepo.Get` ห่อสิ่งที่ `Scan` คืนกลับมาด้วย `%w` ดังนั้น `GetOrder` จึงยัง unwrap ห่วงโซ่เพื่อหา sentinel ข้างในและแปลงเป็น `codes.NotFound` ได้
 - **`o.CreatedAt.Format(time.RFC3339)` ของ `toProto`** แปลง `time.Time` ของ repository เป็น `string` ธรรมดาที่ `.proto` contract ประกาศไว้สำหรับ `Order.created_at` — [The Contracts →](/shopmicro/th/proto-grpc/contracts/) เลือก field `string` แทน `google.protobuf.Timestamp` สำหรับคอร์สนี้ ดังนั้นการ map จึงเป็นแค่ call `Format` เดียว ไม่ใช่การแปลงแบบ `timestamppb`
 
@@ -537,7 +541,7 @@ func main() {
 
 บันทึกไฟล์นี้ทับ `services/order/cmd/main.go` การเปลี่ยนแปลงเดียวจากเวอร์ชันของ [The gRPC Server →](/shopmicro/th/order-service/grpc-server/): `orderRepo := repo.New(pool)` กับ `orderServer := server.New(orderRepo, catalogClient)` สร้าง dependency chain ตัวจริง และ `RegisterOrderServiceServer` ลงทะเบียน `orderServer` แทน `&placeholderServer{catalog: catalogClient}` pool, listener, การ dial Catalog, การลงทะเบียน reflection, goroutine ที่ serve, และการจัดการ signal ทั้งหมดไม่เปลี่ยนแปลง — ไม่มีสิ่งไหนในนั้นเคยเกี่ยวข้องกับ placeholder เลยตั้งแต่แรก
 
-## Verify
+## ตรวจสอบผล
 
 รัน Catalog แล้วรัน Order:
 
@@ -625,6 +629,6 @@ go build ./...
 
 ไม่มี output แปลว่าสำเร็จ
 
-## Recap
+## สรุป
 
 `migrations/order/0001_init.sql` สร้าง `orders`, `order_items`, และ `outbox` — ตัวสุดท้ายมี partial index บนแถวที่ยังไม่ publish ซึ่ง [The Transactional Outbox →](/shopmicro/th/order-service/outbox/) จะอธิบายเต็ม ๆ `OrderRepo.Create` ใน `services/order/internal/repo/orders.go` insert คำสั่งซื้อ ทุกรายการสินค้า และ outbox row `order.created` อยู่ใน `pgx.Tx` เดียว ดังนั้นทั้งสามอย่างจึงสำเร็จพร้อมกันหรือไม่สำเร็จเลย; `Get`, `ListByCustomer`, และ `UpdateStatus` ทำให้ repository สมบูรณ์ ตัวสุดท้ายเขียน outbox row `order.confirmed`/`order.cancelled` ของตัวเองสำหรับ [Order Saga →](/shopmicro/th/saga/) (Module 9) ที่จะเรียกใช้ในที่สุด `Server` ใน `services/order/internal/server/server.go` implement `CreateOrder` โดยตั้งราคาทุกรายการผ่าน Catalog client ที่ inject ไว้ — `codes.FailedPrecondition` สำหรับสินค้าที่ Catalog รายงานว่าไม่มี, `codes.Internal` สำหรับความล้มเหลวอื่น ๆ ของ Catalog — ก่อนที่จะเรียก `repo.Create` เลย; `GetOrder` และ `ListOrders` เชื่อมตรงไปที่ repository `grpcurl` ยืนยันเส้นทางทั้งหมดแบบ end-to-end: สร้างสินค้าใน Catalog สั่งซื้อใน Order โดยตั้งราคาจาก `price_cents` จริงของสินค้านั้น ดึงกลับมา แสดงรายการ และเห็นทั้ง `codes.FailedPrecondition` กับ `codes.InvalidArgument` ทำงานถูกต้อง นั่นคือ Order service ที่สร้างคำสั่งซื้อจริงพร้อมราคาที่ถูกต้อง ต่อไป [The Transactional Outbox →](/shopmicro/th/order-service/outbox/) จะอธิบายว่าทำไมการ insert `outbox` นั้น — ไม่ใช่การ publish ตรงไปที่ Kafka — คือสิ่งที่ทำให้ `order.created` เชื่อถือได้

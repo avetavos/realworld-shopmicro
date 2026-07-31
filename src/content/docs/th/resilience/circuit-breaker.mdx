@@ -5,42 +5,46 @@ sidebar:
   order: 2
 ---
 
-## What we're building
+## สิ่งที่จะสร้าง
 
 `pkg/resilience/breaker.go` — `grpc.UnaryClientInterceptor` ตัวที่สาม, `BreakerInterceptor`, backed ด้วย `sony/gobreaker` เพิ่มเป็นลิงก์ *นอกสุด* ใน chain ที่ `DialOptions()` [Timeouts & retries →](/shopmicro/th/resilience/timeouts-retries/) สร้างไว้แล้ว ไม่มีการแก้ call site: gateway และ Order dial ผ่าน `resilience.DialOptions()` อยู่แล้ว ดังนั้นการต่อสาย breaker เข้า helper ตัวเดียวนั้น harden ทุก synchronous hop พร้อมกัน บทนี้ยัง frame คำถามที่ breaker บังคับให้ caller ตอบ — **graceful degradation**: เมื่อ breaker open และ call ล้มเหลวทันที `CreateOrder` ควร *ทำ* อะไรกันแน่?
 
-## Why
+## ทำไม
 
-Retry แก้ *blip* — dependency ที่ down วินาทีเดียวแล้วกลับมา มันทำร้าย *outage ยาว* อย่างจริงจัง ถ้า Catalog down สองนาที ทุกคำสั่งซื้อที่วางในสองนาทีนั้นยังจ่ายค่า failure เต็มราคาที่ [Timeouts & retries →](/shopmicro/th/resilience/timeouts-retries/) คิด: สาม attempt แต่ละอันรอ timeout ได้ถึง 3 วินาที บวก backoff ระหว่างนั้น — เกือบสิบวินาทีของเวลา caller และสาม network attempt ที่ตายแน่ ต่อ request เพื่อไปถึง `Unavailable` เดิมที่ attempt แรกรู้อยู่แล้ว คูณด้วยทุก request ที่กำลังทำงาน แล้ว retry เองกลายเป็น load บน dependency ที่พยายามฟื้น และกอง goroutine ที่ block สิบวินาทีต่ออันฝั่ง caller การ retry คือ move ที่ถูกสำหรับ blip และผิดสำหรับ outage และ caller บอกไม่ได้ว่าอยู่ในแบบไหนจาก request เดียว
+Retry แก้ *blip* ได้ดี คือกรณีที่ dependency down วินาทีเดียวแล้วกลับมา แต่กลับทำร้ายหนักเมื่อเจอ *outage ยาว*
 
-**Circuit breaker** คือ component ที่บอกได้ เพราะมันจำ มันเฝ้าผลลัพธ์ของ call ล่าสุดไปยัง dependency แล้วเก็บ state:
+ถ้า Catalog down สองนาที ทุกคำสั่งซื้อที่วางในช่วงนั้นยังจ่ายค่า failure เต็มราคาตามที่ [Timeouts & retries →](/shopmicro/th/resilience/timeouts-retries/) คิดไว้ — สาม attempt แต่ละอันรอ timeout ได้ถึง 3 วินาที บวก backoff ระหว่างนั้น รวมเกือบสิบวินาทีของเวลา caller และสาม network attempt ที่ตายแน่นอน เพียงเพื่อไปเจอ `Unavailable` ตัวเดิมที่ attempt แรกรู้อยู่แล้ว
+
+คูณด้วยทุก request ที่กำลังวิ่งอยู่ retry เองก็กลายเป็น load ที่ถล่ม dependency ซึ่งกำลังพยายามฟื้น พร้อมกับกอง goroutine ที่ block สิบวินาทีต่ออันฝั่ง caller การ retry จึงเป็นท่าที่ถูกสำหรับ blip แต่ผิดสำหรับ outage และ caller ก็แยกไม่ออกจาก request เดียวว่ากำลังเจอแบบไหน
+
+**Circuit breaker** คือ component ที่แยกออก เพราะจำสิ่งที่เพิ่งเกิดขึ้นได้ โดยเฝ้าผลลัพธ์ของ call ล่าสุดไปยัง dependency แล้วเก็บเป็น state:
 
 - **Closed** (สุขภาพดี): call ผ่านตรง ๆ ทุก failure ถูกนับ
-- **Open** (trip แล้ว): เมื่อ failure ข้าม threshold, breaker "open" แล้วทุก call return error *ทันที* — ไม่มี network attempt ไม่มี timeout ไม่มี retry นี่คือประเด็นทั้งหมด: เมื่อรู้ว่า dependency down หยุดเสียเวลาและ load ค้นพบมันซ้ำแล้วซ้ำเล่า
+- **Open** (trip แล้ว): เมื่อ failure ข้าม threshold, breaker "open" แล้วทุก call return error *ทันที* — ไม่มี network attempt ไม่มี timeout ไม่มี retry นี่คือประเด็นทั้งหมด: เมื่อรู้แล้วว่า dependency down ก็เลิกเสียเวลาและ load ไปค้นพบเรื่องเดิมซ้ำแล้วซ้ำเล่า
 - **Half-open** (ทดสอบการฟื้น): หลัง cooldown, breaker ปล่อย trial call เดียวผ่าน ถ้าสำเร็จ breaker close แล้ว traffic ปกติกลับมา; ถ้าล้มเหลว breaker open อีกครั้งเพื่อ cooldown รอบใหม่
 
 วางไว้ *นอกสุด* ใน chain ของ interceptor, breaker short-circuit ก่อน retry loop จะเริ่มด้วยซ้ำ — ดังนั้น breaker ที่ trip แล้วหมายถึง retry เป็นศูนย์และ timeout เป็นศูนย์ แค่ `codes.Unavailable` ทันที ลำดับนั้นตั้งใจและตรงข้ามกับความผิดพลาด: ถ้า breaker อยู่ *ข้างใน* retry loop, retry interceptor จะ retry error open-state ของ breaker เองอย่างยินดี ซึ่งคือ work ที่เสียเปล่าที่ breaker มีไว้เพื่อหยุดพอดี
 
-รายละเอียดความถูกต้องที่ละเอียดอ่อนคือ **อะไรนับเป็น failure** breaker ต้อง trip บน failure แบบ *infrastructure* — dependency เข้าไม่ถึงหรือค้าง (`Unavailable`, `DeadlineExceeded`) — และต้อง **ไม่** trip บน failure แบบ *business* `GetProduct` ที่ return `codes.NotFound` เพราะ product id ไม่มีอยู่ หรือ `codes.InvalidArgument` เพราะ request malformed คือ dependency ทำงาน *สมบูรณ์แบบ* — มันปฏิเสธ request ที่แย่อย่างถูกต้อง ถ้าพวกนั้นนับเข้าการ trip, burst ของ 404 จาก client ที่ขอ product ที่ไม่มีจะ open breaker แล้วน็อค Catalog สำหรับทุก request ที่ *ถูกต้อง* ด้วย — outage ที่สร้างเองจาก client error ปกติ ดังนั้น `BreakerInterceptor` report เฉพาะ error ที่มี infrastructure code ให้ breaker และส่งทุก business error ตรงไปยัง caller โดยที่ breaker ไม่เคยเห็นมันเป็น failure
+รายละเอียดความถูกต้องที่ละเอียดอ่อนคือ **อะไรนับเป็น failure** breaker ต้อง trip บน failure แบบ *infrastructure* — dependency เข้าไม่ถึงหรือค้าง (`Unavailable`, `DeadlineExceeded`) — และต้อง **ไม่** trip บน failure แบบ *business* `GetProduct` ที่ return `codes.NotFound` เพราะ product id ไม่มีอยู่ หรือ `codes.InvalidArgument` เพราะ request malformed แปลว่า dependency ทำงาน *ได้สมบูรณ์แบบ* คือปฏิเสธ request ที่แย่อย่างถูกต้อง ถ้านับเคสเหล่านั้นเข้าไปด้วย burst ของ 404 จาก client ที่ขอ product ที่ไม่มีอยู่จะ open breaker แล้วน็อค Catalog สำหรับทุก request ที่ *ถูกต้อง* ตามไปด้วย กลายเป็น outage ที่สร้างขึ้นเองจาก client error ธรรมดา `BreakerInterceptor` จึง report เฉพาะ error ที่มี infrastructure code ให้ breaker และส่ง business error ทุกตัวตรงไปยัง caller โดยที่ breaker ไม่นับเป็น failure เลย
 
-แล้วก็คำถามที่ breaker ส่งให้ caller เมื่อ breaker open, call ของ `CreateOrder` ไป Catalog ล้มเหลว *ทันที* ด้วย `Unavailable` — ซึ่งดีกว่าล้มเหลวช้าแน่นอน แต่มันก็ยังเป็น failure และตอนนี้ caller ต้องตัดสินว่าจะ **degrade** อย่างไร:
+ทีนี้มาถึงคำถามที่ breaker โยนกลับไปให้ caller เมื่อ breaker open call ของ `CreateOrder` ไป Catalog จะล้มเหลว *ทันที* ด้วย `Unavailable` ซึ่งดีกว่าล้มเหลวช้าแน่นอน แต่ก็ยังเป็น failure อยู่ดี และ caller ต้องตัดสินใจว่าจะ **degrade** อย่างไร:
 
 - บน **write path** นี้ คำตอบที่ตรงไปตรงมาคือ **fail fast และสะอาด** Order ตั้งราคาคำสั่งซื้อไม่ได้จริง ๆ ถ้าไม่มีราคาปัจจุบันของ Catalog — ไม่มี fallback ปลอดภัยที่จะแต่งราคาขึ้นมา — ดังนั้น `CreateOrder` return `Unavailable` ขึ้นไปถึง gateway ซึ่งกลายเป็น HTTP 503 ที่ client retry ทีหลังได้ สำคัญคือ failure นี้เกิดขึ้น *ก่อน* การ write database หรือ outbox row ใด ๆ ดังนั้นไม่มีคำสั่งซื้อที่สร้างค้าง ไม่มี state กำพร้า ไม่มีอะไรต้อง clean up graceful degradation บน write ที่ไปต่อไม่ได้หมายถึงล้มเหลวในแบบที่ทิ้งระบบไว้เหมือนเดิมเป๊ะ
-- บน **read path**, degradation บางครั้งทำได้ดีกว่าการล้มเหลว การ list product อาจเสิร์ฟข้อมูล stale เล็กน้อยจาก cache หรือ return partial response พร้อม flag "ข้อมูลบางส่วนไม่พร้อม" แทน hard error — แลกความสดกับ availability คอร์สนี้ไม่สร้าง cache นั้น (มันเป็นบทเรียนของตัวเอง) แต่ breaker คือสิ่งที่ทำให้ *ทางเลือก* ชัด: fast failure คือพื้น และ read path เลือกที่จะปีนสูงกว่านั้นได้
+- บน **read path**, degradation บางครั้งทำได้ดีกว่าการล้มเหลว การ list product อาจเสิร์ฟข้อมูล stale เล็กน้อยจาก cache หรือ return partial response พร้อม flag "ข้อมูลบางส่วนไม่พร้อม" แทน hard error — เท่ากับแลกความสดของข้อมูลกับ availability คอร์สนี้ไม่ได้สร้าง cache ตัวนั้น เพราะเป็นบทเรียนของตัวเองอีกบท แต่ breaker คือสิ่งที่ทำให้ *ทางเลือก* ชัดขึ้น fast failure คือพื้นขั้นต่ำ และ read path จะเลือกปีนสูงกว่านั้นก็ได้
 
-## Pros & cons
+## ข้อดีข้อเสีย
 
 **Circuit breaker หน้า dependency ที่ down ยาว** เทียบกับ **retry อย่างเดียว**
 
 - **Pros:** เมื่อ trip แล้ว call ล้มเหลวในระดับไมโครวินาทีแทนที่จะเผา timeout-and-retry budget เต็มก้อนต่ออัน ซึ่งทั้งปลด goroutine ของ caller และหยุดกอง retry load บน dependency ที่พยายามฟื้น; state half-open ให้การตรวจจับการฟื้นแบบอัตโนมัติและถูก — trial call เดียว ไม่ใช่ท่วม — ดังนั้นระบบกู้ตัวเองทันทีที่ dependency กลับมาจริง
-- **Cons:** breaker เพิ่ม state และ tuning จริงที่ retry เปล่า ๆ ไม่มี — trip threshold, cooldown, จำนวน half-open request ล้วนเป็น knob ที่ตั้งผิดแล้วจะ trip เร็วเกิน (ทำร้าย availability ตอนสะดุดสั้น ๆ) หรือช้าเกิน (ทำลายจุดประสงค์ fast-fail); และ breaker ที่ open ล้มเหลว request ที่ *อาจ* สำเร็จ เพราะมันคาดการณ์จาก failure ล่าสุดไปยัง call ถัดไป — การเดิมพันที่ตั้งใจและบางครั้งผิดว่า dependency ยัง down อยู่
+- **Cons:** breaker เพิ่ม state และ tuning จริงที่ retry เปล่า ๆ ไม่มี — trip threshold, cooldown, จำนวน half-open request ล้วนเป็น knob ที่ตั้งผิดแล้วจะ trip เร็วเกิน (ทำร้าย availability ตอนสะดุดสั้น ๆ) หรือช้าเกินจนทำลายจุดประสงค์ fast-fail และ breaker ที่ open ก็ทำให้ request ที่ *อาจ* สำเร็จล้มเหลวไปด้วย เพราะคาดการณ์ call ถัดไปจาก failure ล่าสุด เป็นการเดิมพันที่ตั้งใจว่า dependency ยัง down อยู่ ซึ่งบางครั้งก็เดิมพันผิด
 
 **นับเฉพาะ infrastructure error เข้าการ trip** เทียบกับ **นับทุก error ที่ไม่ nil**
 
-- **Pros:** breaker trip บนสิ่งที่มันควรตรวจจับ — dependency เข้าไม่ถึง — และ closed อยู่ตลอด business rejection ปกติ ดังนั้นพายุ `NotFound`/`InvalidArgument` จาก request client ที่แย่ไม่มีวัน open breaker แล้วเปลี่ยน 404 ธรรมดาเป็น outage เต็มสำหรับ traffic ที่ถูกต้อง
-- **Cons:** มันหมายถึงการจำแนกทุก error ด้วย gRPC code และการจำแนกต้องถูกต้องต่อไปเมื่อเซอร์วิสวิวัฒน์ — Catalog ที่พังจริงและ (ผิด ๆ) return `InvalidArgument` สำหรับทุกอย่างจะแล่นผ่าน breaker เพราะ interceptor เชื่อว่า code หมายความตามที่มันบอก; breaker ดีเท่ากับความซื่อสัตย์ของ status code ที่มันตรวจสอบเท่านั้น
+- **Pros:** breaker trip เฉพาะกับสิ่งที่ควรตรวจจับจริง ๆ คือ dependency ที่เข้าไม่ถึง และยัง closed อยู่ตลอดช่วง business rejection ปกติ ดังนั้นพายุ `NotFound`/`InvalidArgument` จาก request client ที่แย่ไม่มีวัน open breaker แล้วเปลี่ยน 404 ธรรมดาเป็น outage เต็มสำหรับ traffic ที่ถูกต้อง
+- **Cons:** ต้องจำแนกทุก error ด้วย gRPC code และการจำแนกนั้นต้องถูกต้องต่อไปเรื่อย ๆ เมื่อเซอร์วิสวิวัฒน์ Catalog ที่พังจริงแต่ดันคืน `InvalidArgument` ให้ทุกอย่างจะแล่นผ่าน breaker ไปเฉย ๆ เพราะ interceptor เชื่อว่า code สื่อความหมายตามที่เขียนไว้ สรุปคือ breaker ดีได้แค่เท่าที่ status code ที่ตรวจสอบอยู่ซื่อสัตย์เท่านั้น
 
-## Set it up
+## ติดตั้ง
 
 ### 1. `pkg/resilience/breaker.go`
 
@@ -124,9 +128,9 @@ func countsAsFailure(err error) bool {
 }
 ```
 
-บันทึกไฟล์นี้เป็น `pkg/resilience/breaker.go` `MaxRequests`, `Timeout`, และ threshold ของ failure อยู่ inline ใน `gobreaker.Settings` เพื่อให้เห็น breaker ทั้งตัวในมุมมองเดียว; ยกมันเป็น named constant ข้าง `defaultTimeout` ถ้าคุณอยากให้ tune ได้ข้าง ๆ policy ที่เหลือ
+บันทึกไฟล์นี้เป็น `pkg/resilience/breaker.go` `MaxRequests`, `Timeout`, และ threshold ของ failure อยู่ inline ใน `gobreaker.Settings` เพื่อให้เห็น breaker ทั้งตัวได้ในมุมมองเดียว ถ้าอยากให้ tune ได้ข้าง ๆ policy ที่เหลือ ก็ยกขึ้นเป็น named constant ไว้ข้าง `defaultTimeout` ได้
 
-### 2. เพิ่มมันเข้า chain ใน `pkg/resilience/interceptor.go`
+### 2. เพิ่มเข้า chain ใน `pkg/resilience/interceptor.go`
 
 breaker อยู่ *นอกสุด* นำหน้า retry ดังนั้น breaker ที่ open short-circuit ก่อน retry หรือ timeout ใด ๆ จะรัน:
 
@@ -145,7 +149,7 @@ func DialOptions() []grpc.DialOption {
 
 นั่นคือการแก้ `interceptor.go` เพียงอย่างเดียว และ **ไม่มีการแก้ที่ call site ใด ๆ** — gateway และ Order ส่ง `resilience.DialOptions()` อยู่แล้ว ดังนั้นทั้งคู่ตอนนี้อยู่หลัง breaker อัตโนมัติ chain เต็มต่อ call ตอนนี้คือ: breaker (fail fast ถ้า open) → retry (transient failure ที่ idempotent) → timeout (deadline ต่อ attempt) → gRPC invoker จริง
 
-## Verify
+## ตรวจสอบผล
 
 ยก Postgres ขึ้นมาแล้วรัน Catalog, Order, และ gateway:
 
@@ -193,13 +197,13 @@ done
 503   (real 0.003s) ← breaker open, failing fast
 ```
 
-การพลิกจากวินาทีเป็นมิลลิวินาทีนั้นคือ breaker ทำงาน: มันหยุดจ่ายค่าการค้นพบเมื่อ outage ถูกยืนยันแล้ว ทุกอันเป็น HTTP 503 สะอาดโดยไม่มีคำสั่งซื้อสร้างค้าง — Order ล้มเหลวบน call ตั้งราคาก่อน write อะไร ดังนั้นไม่มีอะไรต้อง roll back ทีนี้เอา Catalog กลับมา:
+การพลิกจากหน่วยวินาทีเหลือมิลลิวินาทีคือหลักฐานว่า breaker ทำงาน เพราะเลิกจ่ายค่าไปค้นหาความจริงซ้ำ ๆ เมื่อยืนยัน outage ได้แล้ว ทุก request จบเป็น HTTP 503 สะอาด ๆ โดยไม่มีคำสั่งซื้อค้างถูกสร้างขึ้น — Order ล้มเหลวบน call ตั้งราคาก่อน write อะไร ดังนั้นไม่มีอะไรต้อง roll back ทีนี้เอา Catalog กลับมา:
 
 ```bash
 go run ./services/catalog/cmd
 ```
 
-รอ cooldown 10 วินาทีของ breaker ให้ผ่าน แล้ววางคำสั่งซื้ออีกอัน breaker เป็น half-open ปล่อย trial call นี้ผ่าน มันสำเร็จกับ Catalog ที่ตอนนี้สุขภาพดี แล้ว breaker close — traffic กลับมาเต็มโดยไม่ต้องแทรกแซงด้วยมือ:
+รอ cooldown 10 วินาทีของ breaker ให้ผ่าน แล้ววางคำสั่งซื้ออีกอัน breaker จะอยู่ในสถานะ half-open และปล่อย trial call นี้ผ่านไป call สำเร็จกับ Catalog ที่กลับมาสุขภาพดีแล้ว breaker จึง close — traffic กลับมาเต็มโดยไม่ต้องแทรกแซงด้วยมือ:
 
 ```json
 {
@@ -215,7 +219,7 @@ go run ./services/catalog/cmd
 for i in $(seq 1 10); do curl -s -o /dev/null -w "%{http_code}\n" localhost:8080/v1/products/does-not-exist; done
 ```
 
-ทุกอัน return `404` และ breaker closed อยู่ — `GetProduct` ที่ถูกต้องหลังจากนั้นยังสำเร็จทันที พายุ not-found คือ dependency ทำงานอย่างถูกต้อง และ breaker เพิกเฉยมันอย่างถูกต้อง
+ทุกอัน return `404` และ breaker closed อยู่ — `GetProduct` ที่ถูกต้องหลังจากนั้นยังสำเร็จทันที พายุ not-found คือหลักฐานว่า dependency ทำงานถูกต้อง และ breaker ก็เพิกเฉยได้อย่างถูกต้องเช่นกัน
 
 แล้วยืนยันว่า module ยังคง build ผ่าน:
 
@@ -227,11 +231,13 @@ go build ./...
 
 ตรวจสอบความเข้าใจ:
 
-- ทำไม breaker ถึงวางไว้ *นอกสุด* ใน chain นำหน้า retry interceptor? work ที่เสียเปล่าอะไรเกิดขึ้นถ้ามันอยู่ข้างใน retry loop แทน?
-- burst ของ `codes.NotFound` จาก client ที่ขอ product ที่ไม่มีต้องไม่ trip breaker แต่ burst ของ `codes.Unavailable` ควร ตรงไหนใน `BreakerInterceptor` ที่ทำการแยกแยะนั้น และการนับ `NotFound` จะทำให้เกิด outage อะไร?
+- ทำไมต้องวาง breaker ไว้ *นอกสุด* ของ chain นำหน้า retry interceptor? จะเกิดงานเสียเปล่าอะไรบ้างถ้าย้ายไปอยู่ข้างใน retry loop แทน?
+- burst ของ `codes.NotFound` จาก client ที่ขอ product ที่ไม่มีต้องไม่ trip breaker แต่ burst ของ `codes.Unavailable` ควร ตรงไหนใน `BreakerInterceptor` ที่แยกแยะนั้น และการนับ `NotFound` จะทำให้เกิด outage อะไร?
 - breaker ล้มเหลว `CreateOrder` เร็วเมื่อ open ทำไม "fail fast แล้ว return 503" ถึงเป็น degradation ที่ถูกสำหรับ write path นี้ และทำไมไม่มีคำสั่งซื้อกำพร้าค้างไว้?
 - half-open ปล่อย trial call เดียวผ่านพอดี (`MaxRequests: 1`) ทำไมไม่ให้ traffic ทั้งหมดกลับมาทันทีที่ cooldown จบ?
 
-## Recap
+## สรุป
 
-`pkg/resilience/breaker.go` เพิ่ม `BreakerInterceptor`, unary client interceptor ที่ backed ด้วย `sony/gobreaker`, เป็นลิงก์นอกสุดใน chain ของ `DialOptions()` — ดังนั้น dependency ที่ down ยาว trip breaker หลัง infrastructure failure ติดกันห้าครั้ง และทุก call ถัดมา return `codes.Unavailable` ในระดับไมโครวินาทีโดยไม่มี network attempt, retry, หรือ timeout จนกว่า cooldown 10 วินาทีและ half-open trial call เดียวยืนยันการฟื้นแล้ว close มันอีกครั้ง เฉพาะ error ที่มี infrastructure code (`Unavailable`, `DeadlineExceeded`) นับเข้าการ trip; business rejection อย่าง `NotFound` และ `InvalidArgument` แล่นผ่านโดยไม่ถูกแตะ ดังนั้น client error ธรรมดาไม่มีวันสร้าง outage ให้ตัวเอง เพราะ gateway และ Order dial ผ่าน `resilience.DialOptions()` อยู่แล้ว breaker harden ทุก synchronous hop โดยไม่มีการแก้ call site เลย จบ chain breaker → retry → timeout → invoker และมันบังคับคำถาม degradation ของ caller ให้เปิดเผย: บน order write path คำตอบที่ตรงไปตรงมาคือ fail fast และสะอาดด้วย 503 ทิ้งไว้โดยไม่มีคำสั่งซื้อสร้างค้าง เพราะไม่มีทางปลอดภัยที่จะตั้งราคาโดยไม่มี Catalog — ในขณะที่ read path เลือกเสิร์ฟข้อมูล stale หรือ partial แทนได้ ฝั่ง synchronous ของ ShopMicro ตอนนี้มีขอบเขต กู้ตัวเองได้ และรู้ทัน outage บทถัดไป [Testing →](/shopmicro/th/testing/) เอาทั้งหมด — เซอร์วิส, event, และ resilience layer นี้ — ไปอยู่ใต้ automated test ที่พิสูจน์ behavior แทนที่จะเชื่อคำ `curl`
+`pkg/resilience/breaker.go` เพิ่ม `BreakerInterceptor`, unary client interceptor ที่ backed ด้วย `sony/gobreaker`, เป็นลิงก์นอกสุดใน chain ของ `DialOptions()` — ดังนั้น dependency ที่ down ยาว trip breaker หลัง infrastructure failure ติดกันห้าครั้ง และทุก call ถัดมา return `codes.Unavailable` ในระดับไมโครวินาทีโดยไม่มี network attempt, retry, หรือ timeout จนกว่า cooldown 10 วินาทีและ half-open trial call เพียงครั้งเดียวจะยืนยันการฟื้น แล้ว close breaker อีกครั้ง เฉพาะ error ที่มี infrastructure code (`Unavailable`, `DeadlineExceeded`) นับเข้าการ trip; business rejection อย่าง `NotFound` และ `InvalidArgument` แล่นผ่านโดยไม่ถูกแตะ ดังนั้น client error ธรรมดาไม่มีวันสร้าง outage ให้ตัวเอง เพราะ gateway และ Order dial ผ่าน `resilience.DialOptions()` อยู่แล้ว breaker จึง harden ทุก synchronous hop โดยไม่ต้องแก้ call site เลยสักจุด ปิด chain ครบเป็น breaker → retry → timeout → invoker
+
+ที่สำคัญคือ breaker ดึงคำถามเรื่อง degradation ของ caller ขึ้นมาให้ตอบอย่างเปิดเผย บน order write path คำตอบที่ตรงไปตรงมาที่สุดคือ fail fast และจบสะอาดด้วย 503 โดยไม่ทิ้งคำสั่งซื้อค้างไว้ เพราะไม่มีทางปลอดภัยที่จะตั้งราคาโดยไม่มี Catalog — ส่วน read path เลือกเสิร์ฟข้อมูล stale หรือ partial แทนได้ ฝั่ง synchronous ของ ShopMicro ตอนนี้มีขอบเขต กู้ตัวเองได้ และรู้ทัน outage บทถัดไป [Testing →](/shopmicro/th/testing/) เอาทั้งหมด — เซอร์วิส, event, และ resilience layer นี้ — ไปอยู่ใต้ automated test ที่พิสูจน์ behavior แทนที่จะเชื่อคำ `curl`

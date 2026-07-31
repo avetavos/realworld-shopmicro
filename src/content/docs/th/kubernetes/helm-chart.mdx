@@ -5,37 +5,43 @@ sidebar:
   order: 1
 ---
 
-## What we're building
+## สิ่งที่จะสร้าง
 
-`deploy/helm/shopmicro/` — Helm chart ที่ package ทั้งระบบสำหรับ Kubernetes ทุก binary ที่ Module 13 containerize [Service images →](/shopmicro/th/docker/service-images/) กลายเป็น Kubernetes `Deployment`: `catalog`, `order`, และ `payment` แยกกัน; `notification` และ `notification-worker` เป็น consumer ที่ไม่มี inbound port; และ `gateway` อยู่หน้าทุกตัวพร้อม `Service` (และ `Ingress` แบบ optional) บน HTTP `8080` gRPC service สองตัวที่ pod อื่นเรียก — `catalog` กับ `order` — ได้ `ClusterIP` `Service` เพื่อให้ชื่อของมัน resolve ได้ภายใน cluster `ConfigMap` ถือ env ที่ไม่ลับ (`KAFKA_BROKERS`, `RABBITMQ_URL`), `Secret` ถือ database URL, และ `templates/_helpers.tpl` รวมชื่อและ label ไว้ที่เดียวเพื่อให้ทุก object ถูก tag เหมือนกัน
+`deploy/helm/shopmicro/` — Helm chart ที่ package ทั้งระบบสำหรับ Kubernetes ทุก binary ที่ Module 13 containerize [Service images →](/shopmicro/th/docker/service-images/) กลายเป็น Kubernetes `Deployment`: `catalog`, `order`, และ `payment` แยกกัน; `notification` และ `notification-worker` เป็น consumer ที่ไม่มี inbound port; และ `gateway` อยู่หน้าทุกตัวพร้อม `Service` (และ `Ingress` แบบ optional) บน HTTP `8080` gRPC service สองตัวที่ pod อื่นเรียกหา — `catalog` กับ `order` — ได้ `ClusterIP` `Service` เพื่อให้ชื่อ Service resolve ได้ภายใน cluster ส่วน `ConfigMap` ถือ env ที่ไม่ลับ (`KAFKA_BROKERS`, `RABBITMQ_URL`), `Secret` ถือ database URL และ `templates/_helpers.tpl` รวมชื่อกับ label ไว้ที่เดียวเพื่อ tag ทุก object ให้เหมือนกัน
 
-ทุกอย่างขับด้วย `values.yaml`: image repository และ tag, จำนวน replica ต่อ service, และ endpoint ของ infrastructure ที่ใช้ร่วมกัน chart นี้ตั้งใจ **ไม่** package Postgres, Kafka, หรือ RabbitMQ — มันถือว่าพวกนี้ถูกจัดการจากภายนอกแล้วชี้ `values.yaml` ไปยังที่ที่มันรันอยู่ บทนี้สร้างและ lint chart; [Deploying to the cluster →](/shopmicro/th/kubernetes/deploy-cluster/) install มันเข้า cluster จริงแล้วรัน `curl` smoke test เดียวกับที่ทั้งคอร์สใช้ กับ pod แทน `go run`
+ทุกอย่างขับด้วย `values.yaml`: image repository และ tag, จำนวน replica ต่อ service, และ endpoint ของ infrastructure ที่ใช้ร่วมกัน chart นี้ตั้งใจ **ไม่** package Postgres, Kafka หรือ RabbitMQ เข้าไปด้วย แต่ถือว่ามีคนจัดการจากภายนอกแล้ว `values.yaml` จึงแค่ชี้ไปยังตำแหน่งที่ระบบเหล่านั้นรันอยู่ บทนี้สร้างและ lint chart ส่วน [Deploying to the cluster →](/shopmicro/th/kubernetes/deploy-cluster/) จะ install chart เข้า cluster จริงแล้วรัน `curl` smoke test เดียวกับที่ใช้มาทั้งคอร์ส เพียงแต่เปลี่ยนจาก `go run` เป็น pod
 
-## Why
+## ทำไม
 
-Docker Compose [Compose stack →](/shopmicro/th/docker/compose-stack/) รันทั้ง 6 service บนเครื่องเดียวอยู่แล้ว Kubernetes ตอบคำถามที่ Compose ไม่ตอบ: พวกนี้รันข้ามหลายเครื่องอย่างไร, restart ตัวเองเมื่อ crash อย่างไร, roll out เวอร์ชันใหม่โดยไม่ downtime อย่างไร, และ scale `notification-worker` เป็นห้า replica โดยไม่แตะ service อื่นอย่างไร Helm chart คือวิธีอธิบายทั้งหมดนั้นเป็น package เดียวที่ version และ parameterize ได้ — `helm install` ครั้งเดียว แล้ว cluster reconcile ความเป็นจริงให้ตรงกับ manifest ที่ chart render การเขียน Kubernetes YAML ดิบด้วยมือก็ได้ แต่คุณต้องก๊อป Deployment boilerplate เดิมหกครั้งและแก้ image tag ด้วยมือข้ามไฟล์เป็นสิบทุกครั้งที่ release; templating ของ Helm ยุบมันลงเหลือ `values.yaml` บวก template หนึ่งตัวต่อ object แต่ละ *kind*
+Docker Compose [Compose stack →](/shopmicro/th/docker/compose-stack/) รันทั้ง 6 service บนเครื่องเดียวอยู่แล้ว Kubernetes ตอบคำถามที่ Compose ไม่ตอบ: พวกนี้รันข้ามหลายเครื่องอย่างไร, restart ตัวเองเมื่อ crash อย่างไร, roll out เวอร์ชันใหม่โดยไม่ downtime อย่างไร, และ scale `notification-worker` เป็นห้า replica โดยไม่แตะ service อื่นอย่างไร Helm chart คือวิธีอธิบายทั้งหมดนั้นเป็น package เดียวที่ version และ parameterize ได้ — `helm install` ครั้งเดียว แล้ว cluster reconcile ความเป็นจริงให้ตรงกับ manifest ที่ chart render จะเขียน Kubernetes YAML ดิบด้วยมือก็ได้ แต่ต้องก๊อป Deployment boilerplate เดิมหกครั้ง แล้วไล่แก้ image tag ข้ามไฟล์เป็นสิบทุกครั้งที่ release ส่วน templating ของ Helm ยุบทั้งหมดนั้นลงเหลือ `values.yaml` บวก template หนึ่งตัวต่อ object แต่ละ *kind*
 
-สิ่งสำคัญที่สุดที่ต้องเข้าใจใน chart นี้คือความละเอียดอ่อนที่มองไม่เห็นตอน dev local: **`CATALOG_GRPC_ADDR` หมายถึงสองอย่างต่างกันขึ้นกับว่า pod ไหนอ่านมัน** ใน `catalog` pod มันคือ *bind address* — `main` ของ `catalog` ส่งมันให้ `net.Listen` ดังนั้นมันต้องเป็น `:50051` (listen บน port นั้นทุก interface) ใน `order` และ `gateway` pod มันคือ *dial address* — พวกมันส่งมันให้ `grpc.NewClient` เพื่อเข้าถึง Catalog ดังนั้นมันต้องเป็น `catalog:50051`, DNS name ที่ Kubernetes ให้ `Service` ของ Catalog local ทั้งคู่ยุบเป็น `:50051` เพราะ `net.Listen(":50051")` และ dial `localhost:50051` คือ host เดียวกัน — ดังนั้น [The gRPC Server →](/shopmicro/th/order-service/grpc-server/) จึงใช้ค่าเดียวสำหรับสองบทบาทได้ ใน cluster มันเป็นค่าต่างกันจริง ๆ ดังนั้น chart set `CATALOG_GRPC_ADDR` *ต่อ Deployment* แทนที่จะครั้งเดียวใน `ConfigMap` ที่ใช้ร่วม การรู้ว่า "ตัวแปรเดียวกันเป็น listen address ใน server และ dial address ใน client" คือส่วนใหญ่ที่ทำให้การต่อ gRPC service ใน Kubernetes เข้าใจได้
+สิ่งสำคัญที่สุดใน chart นี้คือรายละเอียดที่มองไม่เห็นตอน dev บนเครื่อง: **`CATALOG_GRPC_ADDR` มีความหมายสองแบบ ขึ้นกับว่า pod ไหนเป็นคนอ่าน**
 
-ที่เหลือเป็นมาตรฐาน และแต่ละทางเลือกมีเหตุผลของมัน:
+ใน `catalog` pod ค่านี้คือ *bind address* เพราะ `main` ของ `catalog` ส่งต่อให้ `net.Listen` จึงต้องเป็น `:50051` คือ listen บน port นั้นทุก interface
 
-- **`ConfigMap` เทียบกับ `Secret`** host ของ `KAFKA_BROKERS` และ `RABBITMQ_URL` ไม่ลับและอยู่ใน `ConfigMap`; database URL พก credential และอยู่ใน `Secret` Kubernetes จัดการมันต่างกัน (Secret อย่างน้อยถูกเก็บออกจาก `get -o yaml` ธรรมดาโดย default และ encrypt at rest ได้) และการแยกให้ชัดหมายถึง ConfigMap ที่รั่วไม่ทำ password รั่วด้วย
-- **Deployment ไหนได้ `Service`** `Service` มีไว้ให้ชื่อที่เสถียรและ load-balance traffic *ไปยัง* กลุ่ม pod `catalog` และ `order` ต้องการเพราะ pod อื่น dial พวกมัน; `gateway` ต้องการเพราะ client (หรือ Ingress) ยิงมัน `payment`, `notification`, และ `notification-worker` เป็น consumer ล้วน — ไม่มีอะไรเชื่อม *ไปยัง* พวกมัน พวกมันเอื้อม *ออกไป* หา Kafka และ RabbitMQ — ดังนั้นไม่ได้ Service เลย Service ที่ไม่มีคนใช้คือขยะ
-- **Readiness และ liveness probe** gateway expose `/healthz` [grpc-gateway →](/shopmicro/th/gateway/grpc-gateway/) ดังนั้น probe ของมันเป็น `httpGet` ธรรมดา gRPC service ไม่เสิร์ฟ HTTP ดังนั้น chart นี้ probe พวกมันด้วย `tcpSocket` บน gRPC port — พอที่จะรู้ว่า process listen อยู่ (ทางเลือกที่แกร่งกว่าคือ native `grpc` probe ของ Kubernetes ซึ่งต้องให้ server implement service `grpc.health.v1` มาตรฐาน; เพิ่มมันเป็น follow-up เล็ก ๆ ที่คุ้มค่า ตามที่ระบุใน Pros & cons)
+ส่วนใน `order` และ `gateway` pod ค่าเดียวกันนี้คือ *dial address* เพราะสอง service นั้นส่งต่อให้ `grpc.NewClient` เพื่อเข้าถึง Catalog จึงต้องเป็น `catalog:50051` ที่เป็น DNS name ที่ Kubernetes ให้กับ `Service` ของ Catalog
 
-## Pros & cons
+ตอนรันบนเครื่อง สองบทบาทนี้ยุบเหลือ `:50051` ค่าเดียว เพราะ `net.Listen(":50051")` กับการ dial `localhost:50051` ชี้ไปที่ host เดียวกัน [The gRPC Server →](/shopmicro/th/order-service/grpc-server/) จึงใช้ค่าเดียวครอบสองบทบาทได้ แต่ใน cluster สองค่านี้ต่างกันจริง chart จึง set `CATALOG_GRPC_ADDR` *ต่อ Deployment* แทนที่จะ set ครั้งเดียวใน `ConfigMap` ที่ใช้ร่วมกัน เข้าใจว่า "ตัวแปรเดียวกันเป็น listen address ฝั่ง server และ dial address ฝั่ง client" ได้เมื่อไร การต่อ gRPC service ใน Kubernetes ก็เข้าใจง่ายไปกว่าครึ่ง
+
+ที่เหลือเป็นมาตรฐาน และแต่ละทางเลือกมีเหตุผลของตัวเอง:
+
+- **`ConfigMap` เทียบกับ `Secret`** host ของ `KAFKA_BROKERS` และ `RABBITMQ_URL` ไม่ใช่ความลับจึงอยู่ใน `ConfigMap` ส่วน database URL พก credential มาด้วยจึงอยู่ใน `Secret` Kubernetes จัดการสองอย่างนี้ต่างกัน — อย่างน้อย Secret ก็ไม่โผล่ใน `get -o yaml` ธรรมดาโดย default และ encrypt at rest ได้ การแยกให้ชัดแบบนี้แปลว่า ConfigMap ที่รั่วจะไม่ลาก password ออกไปด้วย
+- **Deployment ไหนได้ `Service`** `Service` มีไว้ให้ชื่อที่เสถียรและ load-balance traffic *เข้าไปยัง* กลุ่ม pod `catalog` และ `order` ต้องมีเพราะ pod อื่น dial เข้ามา ส่วน `gateway` ต้องมีเพราะ client หรือ Ingress ยิงเข้ามา ขณะที่ `payment`, `notification` และ `notification-worker` เป็น consumer ล้วน ไม่มีใครเชื่อมเข้ามาหา มีแต่เอื้อม *ออกไป* หา Kafka และ RabbitMQ จึงไม่ได้ Service เลย เพราะ Service ที่ไม่มีคนใช้ก็เป็นแค่ขยะ
+- **Readiness และ liveness probe** gateway expose `/healthz` ไว้ [grpc-gateway →](/shopmicro/th/gateway/grpc-gateway/) probe จึงเป็น `httpGet` ธรรมดา ส่วน gRPC service ไม่ได้เสิร์ฟ HTTP chart นี้จึง probe ด้วย `tcpSocket` บน gRPC port ซึ่งพอจะบอกได้ว่า process listen อยู่ (ทางเลือกที่แกร่งกว่าคือ native `grpc` probe ของ Kubernetes ซึ่งต้องให้ server implement service `grpc.health.v1` มาตรฐาน เพิ่มทีหลังเป็น follow-up เล็ก ๆ ที่คุ้มค่า ตามที่ระบุใน Pros & cons)
+
+## ข้อดีข้อเสีย
 
 **Helm chart** เทียบกับ **`kubectl apply` manifest ที่เขียนเองดิบ ๆ (หรือ Kustomize)**
 
-- **Pros:** `values.yaml` เดียว parameterize image tag, replica, และ resource ข้ามทุก object ดังนั้น release เป็นการแก้บรรทัดเดียวแทนที่จะ find-and-replace ข้ามไฟล์เป็นสิบ; `helm install`/`upgrade`/`rollback` ให้ release ที่ version, atomic พร้อมคำสั่ง rollback จริง; chart เป็น artifact เดียวที่ทีมอื่น install ได้โดยไม่ต้องอ่านภายในมัน
+- **Pros:** `values.yaml` เดียว parameterize image tag, replica, และ resource ข้ามทุก object ดังนั้น release เป็นการแก้บรรทัดเดียวแทนที่จะ find-and-replace ข้ามไฟล์เป็นสิบ; `helm install`/`upgrade`/`rollback` ให้ release ที่ version, atomic พร้อมคำสั่ง rollback จริง; chart เป็น artifact ชิ้นเดียวที่ทีมอื่น install ได้โดยไม่ต้องอ่านโครงสร้างภายใน
 - **Cons:** Go-template-ใน-YAML ของ Helm อ่านและ debug ยากกว่า manifest แบน ๆ จริง ๆ — `{{- }}` whitespace trim ที่หายไปหรือ `.Values` path ที่ผิดผลิต YAML ที่ invalid แบบสับสน; สำหรับ deployment เล็ก ๆ ที่ static, model overlay-a-base ของ Kustomize (ไม่มี templating language เลย) ง่ายกว่า และ manifest ดิบโปร่งใสที่สุด Helm คุ้มความซับซ้อนเมื่อคุณมี object ที่ parameterize เยอะและ release จริงให้จัดการ — ซึ่งระบบนี้มี
 
 **ถือ Postgres/Kafka/RabbitMQ เป็นแบบจัดการจากภายนอก** เทียบกับ **bundle เป็น subchart dependency ของ chart**
 
-- **Pros:** chart focus อยู่ที่ stateless service ของ ShopMicro เอง และ infra production มักถูกจัดการแยกอยู่แล้ว — cloud Postgres, managed Kafka — พร้อม backup, scaling, และ lifecycle ของมันเองที่ chart ของ stateless app ไม่ควรเป็นเจ้าของ; `values.yaml` แค่ชี้ไปยังที่ที่มันอยู่
-- **Cons:** chart ไม่ self-contained — `helm install` อย่างเดียวไม่ให้ระบบที่รันได้ คุณต้อง provision infra ก่อนแล้ว set endpoint — ในขณะที่ bundle subchart Postgres/Kafka/RabbitMQ ของ Bitnami จะทำให้คำสั่งเดียวยกทุกอย่างขึ้น ซึ่งดีกว่าจริงสำหรับ demo หรือ test cluster ชั่วคราว trade คือ "รูปทรง production จริง" เทียบกับ "คำสั่งเดียวได้ทุกอย่าง" และคอร์สนี้เลือกอย่างแรก โดยมี subchart เป็นทางเลือกที่บันทึกไว้
+- **Pros:** chart focus อยู่ที่ stateless service ของ ShopMicro เอง และ infra production มักถูกจัดการแยกอยู่แล้ว — cloud Postgres, managed Kafka — พร้อม backup, scaling และ lifecycle ของตัวเองที่ chart ของ stateless app ไม่ควรเป็นเจ้าของ `values.yaml` จึงแค่ชี้ไปยังตำแหน่งเหล่านั้น
+- **Cons:** chart ไม่ self-contained — `helm install` อย่างเดียวไม่ให้ระบบที่รันได้ คุณต้อง provision infra ก่อนแล้ว set endpoint — ส่วนการ bundle subchart Postgres/Kafka/RabbitMQ ของ Bitnami จะทำให้คำสั่งเดียวยกทุกอย่างขึ้น ซึ่งดีกว่าจริงสำหรับ demo หรือ test cluster ชั่วคราว trade คือ "รูปทรง production จริง" เทียบกับ "คำสั่งเดียวได้ทุกอย่าง" และคอร์สนี้เลือกอย่างแรก โดยมี subchart เป็นทางเลือกที่บันทึกไว้
 
-## Set it up
+## ติดตั้ง
 
 ### 1. `deploy/helm/shopmicro/Chart.yaml`
 
@@ -201,7 +207,7 @@ spec:
       targetPort: {{ .Values.services.catalog.grpcPort }}
 ```
 
-บันทึกเป็น `templates/catalog.yaml` `Service` ชื่อ `catalog` บน port `50051` คือสิ่งที่ทำให้ `catalog:50051` resolve ได้จาก pod อื่น `templates/order.yaml` ตามรูปทรงเดียวกันเป๊ะ ต่างสองจุด: มัน bind `ORDER_GRPC_ADDR: ":50052"` และเพิ่ม env ที่ทำให้ Order เป็น *client* ของ Catalog และ Kafka:
+บันทึกเป็น `templates/catalog.yaml` `Service` ชื่อ `catalog` บน port `50051` คือสิ่งที่ทำให้ `catalog:50051` resolve ได้จาก pod อื่น `templates/order.yaml` ใช้รูปทรงเดียวกันเป๊ะ ต่างกันสองจุด: bind `ORDER_GRPC_ADDR: ":50052"` และเพิ่ม env ที่ทำให้ Order เป็น *client* ของ Catalog และ Kafka:
 
 ```yaml
           env:
@@ -222,7 +228,7 @@ spec:
 
 ### 6. Consumer Deployment — `payment.yaml`, `notification.yaml`, `notification-worker.yaml`
 
-พวกนี้ตาม pattern ของ catalog Deployment โดย **ไม่มี Service และไม่มี port** — ไม่มีอะไรเชื่อมมา พวกมันต่างกันแค่ image และ env ที่ดึง:
+ทั้งสองตัวใช้ pattern เดียวกับ catalog Deployment แต่ **ไม่มี Service และไม่มี port** เพราะไม่มีอะไรเชื่อมเข้ามา ต่างกันแค่ image กับ env ที่ดึงไปใช้:
 
 - `payment`: `KAFKA_BROKERS` จาก ConfigMap ไม่มี DB ไม่มี probe บน port (consumer ล้วนไม่มี readiness endpoint; ละ probe หรือเพิ่ม health port เล็ก ๆ ทีหลัง)
 - `notification`: `KAFKA_BROKERS` และ `RABBITMQ_URL` จาก ConfigMap
@@ -308,11 +314,11 @@ spec:
 {{- end }}
 ```
 
-บันทึกเป็น `templates/gateway.yaml` gateway dial `catalog:50051` และ `order:50052` — สอง Service name — และ `/healthz` ของมันขับ HTTP probe จริง `Ingress` ถูกคุมด้วย `{{- if .Values.services.gateway.ingress.enabled }}` ปิดโดย default: บน laptop คุณจะ `port-forward` บทหน้า; บน cluster จริงคุณเปิดมัน
+บันทึกเป็น `templates/gateway.yaml` gateway dial ไปที่ `catalog:50051` และ `order:50052` ที่เป็นชื่อ Service ทั้งคู่ ส่วน `/healthz` ของ gateway ขับ HTTP probe จริง `{{- if .Values.services.gateway.ingress.enabled }}` เป็นตัวคุม `Ingress` และปิดไว้โดย default บน laptop คุณจะใช้ `port-forward` ในบทหน้า ส่วนบน cluster จริงค่อยเปิดใช้งาน
 
-## Verify
+## ตรวจสอบผล
 
-คุณไม่ต้องมี cluster รันอยู่เพื่อเช็คว่า chart ถูกฟอร์แมตดี ก่อนอื่น lint มัน:
+คุณไม่ต้องมี cluster รันอยู่ก็เช็คได้ว่า chart ฟอร์แมตถูกต้อง เริ่มจาก lint ก่อน:
 
 ```bash
 helm lint deploy/helm/shopmicro
@@ -367,10 +373,12 @@ helm template shopmicro deploy/helm/shopmicro \
 ตรวจสอบความเข้าใจ:
 
 - `CATALOG_GRPC_ADDR` เป็น `:50051` ใน Deployment หนึ่งและ `catalog:50051` ในอีกสองตัว ทำไมนั่นถูกไม่ใช่ bug และทำไม dev local ไม่เคยเผยความต่าง?
-- ทำไม `payment`, `notification`, และ `notification-worker` ไม่ได้ `Service` ในขณะที่ `catalog`, `order`, และ `gateway` ได้?
+- ทำไม `payment`, `notification`, และ `notification-worker` ไม่ได้ `Service` ส่วน `catalog`, `order`, และ `gateway` ได้?
 - database URL อยู่ใน `Secret` และ broker address อยู่ใน `ConfigMap` อะไรจะพลาดถ้า DB URL อยู่ใน ConfigMap แทน?
-- การ scale `notification-worker` เป็น 5 replica เป็นการแก้ค่าบรรทัดเดียว ทำไมนั่นปลอดภัยสำหรับ service นี้โดยเฉพาะ และ [The Send Worker →](/shopmicro/th/notification-service/worker-deliver/) สร้างอะไรที่ทำให้มันปลอดภัย?
+- การ scale `notification-worker` เป็น 5 replica คือการแก้ค่าบรรทัดเดียว ทำไมถึงปลอดภัยสำหรับ service นี้โดยเฉพาะ และ [The Send Worker →](/shopmicro/th/notification-service/worker-deliver/) สร้างอะไรไว้ที่ทำให้ปลอดภัย?
 
-## Recap
+## สรุป
 
-`deploy/helm/shopmicro/` package ทั้ง 6 binary ของ ShopMicro เป็น Helm chart เดียว: Deployment `catalog`, `order`, และ `payment`, `notification` และ `notification-worker` เป็น consumer ที่ไม่มี Service, และ Deployment `gateway` พร้อม `Service` (และ `Ingress` optional) บน `8080` — ทั้งหมด parameterize ผ่าน `values.yaml` สำหรับ image tag, replica, และ infra endpoint ที่จัดการจากภายนอก `_helpers.tpl` รวม label และประกอบ Postgres URL; `ConfigMap` พก `KAFKA_BROKERS`/`RABBITMQ_URL` ที่ไม่ลับ และ `Secret` พก DB URL แนวคิดเดียวที่ทำให้ gRPC-ใน-Kubernetes เข้าใจได้คือ `CATALOG_GRPC_ADDR` เป็น *bind* address (`:50051`) ใน catalog pod และ *dial* address (`catalog:50051`) ใน order และ gateway pod — ตัวแปรเดียวกัน set ต่อ Deployment เพราะ cluster แยกบทบาท listen/connect ที่ `localhost` ยุบไว้ `helm lint` และ `helm template` พิสูจน์ว่า chart render manifest ที่ valid โดยเห็นการแยก bind-vs-dial และการนับสาม Service ใน output ก่อน cluster จะแตะมัน บทถัดไป [Deploying to the cluster →](/shopmicro/th/kubernetes/deploy-cluster/) install chart นี้เข้า Kubernetes cluster จริง รัน migration เป็น pre-install Job แล้วขับ order flow `curl` เดียวกัน — `PENDING → CONFIRMED` — กับ pod แทน `go run`
+`deploy/helm/shopmicro/` package ทั้ง 6 binary ของ ShopMicro เป็น Helm chart เดียว: Deployment `catalog`, `order`, และ `payment`, `notification` และ `notification-worker` เป็น consumer ที่ไม่มี Service, และ Deployment `gateway` พร้อม `Service` (และ `Ingress` optional) บน `8080` — ทั้งหมด parameterize ผ่าน `values.yaml` สำหรับ image tag, replica, และ infra endpoint ที่จัดการจากภายนอก `_helpers.tpl` รวม label และประกอบ Postgres URL; `ConfigMap` พก `KAFKA_BROKERS`/`RABBITMQ_URL` ที่ไม่ลับ และ `Secret` พก DB URL แนวคิดสำคัญที่ทำให้ gRPC บน Kubernetes เข้าใจง่ายขึ้นคือ `CATALOG_GRPC_ADDR` เป็น *bind* address (`:50051`) ใน catalog pod แต่เป็น *dial* address (`catalog:50051`) ใน order และ gateway pod ตัวแปรเดียวกันแต่ set ต่อ Deployment เพราะ cluster แยกบทบาท listen กับ connect ที่ `localhost` ยุบรวมไว้
+
+`helm lint` และ `helm template` พิสูจน์ว่า chart render manifest ออกมา valid โดยเห็นการแยก bind กับ dial และนับ Service ได้ครบสามตัวใน output ตั้งแต่ก่อน cluster จะได้แตะ บทถัดไป [Deploying to the cluster →](/shopmicro/th/kubernetes/deploy-cluster/) จะ install chart นี้เข้า Kubernetes cluster จริง รัน migration เป็น pre-install Job แล้วขับ order flow ด้วย `curl` ชุดเดิม — `PENDING → CONFIRMED` — โดยใช้ pod แทน `go run`

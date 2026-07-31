@@ -5,31 +5,31 @@ sidebar:
   order: 2
 ---
 
-## What we're building
+## สิ่งที่จะสร้าง
 
 ไม่มีโค้ดใหม่ — [Producer & Consumer →](/shopmicro/th/kafka/producer-consumer/) เขียน `Publisher` กับ `Consumer` ที่ทำงานได้จริงไปแล้ว และใช้แนวคิดของ Kafka สี่อย่างโดยไม่ได้อธิบายสักอย่างเดียว: **partition**, **key**, **consumer group**, และ **offset** บทนี้เรียกชื่อแต่ละอย่าง แล้วสร้างและตรวจสอบ topic `orders` กับ `payments` โดยตรงด้วย `kafka-topics.sh` แทนที่จะพึ่ง `AllowAutoTopicCreation` แบบที่ demo ของบทก่อนทำ
 
-## Why
+## ทำไม
 
-Topic ของ Kafka — `orders`, `payments` — คือสตรีมที่มีชื่อ แต่ topic เองไม่ใช่ ordered log มันคือชุดของ **partition** ตั้งแต่หนึ่งตัวขึ้นไป และแต่ละ partition *คือ* ordered log แบบ append-only การรับประกันลำดับของ Kafka ครอบคลุมแค่ partition เดียว: message ภายใน partition เดียวเรียงลำดับกันอย่างเคร่งครัด แต่ไม่มีการรับประกันลำดับข้าม partition ของ topic เดียวกันเลย ข้อเท็จจริงข้อเดียวนี้แหละคือเหตุผลที่ `Publisher.Publish` รับ `key` — `&kafka.Hash{}` hash key นั้นเพื่อเลือก partition และ message ที่ใช้ key เดียวกันจะไปลง partition เดียวกันเสมอ [The Transactional Outbox →](/shopmicro/th/order-service/outbox/) ระบุผลลัพธ์นี้ไว้แล้ว: การ key ทุก event ด้วย `aggregate_id` (id ของคำสั่งซื้อเอง) หมายความว่าทุก event เกี่ยวกับคำสั่งซื้อเดียวกัน — `order.created` แล้วต่อมา `order.confirmed` หรือ `order.cancelled` — ลง partition เดียวกัน และรับประกันว่าจะมาถึง consumer ตามลำดับที่มันเกิดขึ้น Event เกี่ยวกับคำสั่งซื้อ*ต่างกัน*อาจลงคนละ partition และไม่มีการรับประกันลำดับระหว่างกันเลย — และนั่นก็โอเค เพราะไม่มีอะไรในระบบนี้ที่พึ่งพาลำดับข้ามคำสั่งซื้อ มีแค่ลำดับภายในคำสั่งซื้อเดียวเท่านั้นที่สำคัญ
+Topic ของ Kafka — `orders`, `payments` — คือสตรีมที่มีชื่อ แต่ตัว topic เองไม่ใช่ ordered log หากเป็นชุดของ **partition** ตั้งแต่หนึ่งตัวขึ้นไป และแต่ละ partition ต่างหากที่ *เป็น* ordered log แบบ append-only การรับประกันลำดับของ Kafka ครอบคลุมแค่ partition เดียว: message ภายใน partition เดียวเรียงลำดับกันอย่างเคร่งครัด แต่ไม่มีการรับประกันลำดับข้าม partition ของ topic เดียวกันเลย ข้อเท็จจริงข้อเดียวนี้แหละคือเหตุผลที่ `Publisher.Publish` รับ `key` — `&kafka.Hash{}` hash key นั้นเพื่อเลือก partition และ message ที่ใช้ key เดียวกันจะไปลง partition เดียวกันเสมอ [The Transactional Outbox →](/shopmicro/th/order-service/outbox/) ระบุผลลัพธ์นี้ไว้แล้ว: การ key ทุก event ด้วย `aggregate_id` (id ของคำสั่งซื้อเอง) หมายความว่าทุก event เกี่ยวกับคำสั่งซื้อเดียวกัน — `order.created` แล้วต่อมา `order.confirmed` หรือ `order.cancelled` — ลง partition เดียวกัน และรับประกันว่าถึงมือ consumer ตามลำดับที่เกิดขึ้นจริง ส่วน event ของคำสั่งซื้อ*คนละใบ*อาจลงคนละ partition และไม่มีการรับประกันลำดับระหว่างกันเลย — และนั่นก็โอเค เพราะไม่มีอะไรในระบบนี้ที่พึ่งพาลำดับข้ามคำสั่งซื้อ มีแค่ลำดับภายในคำสั่งซื้อเดียวเท่านั้นที่สำคัญ
 
 **Consumer group** คือหน่วยที่ Kafka ใช้ติดตามว่า "กลุ่ม consumer นี้อ่านไปถึงไหนแล้ว" `Consumer` ทุกตัวในคอร์สนี้ถูกสร้างด้วย `groupID` และ `groupID` นั้นคือคำตอบทั้งหมดของคำถาม "เซอร์วิสนี้เห็นทุกข้อความ หรือแบ่งงานกับเซอร์วิสอื่น" Consumer สองตัวที่ใช้ `groupID` **เดียวกัน** จะแบ่ง partition ของ topic กันเอง — แต่ละ partition เป็นของสมาชิกกลุ่มคนเดียวในเวลาหนึ่ง ๆ ดังนั้นการเพิ่ม consumer (สูงสุดเท่าจำนวน partition) เพิ่ม throughput ไม่ใช่ coverage Consumer สองตัวที่ใช้ `groupID` **ต่างกัน** แต่ละตัวได้อ่าน topic แบบครบถ้วนและอิสระของตัวเอง — ทุกข้อความ ไม่ว่าอีกกลุ่มจะอ่านไปถึงไหนแล้วก็ตาม นี่คือเหตุผลที่ทุกเซอร์วิสในระบบนี้ใช้ `groupID` ของตัวเอง (ใช้ชื่อเซอร์วิสก็พอ): Payment กับ Notification ต้องเห็นทุก event `order.created` ทั้งคู่ และจะทำได้ก็ต่อเมื่อทั้งสองอยู่คนละ consumer group เท่านั้น ภายในเซอร์วิสเดียว การรันหลาย instance ที่แชร์ `groupID` เดียวกันคือวิธีที่ scale การ consume ของเซอร์วิสนั้นแนวนอนพอดี
 
 **Offset** คือ cursor ต่อ partition ต่อ group — "ข้อความถัดไปที่กลุ่มนี้ยังไม่ได้อ่านใน partition นี้" `CommitMessages` ใน [Producer & Consumer →](/shopmicro/th/kafka/producer-consumer/) คือตัวที่เลื่อน cursor นั้น ที่สำคัญคือ การ commit offset ไม่ได้ลบข้อความทิ้ง — log ของ Kafka เก็บทุกข้อความไว้ตามระยะเวลา retention ที่ตั้งไว้ (หรือตลอดไป ถ้าตั้ง retention แบบไม่มีวันหมด) ไม่ว่าใครจะอ่านไปแล้วหรือกี่รอบก็ตาม นี่คือ **replayability** และเป็นสิ่งที่แยก Kafka ออกจาก message queue แบบดั้งเดิมอย่าง [RabbitMQ →](/shopmicro/th/rabbitmq/) (Module 7) มากที่สุด: queue ทั่วไปมักจะลบข้อความทิ้งทันทีที่ถูก acknowledge ดังนั้นจึงไม่เหลืออะไรให้ replay เลย Consumer group ของ Kafka สามารถ reset offset ย้อนกลับได้ — ไม่ว่าจะตั้งใจ หรือด้วยการสร้างกลุ่มใหม่ที่เริ่มจากจุดเริ่มต้นของ log — แล้วอ่านประวัติทั้งหมดใหม่ตั้งแต่ต้นได้อีกครั้ง เซอร์วิสใหม่ที่เข้าร่วมระบบนี้อีกหลายเดือนข้างหน้าสามารถสร้าง consumer group ใหม่บน `orders` แล้วสร้าง view ของทุกคำสั่งซื้อที่เคยถูกสร้างขึ้นมาใหม่ทั้งหมด จาก log ล้วน ๆ โดยไม่ต้องเรียก API ของเซอร์วิสอื่นแม้แต่ครั้งเดียว
 
-## Pros & cons
+## ข้อดีข้อเสีย
 
 **Partition ต่อ topic มากกว่า** เทียบกับ **partition น้อยกว่า**
 
 - **Pros:** partition ที่มากขึ้นหมายถึงหน่วย parallelism ที่เป็นอิสระต่อกันมากขึ้น — สูงสุดเท่าจำนวน partition การเพิ่ม consumer เข้าไปในกลุ่มจะเพิ่ม throughput จริง เพราะ consumer แต่ละตัวเป็นเจ้าของ partition กลุ่มย่อยที่ไม่ซ้ำกัน
-- **Cons:** การรับประกันลำดับมีแค่ *ภายใน* partition เท่านั้น ดังนั้น partition ที่มากขึ้นหมายถึง "โดเมนของลำดับ" ที่แยกจากกันมากขึ้นที่ต้องคิดถึง ไม่ใช่ลำดับเดียวทั้งหมด; และจำนวน partition เปลี่ยนทีหลังได้ยากและมีต้นทุนสูง — การเพิ่มมันภายหลังอาจเปลี่ยนว่า key ตัวหนึ่งจะ hash ไปลง partition ไหน ทำให้การรับประกัน "key เดียวกันลง partition เดียวกันเสมอ" พังลงอย่างเงียบ ๆ สำหรับ key ที่กำลังส่งอยู่
+- **Cons:** การรับประกันลำดับมีแค่ *ภายใน* partition เท่านั้น ดังนั้น partition ที่มากขึ้นหมายถึง "โดเมนของลำดับ" ที่แยกจากกันมากขึ้นที่ต้องคิดถึง ไม่ใช่ลำดับเดียวทั้งหมด; อีกทั้งจำนวน partition เปลี่ยนทีหลังได้ยากและมีต้นทุนสูง เพราะการเพิ่มภายหลังอาจเปลี่ยนว่า key ตัวหนึ่งจะ hash ไปลง partition ไหน ทำให้การรับประกัน "key เดียวกันลง partition เดียวกันเสมอ" พังลงอย่างเงียบ ๆ สำหรับ key ที่กำลังส่งอยู่
 
 **Consumer group แยกต่างหากต่อเซอร์วิส** เทียบกับ **consumer group เดียวที่ใช้ร่วมกันทุกเซอร์วิส**
 
 - **Pros:** ทุกเซอร์วิสได้ view ของ topic แบบครบถ้วนและอิสระ ซึ่งตรงกับความต้องการพอดี — Payment กับ Notification ต้องเห็นทุก event `order.created` ทั้งคู่ ไม่ใช่แบ่งกันคนละครึ่ง
-- **Cons:** N เซอร์วิสตอนนี้หมายถึง N ตำแหน่งการอ่านที่เป็นอิสระต่อกันที่ต้อง monitor lag; group เดียวที่ใช้ร่วมกันจะสังเกตง่ายกว่าเพราะเป็นหน่วยเดียว แต่ก็จะ*ผิด*ในกรณีนี้ — group ที่ใช้ร่วมกันจะส่งแต่ละข้อความให้สมาชิกแค่**คนเดียว** ดังนั้น Payment กับ Notification จะได้รับ event แค่ครึ่งเดียวอย่างเงียบ ๆ คนละครึ่ง ซึ่งเป็น bug ด้าน correctness ที่ความผิดพลาดแบบง่าย ๆ "ให้ทั้งสองเซอร์วิสใช้ `groupID` เดียวกันไปเลย" จะสร้างขึ้นมาทันที
+- **Cons:** N เซอร์วิสตอนนี้หมายถึง N ตำแหน่งการอ่านที่เป็นอิสระต่อกันที่ต้อง monitor lag; group เดียวที่ใช้ร่วมกันจะสังเกตง่ายกว่าเพราะเป็นหน่วยเดียว แต่ก็จะ*ผิด*ในกรณีนี้ — group ที่ใช้ร่วมกันจะส่งแต่ละข้อความให้สมาชิกแค่**คนเดียว** ดังนั้น Payment กับ Notification จะได้รับ event แค่ครึ่งเดียวอย่างเงียบ ๆ คนละครึ่ง ที่เป็น bug ด้าน correctness ที่ความผิดพลาดแบบง่าย ๆ "ให้ทั้งสองเซอร์วิสใช้ `groupID` เดียวกันไปเลย" จะสร้างขึ้นมาทันที
 
-## Set it up
+## ติดตั้ง
 
 สร้างทั้งสอง topic โดยตรง พร้อมสามพาร์ทิชันแต่ละตัว — พอสำหรับเห็นพฤติกรรมระดับ partition โดยไม่ต้องมี load จริง:
 
@@ -64,7 +64,7 @@ Topic: orders	TopicId: ...	PartitionCount: 3	ReplicationFactor: 1	Configs:
 
 `ReplicationFactor: 1` คือค่าที่ใช้ได้เฉพาะกับ broker node เดียวเท่านั้น — [Infra & Compose →](/shopmicro/th/setup/infra-compose/) ระบุไว้แล้วว่า container KRaft ตัวนี้ไม่ใช่ production cluster; Kafka จริงจะใช้ replication factor 3 ข้าม broker แยกกัน เพื่อให้ node เดียวล่มไม่ทำให้ข้อมูลหาย
 
-## Verify
+## ตรวจสอบผล
 
 ลิสต์ consumer group หลังจากรัน demo consumer ของ [Producer & Consumer →](/shopmicro/th/kafka/producer-consumer/) อย่างน้อยหนึ่งครั้ง:
 
@@ -77,7 +77,7 @@ docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
 kafkademo
 ```
 
-Describe group นั้นเพื่อดู offset ปัจจุบันต่อ partition และ lag ของมัน (จำนวนข้อความที่ยังไม่ได้อ่าน):
+Describe group นั้นเพื่อดู offset ปัจจุบันต่อ partition พร้อมค่า lag ซึ่งคือจำนวนข้อความที่ยังไม่ได้อ่าน:
 
 ```bash
 docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
@@ -131,8 +131,8 @@ go build ./...
 - ถ้าสองเซอร์วิสต้องเห็นทุก event `order.created` ทำไมทั้งคู่ต้องใช้ `groupID` ต่างกัน แทนที่จะใช้ร่วมกันตัวเดียว?
 - ทำไมการ key ทุก event ด้วย `aggregate_id` ถึงรับประกันลำดับภายในคำสั่งซื้อเดียวกัน แต่ไม่รับประกันลำดับข้ามคำสั่งซื้อที่ต่างกัน?
 - `LAG: 0` บน partition หนึ่งหมายความว่าอย่างไร และ `LAG` ที่โตขึ้นเรื่อย ๆ บ่งบอกอะไรเกี่ยวกับ consumer group นั้น?
-- หลังจากข้อความถูก consume แล้วและ offset ของมันถูก commit ไปแล้ว ทำไมยังเป็นไปได้ที่จะอ่านข้อความเดิมนั้นซ้ำได้อีกในภายหลัง?
+- หลัง consume ข้อความไปแล้วและ commit offset เรียบร้อย ทำไมยังเป็นไปได้ที่จะกลับไปอ่านข้อความเดิมซ้ำอีกในภายหลัง?
 
-## Recap
+## สรุป
 
-Topic คือชุดของ log ที่เรียงลำดับกัน — **partition** — และ Kafka รับประกันลำดับแค่ *ภายใน* partition เท่านั้น ไม่เคยข้าม partition เลย นี่คือเหตุผลที่ argument `key` ของ `Publisher.Publish` สำคัญ: `&kafka.Hash{}` ส่งข้อความที่ key เดียวกันไปลง partition เดียวกัน และการ key ด้วย `aggregate_id` คือสิ่งที่ทำให้ event ของทุกคำสั่งซื้อได้การรับประกันลำดับภายในคำสั่งซื้อนั้น ๆ **Consumer group** (`groupID`) คือหน่วยของทั้ง scaling และ isolation: สมาชิกของกลุ่ม*เดียวกัน*แบ่ง partition ของ topic กันเพื่อขนานงาน ในขณะที่กลุ่ม*ต่างกัน*แต่ละกลุ่มได้สำเนาของสตรีมที่ครบถ้วนและอิสระของตัวเอง — ซึ่งเป็นเหตุผลที่ทุกเซอร์วิสในระบบนี้รันกลุ่มของตัวเอง **Offset** คือ cursor การอ่านต่อ partition ต่อ group และการ commit มันไม่เคยลบข้อความที่อยู่เบื้องหลังทิ้งเลย — Kafka เก็บ log ไว้ไม่ว่าจะมีอะไรถูกอ่านไปแล้วหรือไม่ นี่คือ **replayability**: consumer group ใหม่เริ่มจากจุดเริ่มต้นได้เสมอ แล้วสร้าง view ของประวัติขึ้นมาใหม่จากศูนย์ได้ ซึ่งเป็นสิ่งที่ queue ดั้งเดิมอย่าง [RabbitMQ →](/shopmicro/th/rabbitmq/) โดยทั่วไปทำไม่ได้แล้วเมื่อข้อความถูก acknowledge และหายไป `kafka-topics.sh --create`/`--describe` และ `kafka-consumer-groups.sh --list`/`--describe`/`--reset-offsets` คือเครื่องมือปฏิบัติการสำหรับตรวจสอบและจัดการแนวคิดเหล่านี้โดยตรงกับ broker ต่อไป [Outbox & Relay →](/shopmicro/th/kafka/outbox-relay/) จะเอาทั้งหมดนี้ไปใช้งานจริง: relay ที่ดึงตาราง `outbox` ของ Module 4 ออกมาแล้วปิด transactional outbox pattern ในที่สุด
+Topic คือชุดของ log ที่เรียงลำดับกัน — **partition** — และ Kafka รับประกันลำดับแค่ *ภายใน* partition เท่านั้น ไม่เคยข้าม partition เลย นี่คือเหตุผลที่ argument `key` ของ `Publisher.Publish` สำคัญ: `&kafka.Hash{}` ส่งข้อความที่ key เดียวกันไปลง partition เดียวกัน และการ key ด้วย `aggregate_id` คือสิ่งที่ทำให้ event ของทุกคำสั่งซื้อได้การรับประกันลำดับภายในคำสั่งซื้อนั้น ๆ **Consumer group** (`groupID`) คือหน่วยของทั้ง scaling และ isolation: สมาชิกของกลุ่ม*เดียวกัน*แบ่ง partition ของ topic กันเพื่อขนานงาน ส่วนกลุ่ม*ต่างกัน*แต่ละกลุ่มได้สำเนาของสตรีมที่ครบถ้วนและอิสระของตัวเอง — นั่นคือเหตุผลที่ทุกเซอร์วิสในระบบนี้รันกลุ่มของตัวเอง **Offset** คือ cursor การอ่านต่อ partition ต่อ group และการ commit offset ไม่เคยลบข้อความที่อยู่เบื้องหลังทิ้งเลย — Kafka เก็บ log ไว้ไม่ว่าจะมีอะไรถูกอ่านไปแล้วหรือไม่ นี่คือ **replayability**: consumer group ใหม่เริ่มจากจุดเริ่มต้นได้เสมอ แล้วสร้าง view ของประวัติขึ้นมาใหม่จากศูนย์ได้ นั่นคือสิ่งที่ queue ดั้งเดิมอย่าง [RabbitMQ →](/shopmicro/th/rabbitmq/) โดยทั่วไปทำไม่ได้แล้วเมื่อข้อความถูก acknowledge และหายไป `kafka-topics.sh --create`/`--describe` และ `kafka-consumer-groups.sh --list`/`--describe`/`--reset-offsets` คือเครื่องมือปฏิบัติการสำหรับตรวจสอบและจัดการแนวคิดเหล่านี้โดยตรงกับ broker ต่อไป [Outbox & Relay →](/shopmicro/th/kafka/outbox-relay/) จะเอาทั้งหมดนี้ไปใช้งานจริง: relay ที่ดึงตาราง `outbox` ของ Module 4 ออกมาแล้วปิด transactional outbox pattern ในที่สุด

@@ -5,17 +5,23 @@ sidebar:
   order: 2
 ---
 
-## What we're building
+## สิ่งที่จะสร้าง
 
-ไม่มีโค้ดใหม่ [The Saga Handler →](/shopmicro/th/saga/orchestration/) เขียนทุกบรรทัดที่บทนี้พูดถึงไว้แล้ว — การ dedupe ด้วย `insert into processed_events ... on conflict do nothing`, guard terminal-state ด้วย `select status ... for update`, และ `pgx.Tx` เดียวที่ครอบมันไว้ด้วยกันกับการ update status และ outbox row — และใช้ทั้งหมดโดยไม่ได้หยุดอธิบายว่า *ทำไม* แต่ละชิ้นถึงมีรูปร่างแบบนั้น บทนี้ทำแบบนั้นพอดี: มันตั้งชื่อ guard สองตัวใน `OrderRepo.ApplyPaymentResult`, อธิบายว่าแต่ละตัวมีไว้รอด failure อะไรภายใต้ at-least-once delivery ของ Kafka แล้วซื่อสัตย์เรื่องการรับประกันสองอย่างที่ saga นี้จงใจ *ไม่* ให้ — exactly-once delivery และ rollback อัตโนมัติเมื่อขั้นตอนใดล้มเหลว
+บทนี้ไม่มีโค้ดใหม่ [The Saga Handler →](/shopmicro/th/saga/orchestration/) เขียนทุกบรรทัดที่จะพูดถึงไว้ครบแล้ว — การ dedupe ด้วย `insert into processed_events ... on conflict do nothing`, guard terminal-state ด้วย `select status ... for update` และ `pgx.Tx` เดียวที่ครอบทั้งสองอย่างไว้กับการ update status และ outbox row แต่บทนั้นใช้ทั้งหมดโดยไม่ได้หยุดอธิบายว่า *ทำไม* แต่ละชิ้นถึงมีรูปร่างแบบนั้น
 
-มันคือรูปแบบเดียวกับที่ [Acks, Retry & Dead Letters →](/shopmicro/th/rabbitmq/acks-retry-dlq/) ใช้กับ RabbitMQ: กลไกถูกเขียนไว้บทก่อนแล้วและถูกใช้โดยไม่มีพิธีรีตอง; บทนี้คือการอ่านละเอียดที่เปลี่ยน "มันทำงาน" เป็น "ผมรู้แน่ว่าทำไมมันทำงาน และมันหยุดตรงไหน"
+บทนี้ทำหน้าที่นั้นพอดี — ตั้งชื่อ guard สองตัวใน `OrderRepo.ApplyPaymentResult` อธิบายว่าแต่ละตัวมีไว้รอด failure แบบไหนภายใต้ at-least-once delivery ของ Kafka แล้วพูดตรง ๆ เรื่องการรับประกันสองอย่างที่ saga นี้จงใจ *ไม่* ให้ คือ exactly-once delivery และ rollback อัตโนมัติเมื่อขั้นตอนใดล้มเหลว
 
-## Why
+รูปแบบเดียวกับที่ [Acks, Retry & Dead Letters →](/shopmicro/th/rabbitmq/acks-retry-dlq/) ใช้กับ RabbitMQ: บทก่อนเขียนกลไกไว้แล้วและใช้งานไปเลยโดยไม่มีพิธีรีตอง ส่วนบทนี้คือการอ่านละเอียดที่เปลี่ยน "โค้ดทำงานได้" ให้เป็น "รู้แน่ว่าทำไมถึงทำงาน และหยุดทำงานตรงไหน"
 
-เริ่มจากสิ่งที่บังคับทั้งหมดนี้: **at-least-once delivery** [Producer & Consumer →](/shopmicro/th/kafka/producer-consumer/) พูดไว้ว่า `Consumer.Run` commit offset *หลัง* handler return เท่านั้น ดังนั้นถ้า saga consumer crash หลัง `ApplyPaymentResult` commit แต่ก่อน offset ถูก commit, Kafka redeliver event `payment.succeeded` เดิมเป๊ะตอน restart saga *จะ* เห็น event บางตัวมากกว่าหนึ่งครั้ง — ไม่ใช่ edge case หายาก แต่เป็นการรับประกันของ delivery model ที่มันสร้างอยู่บน guard ทุกตัวข้างล่างมีอยู่เพราะข้อเท็จจริงเดียวนี้
+## ทำไม
 
-**Guard 1 — การ dedupe ด้วย `processed_events`** สิ่งแรกที่ `ApplyPaymentResult` ทำใน transaction ของมันคือพยายามบันทึก id ของ event:
+เริ่มจากสิ่งที่บังคับทั้งหมดนี้: **at-least-once delivery**
+
+[Producer & Consumer →](/shopmicro/th/kafka/producer-consumer/) พูดไว้ว่า `Consumer.Run` จะ commit offset *หลัง* handler return เท่านั้น ดังนั้นถ้า saga consumer crash หลัง `ApplyPaymentResult` commit แต่ยังไม่ทัน commit offset ตอน restart Kafka จะ redeliver event `payment.succeeded` เดิมเป๊ะ
+
+แปลว่า saga *จะ* เห็น event บางตัวมากกว่าหนึ่งครั้ง ไม่ใช่ edge case หายาก แต่เป็นการรับประกันของ delivery model ที่ระบบนี้ตั้งอยู่บน guard ทุกตัวข้างล่างมีอยู่เพราะข้อเท็จจริงเดียวนี้
+
+**Guard 1 — การ dedupe ด้วย `processed_events`** สิ่งแรกที่ `ApplyPaymentResult` ทำใน transaction คือพยายามบันทึก id ของ event:
 
 ```go
 tag, err := tx.Exec(ctx, `
@@ -31,9 +37,15 @@ if tag.RowsAffected() == 0 {
 }
 ```
 
-`processed_events` มี `event_id text primary key` migration ของ [The Saga Handler →](/shopmicro/th/saga/orchestration/) สร้างมันไว้ ดังนั้น `on conflict do nothing` คือ "insert ถ้ายังไม่เคยเห็น id นี้" แบบ race-free ถ้า row มีอยู่แล้ว — event นี้เป๊ะถูก process ไปแล้วในการ deliver ครั้งก่อน — `RowsAffected()` เป็น `0` และ handler commit แล้ว return โดย *ไม่แตะอะไรอย่างอื่นเลย* status ของคำสั่งซื้อไม่เคยถูกประเมินซ้ำ ไม่มี outbox row ที่สองถูกเขียน idempotency key คือ `eventID` ซึ่งคือ `e.ID` — saga ส่ง `e.ID` ตรงเข้ามา [The Saga Handler →](/shopmicro/th/saga/orchestration/) และมันทำงานข้าม redelivery ของ Payment *เอง* ด้วย ไม่ใช่แค่ของ saga เพราะ [Process & Publish →](/shopmicro/th/payment-service/process-publish/) derive id ของ event `payment.*` แต่ละตัวแบบ deterministic เป็น `e.ID + ":payment"` — ดังนั้น `order.created` ที่ redeliver ผลิต `payment.succeeded` ที่มี id *เดิม* เสมอ ซึ่ง `processed_events` รู้จักอย่างถูกต้องว่าเห็นแล้ว id ที่ deterministic ต้นทางคือสิ่งที่ทำให้ dedupe ปลายทางเป็นไปได้
+table `processed_events` มี `event_id text primary key` โดย migration ของ [The Saga Handler →](/shopmicro/th/saga/orchestration/) สร้างไว้ให้แล้ว `on conflict do nothing` จึงแปลว่า "insert ถ้ายังไม่เคยเห็น id นี้" แบบ race-free
 
-**Guard 2 — การเช็ค terminal-state ด้วย `for update`** การผ่าน dedupe หมายความว่านี่คือ event id ที่ saga ไม่เคย process จริง ๆ แต่นั่นยังไม่พอที่จะ apply มันแบบมืด ๆ:
+ถ้า row มีอยู่แล้ว แปลว่า event ตัวนี้เป๊ะ ๆ ผ่านการ process ไปแล้วในการ deliver ครั้งก่อน `RowsAffected()` จะเป็น `0` แล้ว handler ก็ commit และ return โดย *ไม่แตะอะไรอย่างอื่นเลย* ไม่มีการประเมิน status ของคำสั่งซื้อซ้ำ และไม่มีการเขียน outbox row ตัวที่สอง
+
+idempotency key คือ `eventID` ซึ่งก็คือ `e.ID` ที่ saga ส่งตรงเข้ามาจาก [The Saga Handler →](/shopmicro/th/saga/orchestration/) และ guard นี้ยังกันการ redelivery ของ Payment *เอง* ได้ด้วย ไม่ใช่แค่ของ saga เพราะ [Process & Publish →](/shopmicro/th/payment-service/process-publish/) derive id ของ event `payment.*` แต่ละตัวแบบ deterministic เป็น `e.ID + ":payment"`
+
+ดังนั้น `order.created` ที่ redeliver จะผลิต `payment.succeeded` ที่มี id *เดิม* เสมอ และ `processed_events` ก็รู้ทันทีว่าเคยเห็นแล้ว id ที่ deterministic ตั้งแต่ต้นทางคือสิ่งที่ทำให้ dedupe ที่ปลายทางเป็นไปได้
+
+**Guard 2 — การเช็ค terminal-state ด้วย `for update`** การผ่าน dedupe มาได้แปลว่านี่คือ event id ที่ saga ไม่เคย process จริง ๆ แต่แค่นั้นยังไม่พอที่จะ apply แบบหลับหูหลับตา:
 
 ```go
 var status string
@@ -51,30 +63,42 @@ if status != "pending" {
 }
 ```
 
-สองอย่างที่ต่างกันเกิดขึ้นตรงนี้ อย่างแรก `for update` take **row-level lock** บนคำสั่งซื้อนั้นตลอดที่เหลือของ transaction — ดังนั้นถ้า payment-result event สองตัวสำหรับคำสั่งซื้อเดียวกันถูก process พร้อมกัน (saga consumer สองinstance) transaction ที่สอง *block* ที่ `SELECT` นี้จนกว่าตัวแรก commit และไม่มีวันอ่าน `status` เก่าแล้วทำอะไรกับมัน อย่างที่สอง การเช็ค `if status != "pending"` คือ **terminal-state guard**: คำสั่งซื้อที่ถึง `confirmed` หรือ `cancelled` แล้วจบแล้ว และ payment event ต่อ ๆ ไปเกี่ยวกับมัน — `payment.failed` ที่มาถึงหลัง `payment.succeeded` confirm ไปแล้ว หรือแค่ event ที่ id ต่างกันจริง ๆ สำหรับคำสั่งซื้อที่ event อื่น resolve ไปแล้ว — ต้องไม่ขยับมันครั้งที่สอง มัน commit การ insert `processed_events` (เพื่อให้ id นั้นถูกบันทึกแล้ว) แล้วหยุด
+ตรงนี้มีสองอย่างเกิดขึ้นพร้อมกัน
 
-ทำไมต้องสอง guard ในเมื่อฟังดูเหมือนตัวใดตัวหนึ่งน่าจะพอ? เพราะมันจับคนละอย่าง dedupe จับ *event เดิม* ที่มาสองครั้ง — id เดียวกัน การเช็ค terminal-state จับ *event คนละตัว* ที่พยายาม re-resolve คำสั่งซื้อที่ terminal ไปแล้ว — id ต่างกัน คำสั่งซื้อเดียวกัน ซึ่ง dedupe จะยินดีปล่อยผ่าน ระบบที่มีแค่ dedupe จะ ignore `payment.succeeded` ที่ redeliver อย่างถูกต้อง แต่ยังปล่อยให้ `payment.failed` ที่มาสายพลิกคำสั่งซื้อ `confirmed` เป็น `cancelled` ได้ ระบบที่มีแค่การเช็ค terminal-state จะปลอดภัยจากอันนั้น แต่จะรัน status-update-and-outbox-write ทั้งชุดใหม่ทุกครั้งที่ event เดิม redeliver จนกว่าตัวใดตัวหนึ่งจะ land ก่อน — เปลืองและ racy โดยไม่มี lock พวกมันด้วยกันใน transaction เดียวทำให้ `ApplyPaymentResult` ถูกต้องภายใต้ ordering, duplication, หรือ concurrency ใด ๆ ที่ delivery layer โยนมาได้
+อย่างแรก `for update` จับ **row-level lock** บนคำสั่งซื้อนั้นไว้ตลอดที่เหลือของ transaction ถ้ามี payment-result event สองตัวของคำสั่งซื้อเดียวกันเข้ามาพร้อมกัน (saga consumer สอง instance) transaction ตัวที่สองจะ *block* อยู่ที่ `SELECT` นี้จนกว่าตัวแรกจะ commit จึงไม่มีทางอ่าน `status` เก่าแล้วตัดสินใจผิด
 
-**Transaction คือ guard ที่สาม ตัวเงียบ ๆ** ทั้งหมด — dedupe insert, การอ่านแบบ locked, การ update status, outbox row — คือ `pgx.Tx` เดียวด้วย `defer tx.Rollback(ctx)` วินัยเดียวกับที่ [The Order Repository →](/shopmicro/th/order-service/order-repo/) ใช้ทุกที่ ไม่คำสั่งซื้อขยับไป terminal status *และ* `processed_events` row ถูกบันทึก *และ* outbox row `order.confirmed`/`order.cancelled` ถูกเขียน — ด้วยกันทั้งหมด — ก็ไม่มีเลยสักอย่าง ไม่มีช่องว่างที่ event ถูก mark ว่า processed แต่ status ไม่เปลี่ยน หรือ status เปลี่ยนแต่ไม่มี outbox row บอกส่วนที่เหลือของระบบ
+อย่างที่สอง การเช็ค `if status != "pending"` คือ **terminal-state guard** คำสั่งซื้อที่ถึง `confirmed` หรือ `cancelled` แล้วถือว่าจบ payment event ที่ตามมาทีหลัง — `payment.failed` ที่มาถึงหลัง `payment.succeeded` confirm ไปแล้ว หรือ event ที่ id ต่างกันจริง ๆ ของคำสั่งซื้อที่ event อื่น resolve ไปแล้ว — ต้องไม่ขยับสถานะเป็นครั้งที่สอง handler จะ commit เฉพาะการ insert `processed_events` เพื่อบันทึก id นั้นไว้ แล้วหยุด
+
+ทำไมต้องมีสอง guard ในเมื่อฟังดูเหมือนตัวเดียวน่าจะพอ? เพราะสอง guard จับคนละเคส
+
+dedupe จับ *event เดิม* ที่มาสองครั้ง — id เดียวกัน ส่วนการเช็ค terminal-state จับ *event คนละตัว* ที่พยายาม re-resolve คำสั่งซื้อที่ terminal ไปแล้ว — id ต่างกันแต่คำสั่งซื้อเดียวกัน ที่เป็นเคสที่ dedupe ยินดีปล่อยผ่าน
+
+ระบบที่มีแค่ dedupe จะ ignore `payment.succeeded` ที่ redeliver ได้ถูกต้อง แต่ยังปล่อยให้ `payment.failed` ที่มาสายพลิกคำสั่งซื้อ `confirmed` กลับเป็น `cancelled` ได้ ส่วนระบบที่มีแค่การเช็ค terminal-state จะรอดเคสนั้น แต่จะรัน status-update พร้อมเขียน outbox ใหม่ทั้งชุดทุกครั้งที่ event เดิม redeliver จนกว่าจะมีตัวใดตัวหนึ่ง land ก่อน ซึ่งทั้งเปลืองและ racy เพราะไม่มี lock
+
+พอวางสอง guard ไว้ด้วยกันใน transaction เดียว `ApplyPaymentResult` ก็ถูกต้องภายใต้ ordering, duplication หรือ concurrency แบบไหนก็ตามที่ delivery layer โยนมา
+
+**Transaction คือ guard ตัวที่สามแบบเงียบ ๆ** ทุกอย่าง — dedupe insert, การอ่านแบบ locked, การ update status และ outbox row — อยู่ใน `pgx.Tx` เดียวพร้อม `defer tx.Rollback(ctx)` วินัยเดียวกับที่ [The Order Repository →](/shopmicro/th/order-service/order-repo/) ใช้ทุกที่
+
+ผลคือมีแค่สองทาง: คำสั่งซื้อขยับไป terminal status *และ* บันทึก `processed_events` row *และ* เขียน outbox row `order.confirmed`/`order.cancelled` สำเร็จพร้อมกันทั้งหมด หรือไม่เกิดอะไรขึ้นเลยสักอย่าง จึงไม่มีช่องว่างที่ event ติดสถานะ processed แต่ status ไม่ขยับ หรือ status ขยับแล้วแต่ไม่มี outbox row ไปบอกส่วนที่เหลือของระบบ
 
 ทีนี้ความซื่อสัตย์ สองอย่างที่ saga นี้ **ไม่** ให้ โดยตั้งใจ:
 
-- **ไม่ใช่ exactly-once *delivery* — แต่ at-least-once delivery พร้อม *effect* แบบ exactly-once** guard พวกนี้ไม่หยุด Kafka จากการ deliver event เดิมสิบครั้ง; มันทำให้การ deliver ครั้งที่สิบเป็น no-op event ถูก *รับ* หลายครั้ง; *effect ต่อคำสั่งซื้อ* เกิดขึ้นครั้งเดียว ความต่างนั้นสำคัญเพราะ "exactly-once delivery" ในกรณี distributed-messaging ทั่วไปแทบทำไม่ได้เลย — คุณทำให้ network deliver message ครั้งเดียวเป๊ะภายใต้ crash และ retry ไม่ได้ สิ่งที่คุณ *สร้างได้* คือ idempotent consumer ที่ผลลัพธ์ที่สังเกตได้เหมือนกันไม่ว่า event จะมาครั้งเดียวหรือร้อยครั้ง ซึ่งคือสิ่งที่ `ApplyPaymentResult` เป็นพอดี เมื่อมีคนบอกว่าระบบเป็น "exactly-once" สิ่งนี้ — at-least-once delivery บวก idempotent handling — คือสิ่งที่พวกเขาหมายถึงจริง ๆ เกือบทุกครั้ง
-- **ไม่มี distributed rollback อัตโนมัติ** นี่คือ **choreography** saga [The Saga Handler →](/shopmicro/th/saga/orchestration/) และมันไม่มี coordinator ที่ถือ logic การ compensate เมื่อ payment ล้มเหลว คำสั่งซื้อขยับ *ไปข้างหน้า* สู่ `cancelled` — terminal state — ไม่ใช่ *ถอยหลัง* ด้วยการ undo ขั้นตอนก่อนหน้า ในคอร์สนี้แค่นั้นก็พอ เพราะขั้นตอนก่อนหน้าเดียวที่มี side effect คือการสร้าง order row และ `cancelled` เป็นจุดจบที่ดีสำหรับมัน แต่ระบบที่ซับซ้อนกว่า — ที่ reserve stock หรือ charge card จริง ก่อนการตัดสินใจของ payment — จะต้อง *compensate*: release stock, refund charge พวกนั้นคือ action ไปข้างหน้า (refund คือ transaction ใหม่ ไม่ใช่ undo) และใน choreography แต่ละเซอร์วิสต้องตอบสนองต่อ failure event แล้ว compensate ขั้นตอนของตัวเอง โดยไม่มีที่กลางที่รับประกันว่าทุก compensation รัน orchestration saga ใส่ sequence นั้นไว้ใน state machine เดียว; ตัวนี้จงใจไม่มี side effect ที่ต้อง compensate จึงไม่ต้องการมัน — ขอบเขตที่ควรรู้ก่อนคุณเพิ่มขั้นตอนที่ *มี* side effect
+- **ไม่ใช่ exactly-once *delivery* แต่เป็น at-least-once delivery พร้อม *effect* แบบ exactly-once** guard พวกนี้ไม่ได้หยุด Kafka จากการ deliver event เดิมสิบครั้ง แต่ทำให้การ deliver ครั้งที่สิบกลายเป็น no-op ระบบ *รับ* event หลายครั้ง แต่ *effect ต่อคำสั่งซื้อ* เกิดขึ้นครั้งเดียว ความต่างตรงนี้สำคัญ เพราะ "exactly-once delivery" ในงาน distributed messaging ทั่วไปแทบทำไม่ได้เลย — คุณบังคับให้ network ส่ง message ครั้งเดียวเป๊ะภายใต้ crash และ retry ไม่ได้ สิ่งที่ *สร้างได้จริง* คือ idempotent consumer ที่ให้ผลลัพธ์ที่สังเกตได้เหมือนกันไม่ว่า event จะมาครั้งเดียวหรือร้อยครั้ง ซึ่งก็คือสิ่งที่ `ApplyPaymentResult` เป็นพอดี เวลาใครบอกว่าระบบของเขา "exactly-once" เกือบทุกครั้งเขาหมายถึงแบบนี้ — at-least-once delivery บวก idempotent handling
+- **ไม่มี distributed rollback อัตโนมัติ** นี่คือ **choreography** saga [The Saga Handler →](/shopmicro/th/saga/orchestration/) จึงไม่มี coordinator ที่ถือ logic การ compensate เมื่อ payment ล้มเหลว คำสั่งซื้อจะขยับ *ไปข้างหน้า* สู่ `cancelled` ที่เป็น terminal state ไม่ใช่ *ถอยหลัง* ด้วยการ undo ขั้นตอนก่อนหน้า ในคอร์สนี้แค่นี้ก็พอ เพราะขั้นตอนก่อนหน้าเพียงอย่างเดียวที่มี side effect คือการสร้าง order row และ `cancelled` ก็เป็นจุดจบที่เหมาะสมอยู่แล้ว แต่ระบบที่ซับซ้อนกว่านี้ — ที่ reserve stock หรือ charge card จริงก่อนรู้ผล payment — จะต้อง *compensate* ด้วยการ release stock หรือ refund charge ซึ่งทั้งหมดเป็น action ไปข้างหน้า เพราะ refund คือ transaction ใหม่ ไม่ใช่การ undo ใน choreography แต่ละเซอร์วิสต้องตอบสนองต่อ failure event แล้ว compensate ขั้นตอนของตัวเอง โดยไม่มีจุดกลางคอยรับประกันว่าทุก compensation ได้รัน ส่วน orchestration saga จะยัด sequence นั้นไว้ใน state machine เดียว saga ตัวนี้จงใจไม่มี side effect ที่ต้อง compensate จึงยังไม่ต้องใช้ นี่คือขอบเขตที่ควรรู้ก่อนจะเพิ่มขั้นตอนที่ *มี* side effect เข้าไป
 
-## Pros & cons
+## ข้อดีข้อเสีย
 
 **Idempotent consumer (dedupe + terminal-state guard)** เทียบกับ **เชื่อว่า delivery layer เป็น exactly-once**
 
-- **Pros:** มันถูกต้องภายใต้การรับประกัน delivery ที่ระบบมีจริง (at-least-once) แทนที่จะเป็นอันที่มันมีไม่ได้; ความปลอดภัยอยู่ใน database ใน transaction เดียว ที่ซึ่งมันทนทานและตรวจสอบได้ ไม่ใช่ในสมมติฐานเปราะ ๆ ว่า broker จะไม่ redeliver; และมัน compose ได้ — consumer ตัวใดที่ dedupe บน `Event.ID` ปลอดภัยจากทั้ง redelivery ของตัวเองและ producer ต้นทางที่ derive id แบบ deterministic
-- **Cons:** consumer ที่มี state ทุกตัวตอนนี้พก table `processed_events` และวินัยที่ต้องเช็คมันก่อน ซึ่งเป็น schema จริงและโค้ดจริงที่ต้องทำให้ถูก; และ dedupe table โตไม่มีขอบเขตโดยไม่มี retention policy (การ prune `event_id` เก่าเป็นระยะ อยู่นอกขอบเขตที่นี่) — ต้นทุน operational เล็ก ๆ ที่การเชื่อ broker exactly-once ในตำนานจะไม่มี ถ้า broker แบบนั้นมีอยู่จริง
+- **Pros:** ถูกต้องภายใต้การรับประกัน delivery ที่ระบบมีจริงคือ at-least-once แทนที่จะพึ่งการรับประกันที่ไม่มีทางมี ความปลอดภัยอยู่ใน database ภายใน transaction เดียว ซึ่งทนทานและตรวจสอบย้อนหลังได้ ไม่ใช่อยู่ในสมมติฐานเปราะ ๆ ว่า broker จะไม่ redeliver แถมยัง compose ต่อได้ เพราะ consumer ตัวไหนที่ dedupe บน `Event.ID` ก็ปลอดภัยทั้งจาก redelivery ของตัวเองและจาก producer ต้นทางที่ derive id แบบ deterministic
+- **Cons:** consumer ที่มี state ทุกตัวต้องพก table `processed_events` มาด้วย พร้อมวินัยที่ต้องเช็คก่อนเสมอ ที่เป็น schema จริงและโค้ดจริงที่ต้องทำให้ถูก และ dedupe table จะโตไม่มีขอบเขตถ้าไม่มี retention policy การ prune `event_id` เก่าเป็นระยะอยู่นอกขอบเขตบทนี้ นี่คือต้นทุน operational เล็ก ๆ ที่จะไม่มีเลยถ้าเชื่อ broker แบบ exactly-once ในตำนาน สมมติว่า broker แบบนั้นมีอยู่จริง
 
 **Guard ทั้งสอง (dedupe *และ* terminal-state)** เทียบกับ **มีแค่ตัวเดียว**
 
 - **Pros:** สองตัวด้วยกันถูกต้องภายใต้ duplication *และ* out-of-order *และ* concurrent delivery — dedupe จัดการ same-id redelivery, การเช็ค terminal-state บวก `for update` จัดการ event คนละตัวที่แข่ง re-resolve คำสั่งซื้อที่จบไปแล้ว — ซึ่งคือชุดเต็มของสิ่งที่ at-least-once delivery ทำกับคุณได้จริง
-- **Cons:** มันมีชิ้นส่วนมากกว่าที่การอ่านครั้งแรกบอกว่าต้องการ และ guard ทั้งสองดูซ้ำซ้อนจนกว่าคุณจะสร้างเคสเป๊ะที่แต่ละตัวลำพังจะพลาด; reviewer ที่ลบ "ตัวที่ซ้ำซ้อน" ออกจะนำ bug ที่ละเอียดอ่อนกลับมา ซึ่งโผล่เฉพาะภายใต้ interleaving เฉพาะ ซึ่งคือ failure ประเภทที่จับได้ยากสุดใน testing
+- **Cons:** มีชิ้นส่วนมากกว่าที่อ่านผ่านครั้งแรกแล้วรู้สึกว่าจำเป็น และ guard ทั้งสองดูซ้ำซ้อนจนกว่าจะลองสร้างเคสที่แต่ละตัวลำพังจะพลาด reviewer ที่เผลอลบ "ตัวที่ซ้ำซ้อน" ออกจะดึง bug ละเอียดอ่อนกลับเข้ามา ซึ่งโผล่เฉพาะภายใต้ interleaving บางแบบเท่านั้น และเป็น failure ประเภทที่จับได้ยากที่สุดใน testing
 
-## Set it up
+## ติดตั้ง
 
 ไม่มีอะไรใหม่ต้องเขียน — guard สองตัวที่บทนี้พูดถึงอยู่ใน `services/order/internal/repo/orders.go` แล้วจาก [The Saga Handler →](/shopmicro/th/saga/orchestration/) และ `processed_events` ถูกสร้างโดย `migrations/order/0002_processed_events.sql` ของบทนั้น อ่าน guard ทั้งสองอีกครั้งด้วย framing ของบทนี้ คราวนี้เป็นภาพรวมแทนที่จะเป็นรายละเอียดที่ผ่านไป:
 
@@ -102,7 +126,7 @@ if status != "pending" {
 }
 ```
 
-ถ้าคุณข้ามการ apply `0002_processed_events.sql` ไปก่อนหน้านี้ มันแค่:
+ถ้าก่อนหน้านี้คุณข้ามการ apply `0002_processed_events.sql` ไป ก็แค่รัน:
 
 ```sql
 create table processed_events ( event_id text primary key, processed_at timestamptz not null default now() );
@@ -112,7 +136,7 @@ create table processed_events ( event_id text primary key, processed_at timestam
 migrate -path migrations/order -database "$ORDER_DB_URL" up
 ```
 
-## Verify
+## ตรวจสอบผล
 
 ยก stack ขึ้นมาแล้วรัน Catalog, Order, gateway, และ Payment แบบเดียวกับที่ [The Saga Handler →](/shopmicro/th/saga/orchestration/) ทิ้งไว้:
 
@@ -136,7 +160,7 @@ go run ./gateway/cmd
 go run ./services/payment/cmd
 ```
 
-สร้างคำสั่งซื้อขนาดเล็กแล้วปล่อยให้ loop resolve มันเป็น `CONFIRMED` แบบเดียวกับบทก่อน:
+สร้างคำสั่งซื้อขนาดเล็กแล้วปล่อยให้ loop resolve จนเป็น `CONFIRMED` แบบเดียวกับบทก่อน:
 
 ```bash
 curl -s -X POST localhost:8080/v1/orders \
@@ -144,7 +168,7 @@ curl -s -X POST localhost:8080/v1/orders \
   -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
 ```
 
-Poll มันกลับมาจนเป็น `ORDER_STATUS_CONFIRMED` แล้วจด id ของมัน ทีนี้พิสูจน์ idempotency ตรง ๆ: **redeliver event `payment.succeeded` เดิมเป๊ะ** ลงบน topic `payments` ด้วย `id` เดิมที่ console consumer แสดงใน [Process & Publish →](/shopmicro/th/payment-service/process-publish/) (`<order-id>:payment`) produce record ดิบหนึ่งอันตรงเข้า Kafka:
+Poll สถานะจนได้ `ORDER_STATUS_CONFIRMED` แล้วจด id ของคำสั่งซื้อไว้ ทีนี้พิสูจน์ idempotency ตรง ๆ: **redeliver event `payment.succeeded` เดิมเป๊ะ** ลงบน topic `payments` ด้วย `id` เดิมที่ console consumer แสดงใน [Process & Publish →](/shopmicro/th/payment-service/process-publish/) (`<order-id>:payment`) produce record ดิบหนึ่งอันตรงเข้า Kafka:
 
 ```bash
 docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
@@ -153,7 +177,7 @@ docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
 EOF
 ```
 
-saga consume มันอีกครั้ง — แต่ id อยู่ใน `processed_events` แล้ว ดังนั้น Guard 1 short-circuit และไม่มีอะไรเปลี่ยน ยืนยันว่า status ของคำสั่งซื้อไม่ถูกแตะและ event ถูกบันทึกครั้งเดียวพอดี:
+saga จะ consume event นี้อีกครั้ง แต่เพราะ id อยู่ใน `processed_events` แล้ว Guard 1 จึง short-circuit และไม่มีอะไรเปลี่ยน ยืนยันว่า status ของคำสั่งซื้อไม่โดนแตะ และ event บันทึกไว้ครั้งเดียวพอดี:
 
 ```bash
 docker compose exec -T postgres psql -U shopmicro -d orders -c \
@@ -188,7 +212,7 @@ docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
 EOF
 ```
 
-id นี้ใหม่ ดังนั้น Guard 1 ปล่อยมันผ่าน — แต่คำสั่งซื้อเป็น `confirmed` แล้ว ดังนั้น `if status != "pending"` ของ Guard 2 ปฏิเสธที่จะขยับมัน เช็ค status อีกครั้ง:
+id นี้เป็นของใหม่ Guard 1 จึงปล่อยผ่าน แต่คำสั่งซื้อเป็น `confirmed` ไปแล้ว `if status != "pending"` ของ Guard 2 จึงปฏิเสธที่จะขยับสถานะ เช็ค status อีกครั้ง:
 
 ```bash
 docker compose exec -T postgres psql -U shopmicro -d orders -c \
@@ -207,9 +231,13 @@ go build ./...
 
 - ลาก trace `payment.succeeded` ที่ redeliver (id เดิม) กับ `payment.failed` ที่ใหม่จริง ๆ สำหรับคำสั่งซื้อที่ `confirmed` แล้ว guard ตัวไหนหยุดแต่ละอัน และอะไรจะพังถ้า guard นั้นไม่อยู่?
 - ระบบเป็น "at-least-once delivery พร้อม effect แบบ exactly-once" ความต่างที่แม่นยำระหว่างสองวลีนั้นคืออะไร และทำไมคุณถึงมี exactly-once *delivery* แทนไม่ได้?
-- ทำไม `for update` บนบรรทัด `select status` ถึงจำเป็น ไม่ใช่แค่การเช็ค `if status != "pending"` ลำพัง? สร้าง interleaving ที่มันป้องกัน
-- saga นี้ไม่มี compensation logic และไม่มี orchestrator ขั้นตอนใหม่อะไรที่คุณต้องเพิ่มเข้า order flow ก่อนที่มันจะกลายเป็นปัญหาจริง และ compensation สำหรับมันจะหน้าตาเป็นอย่างไร?
+- ทำไม `for update` บนบรรทัด `select status` ถึงจำเป็น แทนที่จะใช้แค่การเช็ค `if status != "pending"` ลำพัง? ลองสร้าง interleaving ที่ `for update` ป้องกันไว้
+- saga นี้ไม่มี compensation logic และไม่มี orchestrator ต้องเพิ่มขั้นตอนใหม่แบบไหนเข้า order flow เรื่องนี้ถึงจะกลายเป็นปัญหาจริง และ compensation ของขั้นตอนนั้นจะหน้าตาเป็นอย่างไร?
 
-## Recap
+## สรุป
 
-`OrderRepo.ApplyPaymentResult` ปลอดภัยภายใต้ at-least-once delivery ของ Kafka เพราะ guard สองตัวใน transaction เดียว Guard 1, `insert into processed_events ... on conflict do nothing`, dedupe บน id ของ event — การ redeliver event *เดิม* เจอ id ที่บันทึกไว้แล้ว, commit no-op, และไม่แตะอะไร; มันทำงานข้าม redelivery ของ Payment เองด้วย เพราะ Payment derive id ของ result event แต่ละตัวแบบ deterministic Guard 2, `select status ... for update` บวก `if status != "pending"`, take row lock (serialize concurrent consumer) และปฏิเสธการ re-resolve คำสั่งซื้อที่ terminal แล้ว — จับ event *คนละตัว* ที่พยายามขยับคำสั่งซื้อที่ dedupe จะปล่อยผ่าน ด้วยกัน ใน `pgx.Tx` เดียวกับการ update status และ outbox row มันทำให้ handler ถูกต้องภายใต้ duplication, reordering, และ concurrency สิ่งที่จงใจ *ไม่* เป็น: exactly-once delivery (มันคือ at-least-once delivery พร้อม *effect* แบบ idempotent exactly-once — เวอร์ชันที่ทำได้ของเป้าหมายเดียวกัน) และมันไม่มี distributed rollback อัตโนมัติ เพราะ choreography saga ที่ไม่มี side effect ที่ต้อง compensate ขยับคำสั่งซื้อที่ล้มเหลว *ไปข้างหน้า* สู่ `cancelled` แทนที่จะ undo ขั้นตอนก่อนหน้า การ redeliver event เดิมและ inject อันที่ขัดแย้งมาสายทั้งคู่พิสูจน์มัน: คำสั่งซื้อเปลี่ยน state ครั้งเดียวพอดี ไม่ว่า delivery layer จะทำอะไร นั่นทำให้ saga สมบูรณ์ บทถัดไป [Notification Service →](/shopmicro/th/notification-service/) consume `payments` stream เดียวกันภายใต้ group ของตัวเองแล้วเปลี่ยนแต่ละผลลัพธ์เป็น notification ให้ลูกค้า — reader อิสระตัวที่สองของ event ที่ saga นี้ resolve อยู่มาตลอด
+`OrderRepo.ApplyPaymentResult` ปลอดภัยภายใต้ at-least-once delivery ของ Kafka เพราะ guard สองตัวใน transaction เดียว Guard 1, `insert into processed_events ... on conflict do nothing`, dedupe บน id ของ event การ redeliver event *เดิม* จะเจอ id ที่บันทึกไว้แล้ว commit แบบ no-op และไม่แตะอะไรทั้งสิ้น guard นี้ยังกัน redelivery ของ Payment เองได้ด้วย เพราะ Payment derive id ของ result event แต่ละตัวแบบ deterministic
+
+Guard 2 คือ `select status ... for update` บวก `if status != "pending"` ซึ่งจับ row lock เพื่อ serialize concurrent consumer แล้วปฏิเสธการ re-resolve คำสั่งซื้อที่ terminal ไปแล้ว จึงดัก event *คนละตัว* ที่พยายามขยับคำสั่งซื้อซึ่ง dedupe จะปล่อยผ่าน เมื่อรวมสอง guard ไว้ใน `pgx.Tx` เดียวกับการ update status และ outbox row handler จึงถูกต้องภายใต้ duplication, reordering และ concurrency
+
+สิ่งที่ระบบนี้จงใจ *ไม่* เป็นคือ exactly-once delivery เพราะจริง ๆ แล้วเป็น at-least-once delivery พร้อม *effect* แบบ idempotent exactly-once ที่เป็นเวอร์ชันที่ทำได้จริงของเป้าหมายเดียวกัน และไม่มี distributed rollback อัตโนมัติ เพราะ choreography saga ที่ไม่มี side effect ให้ compensate จะขยับคำสั่งซื้อที่ล้มเหลว *ไปข้างหน้า* สู่ `cancelled` แทนการ undo ขั้นตอนก่อนหน้า การ redeliver event เดิมและ inject event ที่ขัดแย้งเข้ามาสาย พิสูจน์ทั้งสองอย่างพร้อมกัน — คำสั่งซื้อเปลี่ยน state ครั้งเดียวพอดี ไม่ว่า delivery layer จะทำอะไรก็ตาม นั่นทำให้ saga สมบูรณ์ บทถัดไป [Notification Service →](/shopmicro/th/notification-service/) consume `payments` stream เดียวกันภายใต้ group ของตัวเองแล้วเปลี่ยนแต่ละผลลัพธ์เป็น notification ให้ลูกค้า — reader อิสระตัวที่สองของ event ที่ saga นี้ resolve อยู่มาตลอด

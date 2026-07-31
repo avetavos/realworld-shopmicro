@@ -5,33 +5,33 @@ sidebar:
   order: 2
 ---
 
-## What we're building
+## สิ่งที่จะสร้าง
 
 `deploy/compose/docker-compose.yml` — Compose file ตัวเดียวที่ยกทั้งระบบ ShopMicro ขึ้นมา: PostgreSQL, Kafka, และ RabbitMQ (infra ที่ [Infra & Compose →](/shopmicro/th/setup/infra-compose/) ยกขึ้นครั้งแรกใน Module 1), เซอร์วิส **migration** แบบ one-shot ที่ apply SQL ของแต่ละเซอร์วิสก่อน app เริ่ม, และทั้งหก application image — Catalog, Order, Payment, Notification, Notification worker, และ gateway — แต่ละตัว build จาก `Dockerfile` ที่ parameterize ได้ตัวเดียว [Service images →](/shopmicro/th/docker/service-images/) ด้วย `TARGET` ของตัวเอง ทุก dependency ต่อสายด้วย DNS ของ Compose network ทุกลำดับการเริ่มจัดด้วย healthcheck และ gateway publish บน `8080` หลังจากนี้ `docker compose up` คือคำสั่ง "รัน ShopMicro บนเครื่อง" ทั้งหมด
 
-## Why
+## ทำไม
 
-จนถึงตอนนี้ การรันระบบหมายถึงหนึ่ง terminal ต่อ process — Catalog ตรงนี้, Order ตรงนั้น, gateway, Payment, Notification, worker — แต่ละตัว `go run` ชี้ไป infra บน `localhost` เริ่มในลำดับที่ถูกด้วยมือ มันใช้ได้สำหรับพัฒนาเซอร์วิสเดียว แต่มันคือหก terminal, boot order ที่ต้องจำ, และกอง env var ที่ต้องคุมให้ตรง Compose ยุบมันทั้งหมดเป็นไฟล์ declarative ตัวเดียวและคำสั่งเดียว และสาม feature ของมันคือสิ่งที่ทำให้เชื่อถือได้ ไม่ใช่แค่สะดวก
+จนถึงตอนนี้ การรันระบบหมายถึงหนึ่ง terminal ต่อ process — Catalog ตรงนี้, Order ตรงนั้น, gateway, Payment, Notification, worker — แต่ละตัว `go run` ชี้ไป infra บน `localhost` แล้วไล่เริ่มตามลำดับที่ถูกต้องด้วยมือ วิธีนี้ใช้ได้ตอนพัฒนาเซอร์วิสเดียว แต่พอครบทั้งระบบก็กลายเป็นหก terminal บวก boot order ที่ต้องจำ และกอง env var ที่ต้องคุมให้ตรง Compose ยุบทั้งหมดนั้นเหลือไฟล์ declarative ตัวเดียวกับคำสั่งเดียว และมีสาม feature ที่ทำให้เชื่อถือได้จริง ไม่ใช่แค่สะดวก
 
 **Service DNS** ทุกเซอร์วิสใน Compose file เข้าถึงได้จากทุกตัวด้วย *ชื่อ* เซอร์วิสเป็น hostname บน Compose network ดังนั้น Order เข้าถึง Postgres ที่ `postgres:5432`, Payment เข้าถึง Kafka ที่ `kafka:9092`, Notification เข้าถึง RabbitMQ ที่ `rabbitmq:5672` — ไม่มี IP address ไม่มี `localhost` (ซึ่งข้างใน container หมายถึงตัว container เอง ไม่ใช่ host) env var ที่แต่ละเซอร์วิสอ่านอยู่แล้ว — `ORDER_DB_URL`, `KAFKA_BROKERS`, `RABBITMQ_URL` [Consuming events →](/shopmicro/th/notification-service/consume-events/) — แค่ได้ hostname ของ Compose แทน `localhost` และไม่มีอะไรในโค้ด Go เปลี่ยนเลย
 
-**Healthcheck และ `depends_on: condition: service_healthy`** ลำดับการเริ่มเป็นปัญหาจริงในระบบแบบนี้: migration ของ Order รันไม่ได้จนกว่า Postgres จะรับ connection จริง และ Order เองไม่ควรเริ่มจนกว่า migration ของมันจะเสร็จ `depends_on` เปล่า ๆ รอแค่ container *เริ่ม* ไม่ใช่ *พร้อม* — container ของ Postgres "up" นานก่อน Postgres จะตอบ query ดังนั้น Postgres, Kafka, และ RabbitMQ ต่างประกาศ `healthcheck` และทุกอย่างข้างล่างพึ่งพวกมันด้วย `condition: service_healthy` ซึ่งรอให้ healthcheck ผ่านจริง migration job gate บน Postgres ที่ healthy; app service gate บน migration ที่เสร็จและ broker ที่ healthy
+**Healthcheck และ `depends_on: condition: service_healthy`** ลำดับการเริ่มเป็นปัญหาจริงในระบบแบบนี้: migration ของ Order รันไม่ได้จนกว่า Postgres จะรับ connection จริง และ Order เองก็ไม่ควรเริ่มจนกว่า migration จะเสร็จ `depends_on` เปล่า ๆ รอแค่ container *เริ่ม* ไม่ใช่ *พร้อมใช้งาน* container ของ Postgres ขึ้นสถานะ "up" ตั้งนานก่อน Postgres จะตอบ query ได้ ดังนั้น Postgres, Kafka และ RabbitMQ ต่างประกาศ `healthcheck` ไว้ แล้วทุกอย่างที่อยู่ถัดลงมาก็พึ่งสามตัวนี้ด้วย `condition: service_healthy` ซึ่งรอจน healthcheck ผ่านจริง migration job gate บน Postgres ที่ healthy; app service gate บน migration ที่เสร็จและ broker ที่ healthy
 
-**Migration service แบบ one-shot** SQL migration [Repo Layout →](/shopmicro/th/setup/repo-layout/) ไม่ถูก bake เข้า image ของเซอร์วิส — `.dockerignore` ของ [Service images →](/shopmicro/th/docker/service-images/) กันมันออกอย่างตั้งใจ แต่มันรันเป็นเซอร์วิส Compose อายุสั้นของตัวเองด้วย image `migrate/migrate` ซึ่งเริ่ม apply migration ที่ค้างทุกตัวกับ database แล้ว exit `0` app service แล้วพึ่ง migration job ของมันด้วย `condition: service_completed_successfully` ดังนั้น Order ไม่เริ่มกับ schema ที่ยังไม่ถูกสร้าง การแยก migration ออกจากเซอร์วิสที่ใช้ schema คือวินัยเดียวกับที่คอร์สนี้ใช้ทุกที่: สิ่งที่ *เปลี่ยน* database แยกจากสิ่งที่ *ใช้* มัน
+**Migration service แบบ one-shot** SQL migration [Repo Layout →](/shopmicro/th/setup/repo-layout/) ไม่ถูก bake เข้า image ของเซอร์วิส เพราะ `.dockerignore` ของ [Service images →](/shopmicro/th/docker/service-images/) กันออกอย่างตั้งใจ แต่จะรันเป็นเซอร์วิส Compose อายุสั้นของตัวเองด้วย image `migrate/migrate` ที่ apply migration ค้างทุกตัวกับ database แล้ว exit `0` จากนั้น app service ก็พึ่ง migration job ของตัวเองด้วย `condition: service_completed_successfully` Order จึงไม่มีทางเริ่มขึ้นมาพร้อม schema ที่ยังไม่ถูกสร้าง การแยก migration ออกจากเซอร์วิสที่ใช้ schema คือวินัยเดียวกับที่คอร์สนี้ใช้ทุกที่ — แยกสิ่งที่ *เปลี่ยน* database ออกจากสิ่งที่ *ใช้* database
 
-## Pros & cons
+## ข้อดีข้อเสีย
 
 **Compose สำหรับ local stack** เทียบกับ **รันแต่ละ binary ด้วยมือด้วย `go run`**
 
-- **Pros:** ไฟล์เดียวคือแหล่งความจริงเดียวของการต่อสายทั้งระบบ — port, env var, ลำดับ dependency, image build — และ `docker compose up` เดียวสร้างมันเหมือนกันเป๊ะบนเครื่องไหนก็ได้ที่มี Docker ไม่ต้องจำ boot sequence; การ gate ด้วย healthcheck ตัด race ที่เซอร์วิสเริ่มก่อน database พร้อม; และทั้งหมด tear down สะอาดด้วย `docker compose down`
-- **Cons:** ตอนนี้คุณ iterate ผ่านการ build image แทน `go run` ที่ทันที ดังนั้น inner loop ที่เร็วของการแก้เซอร์วิสเดียวช้าลงเว้นแต่คุณกลับไปรันแค่ binary นั้นบนเครื่องกับ Compose infra; และ Compose เป็นเครื่องมือ local-development และ single-host — มัน *ไม่ใช่* วิธีที่ระบบนี้รันบน production ซึ่งเป็นเหตุผลทั้งหมดที่ [Kubernetes (Helm) →](/shopmicro/th/kubernetes/) มีอยู่
+- **Pros:** ไฟล์เดียวคือแหล่งความจริงเดียวของการต่อสายทั้งระบบ — port, env var, ลำดับ dependency, image build — และ `docker compose up` ครั้งเดียวก็สร้างทั้งระบบขึ้นมาเหมือนกันเป๊ะบนเครื่องไหนก็ได้ที่มี Docker โดยไม่ต้องจำ boot sequence การ gate ด้วย healthcheck ตัด race ที่เซอร์วิสเริ่มก่อน database พร้อม; และทั้งหมด tear down สะอาดด้วย `docker compose down`
+- **Cons:** ตอนนี้ต้อง iterate ผ่านการ build image แทน `go run` ที่เห็นผลทันที inner loop ของการแก้เซอร์วิสเดียวจึงช้าลง เว้นแต่จะย้อนไปรันเฉพาะ binary นั้นบนเครื่องโดยใช้ infra จาก Compose อีกอย่างคือ Compose เป็นเครื่องมือสำหรับ dev บนเครื่องเดียว *ไม่ใช่* วิธีที่ระบบนี้รันบน production นั่นคือเหตุผลทั้งหมดที่ [Kubernetes (Helm) →](/shopmicro/th/kubernetes/) มีอยู่
 
 **เซอร์วิส `migrate` แบบ one-shot ต่อ database** เทียบกับ **แต่ละเซอร์วิสรัน migration ของตัวเองตอน startup**
 
 - **Pros:** migration รันครั้งเดียวพอดี ใน step เฉพาะ พร้อมผลสำเร็จ/ล้มเหลวชัดที่ app startup gate ได้ — ไม่มีความกำกวมว่า Order replica ตัวไหนใน 3 ตัว "ชนะ" race ของ migration และไม่มี migration logic link เข้า binary ของเซอร์วิสเลย
-- **Cons:** มันคือหนึ่งเซอร์วิสต่อ database เพิ่มใน Compose file และอีกหนึ่งอย่างที่ต้อง sync เมื่อเพิ่ม migration ใหม่; เซอร์วิสที่ต้อง self-migrate ในบาง environment (platform ที่รัน init job ไม่ได้) ต้องมี logic นั้นใน process อยู่ดี ซึ่งการแยกนี้ไม่ให้
+- **Cons:** ต้องเพิ่มหนึ่งเซอร์วิสต่อหนึ่ง database ใน Compose file และมีอีกหนึ่งจุดที่ต้อง sync ทุกครั้งที่เพิ่ม migration ใหม่ ส่วนเซอร์วิสที่ต้อง self-migrate ในบาง environment เช่น platform ที่รัน init job ไม่ได้ ก็ยังต้องมี logic นั้นอยู่ใน process อยู่ดี ซึ่งการแยกแบบนี้ไม่ได้ช่วย
 
-## Set it up
+## ติดตั้ง
 
 ### 1. `deploy/compose/initdb.sql`
 
@@ -212,7 +212,7 @@ services:
 - **startup graph ถูก encode ไม่ใช่สมมติ:** `migrate-*` job รอ Postgres *healthy*, app service รอ migration *เสร็จสำเร็จ* และ broker healthy, และ gateway รอ Catalog กับ Order เริ่ม — ดังนั้น `docker compose up` ยกทั้งหมดขึ้นในลำดับที่ถูกโดยไม่ต้อง sequence ด้วยมือ
 - **มีแค่ gateway (`8080`) และ management/debug port (`5432`, `15672`) ที่ publish** ไป host; เซอร์วิสคุยกันผ่าน network ภายในและไม่ต้องการ host port เลย
 
-## Verify
+## ตรวจสอบผล
 
 จาก compose directory build ทุก image แล้วเริ่มทั้ง stack:
 
@@ -220,7 +220,7 @@ services:
 cd deploy/compose && docker compose up -d --build
 ```
 
-Compose build ทั้งหก image เริ่ม Postgres/Kafka/RabbitMQ รอให้ผ่าน healthcheck รัน migration job ทั้งสองให้เสร็จ แล้วเริ่มเซอร์วิส ดูมันเข้าที่:
+Compose build ทั้งหก image เริ่ม Postgres/Kafka/RabbitMQ รอให้ผ่าน healthcheck รัน migration job ทั้งสองให้เสร็จ แล้วค่อยเริ่มเซอร์วิส ลองดูให้เข้าที่:
 
 ```bash
 docker compose ps
@@ -239,7 +239,7 @@ shopmicro-postgres-1            Up (healthy)
 shopmicro-rabbitmq-1            Up (healthy)
 ```
 
-`migrate-*` job สองตัวจะไม่ปรากฏใน `ps` — มันรัน exit `0` แล้วเสร็จ ทีนี้รัน end-to-end smoke test *เดิม* จากบทก่อน ๆ [The Saga Handler →](/shopmicro/th/saga/orchestration/) เพียงแต่ทุก hop ตอนนี้เกิดระหว่าง container และสิ่งเดียวที่คุณคุยด้วยคือ gateway บน `8080` ของ host:
+`migrate-*` job สองตัวจะไม่โผล่ใน `ps` เพราะรันแล้ว exit `0` จบไปแล้ว ทีนี้ลองรัน end-to-end smoke test *ชุดเดิม* จากบทก่อน ๆ [The Saga Handler →](/shopmicro/th/saga/orchestration/) เพียงแต่ทุก hop ตอนนี้เกิดระหว่าง container และสิ่งเดียวที่คุณคุยด้วยคือ gateway บน `8080` ของ host:
 
 ```bash
 curl -s localhost:8080/v1/products
@@ -261,7 +261,7 @@ curl -s -X POST localhost:8080/v1/orders \
   -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
 ```
 
-Poll คำสั่งซื้อกลับมาไม่กี่วินาทีต่อมาแล้วดูมันถึง `CONFIRMED` เอง — loop เต็ม `order.created` → Kafka → Payment → Kafka → saga รันข้างใน Compose ทั้งหมด และ Notification enqueue RabbitMQ job ที่ worker ส่ง ทั้งหมดโดยไม่มี `go run` เดียว:
+Poll คำสั่งซื้อกลับมาอีกไม่กี่วินาทีต่อมา แล้วดูสถานะเดินไปถึง `CONFIRMED` เอง — loop เต็ม `order.created` → Kafka → Payment → Kafka → saga รันข้างใน Compose ทั้งหมด และ Notification enqueue RabbitMQ job ที่ worker ส่ง ทั้งหมดโดยไม่มี `go run` เดียว:
 
 ```bash
 curl -s localhost:8080/v1/orders/<id-from-above>
@@ -294,6 +294,6 @@ docker compose down -v
 - migration รันเป็นเซอร์วิส `migrate/migrate` ของตัวเองแทนที่จะ bake เข้า image ของ Order `.dockerignore` ของ [Service images →](/shopmicro/th/docker/service-images/) ทำอะไรที่สอดคล้องกับสิ่งนี้ และทำไมกัน migration ออกจาก image ของเซอร์วิส?
 - curl test แบบ end-to-end เหมือนบทก่อนเป๊ะทุก byte แต่ไม่มีอะไรรันด้วย `go run` อะไรเปลี่ยนเกี่ยวกับ *ที่* แต่ละ hop เกิด และอะไรเหมือนเดิมเกี่ยวกับ behavior ของระบบ?
 
-## Recap
+## สรุป
 
 `deploy/compose/docker-compose.yml` คือทั้งระบบในไฟล์เดียว Postgres, Kafka, และ RabbitMQ ขึ้นมาพร้อม healthcheck; `migrate-catalog` และ `migrate-order` apply แต่ละ schema ครั้งเดียวแล้ว exit; และทั้งหก app image build จาก `Dockerfile` ที่ parameterize ได้ตัวเดียว [Service images →](/shopmicro/th/docker/service-images/) แต่ละตัวเลือก binary ด้วย build arg `TARGET` ผ่าน YAML anchor ที่ใช้ร่วม ทุกอย่างต่อสายด้วย DNS ของ Compose network — เซอร์วิส address กันด้วยชื่อ (`postgres:5432`, `kafka:9092`, `catalog:50051`) ไม่เคย `localhost` — และเรียงด้วย `depends_on` condition ดังนั้น migration รอ database ที่ healthy และ app รอ migration ที่เสร็จและ broker ที่ healthy `docker compose up -d --build` ยกทั้ง stack ขึ้น และ `curl` smoke test เดิมจากบทก่อนขับคำสั่งซื้อจริงถึง `CONFIRMED` พร้อม notification ที่ส่งแล้ว ทุก hop ตอนนี้ระหว่าง container แทนที่จะเป็น process บนเครื่อง แต่ Compose คือ local stack ที่สร้างซ้ำได้ — ไม่ใช่ production บทถัดไป [Kubernetes (Helm) →](/shopmicro/th/kubernetes/) package image เดียวกันเหล่านี้เป็น Helm chart แล้ว deploy ระบบไปยัง cluster จริง แลกความเรียบง่าย single-host ของ Compose กับ scaling, self-healing, และ rolling deploy

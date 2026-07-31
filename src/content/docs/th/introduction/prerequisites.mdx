@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-## What we're building
+## สิ่งที่จะสร้าง
 
 ในบทนี้เราจะเตรียมเครื่อง **macOS** ของคุณให้พร้อมสร้าง ShopMicro ยังไม่มีโค้ดแอปพลิเคชัน — แค่ toolchain พอจบแล้วคุณจะติดตั้งทุกเครื่องมือครบ และที่สำคัญกว่านั้นคือ **ตรวจสอบ (verify)** ด้วยคำสั่งที่มี output ให้คุณเทียบกับที่พิมพ์ไว้ตรงนี้ได้
 
@@ -19,11 +19,13 @@ sidebar:
 - [ ] **helm** — ติดตั้ง chart ของ ShopMicro ขึ้น Kubernetes
 - [ ] **cluster บนเครื่อง** — `kind` หรือ Kubernetes ที่มากับ Docker Desktop
 
-## Why
+## ทำไม
 
-Version drift คือเพชฌฆาตเงียบของ "มันรันได้บนเครื่องฉันนะ" การล็อก toolchain ไว้ตอนนี้ — และยืนยันว่าแต่ละเครื่องมือรันได้จริง — หมายความว่าเมื่อโมดูลถัด ๆ ไปบอกว่า "รัน `buf generate`" หรือ "helm install chart" มันก็จะทำงานได้เลย การตรวจ output ไว้ล่วงหน้าเปลี่ยน "ติดตั้งแล้วมั้ง" ให้เป็น "ติดตั้งแล้ว ฉันเช็คแล้ว" โปรเจกต์ microservices มีเครื่องมือมากกว่าโปรเจกต์เซอร์วิสเดียว การตั้งค่าให้สะอาดจึงคุ้มยิ่งกว่าเดิม
+Version drift คือเพชฌฆาตเงียบของ "มันรันได้บนเครื่องฉันนะ" ถ้าล็อก toolchain ไว้ตอนนี้และยืนยันว่าแต่ละเครื่องมือรันได้จริง พอโมดูลถัด ๆ ไปบอกให้ "รัน `buf generate`" หรือ "helm install chart" ก็จะผ่านฉลุย
 
-## Pros & cons
+การเทียบ output ไว้ล่วงหน้าเปลี่ยน "ติดตั้งแล้วมั้ง" ให้เป็น "ติดตั้งแล้ว เช็คแล้ว" และเพราะโปรเจกต์ microservices มีเครื่องมือมากกว่าโปรเจกต์เซอร์วิสเดียว การตั้งค่าให้สะอาดตั้งแต่แรกจึงคุ้มยิ่งกว่าเดิม
+
+## ข้อดีข้อเสีย
 
 **ข้อดี**
 
@@ -37,9 +39,9 @@ Version drift คือเพชฌฆาตเงียบของ "มัน�
 - Docker Desktop บวก Kubernetes cluster เป็นไฟล์ดาวน์โหลดขนาดใหญ่และกิน RAM พอสมควร — การรัน Kafka, RabbitMQ และ Postgres พร้อมกันไม่ใช่ของเบา
 - สมมติว่าคุณมี Homebrew อยู่แล้ว ถ้ายังไม่มี ให้ติดตั้งก่อนจาก [brew.sh](https://brew.sh)
 
-## Set it up
+## ติดตั้ง
 
-ทำจากบนลงล่าง หลังติดตั้งแต่ละตัว ให้รันคำสั่ง verify ของมันและเทียบ output ให้ตรงก่อนไปต่อ
+ทำจากบนลงล่าง หลังติดตั้งแต่ละตัว ให้รันคำสั่ง verify ของเครื่องมือนั้นแล้วเทียบ output ให้ตรงก่อนไปต่อ
 
 ### 1. Go 1.22+
 
@@ -63,7 +65,7 @@ go version go1.22.5 darwin/arm64
 
 ### 2. buf
 
-`buf` คือ toolchain สมัยใหม่สำหรับ Protocol Buffers เราจะใช้มัน lint สัญญา `.proto` และ generate gRPC Go stub (ทั้ง client และ server) ตั้งแต่ Module 2 เป็นต้นไป ติดตั้งผ่าน Homebrew:
+`buf` คือ toolchain สมัยใหม่สำหรับ Protocol Buffers ตั้งแต่ Module 2 เป็นต้นไปเราจะใช้ buf lint contract `.proto` และ generate gRPC Go stub ทั้งฝั่ง client และ server ติดตั้งผ่าน Homebrew:
 
 ```sh
 brew install bufbuild/buf/buf
@@ -83,7 +85,7 @@ Output ที่คาดหวัง:
 
 ### 3. Docker Desktop
 
-Docker รัน infrastructure ของ ShopMicro — **PostgreSQL**, **Kafka** และ **RabbitMQ** — ระหว่างพัฒนา โดยเชื่อมทั้งหมดเข้าด้วยกันผ่าน Docker Compose ไฟล์ที่คุณจะเขียนใน Module 1 ต่อมา Docker ยังใช้แพ็กแต่ละเซอร์วิสเป็น image ด้วย ติดตั้ง **Docker Desktop for Mac** จาก [docker.com](https://www.docker.com/products/docker-desktop/) (หรือ `brew install --cask docker`) แล้วเปิดมันสักครั้งเพื่อให้ engine ทำงาน
+Docker รัน infrastructure ของ ShopMicro — **PostgreSQL**, **Kafka** และ **RabbitMQ** — ระหว่างพัฒนา โดยเชื่อมทั้งหมดเข้าด้วยกันผ่าน Docker Compose ไฟล์ที่คุณจะเขียนใน Module 1 ต่อมา Docker ยังใช้แพ็กแต่ละเซอร์วิสเป็น image ด้วย ติดตั้ง **Docker Desktop for Mac** จาก [docker.com](https://www.docker.com/products/docker-desktop/) (หรือ `brew install --cask docker`) แล้วเปิดขึ้นมาสักครั้งเพื่อให้ engine เริ่มทำงาน
 
 Verify ทั้ง engine และ Compose plugin:
 
@@ -103,7 +105,7 @@ Docker Compose version v2.28.1
 
 ### 4. grpcurl
 
-`grpcurl` คือ `curl` สำหรับ gRPC — มันให้คุณเรียก method ของเซอร์วิสตรงจาก terminal ซึ่งมีค่ามากสำหรับการทดสอบ Catalog และ Order ก่อนที่ gateway จะมีอยู่ ติดตั้งผ่าน Homebrew:
+`grpcurl` คือ `curl` สำหรับ gRPC ให้คุณเรียก method ของเซอร์วิสตรงจาก terminal ซึ่งมีประโยชน์มากตอนทดสอบ Catalog และ Order ก่อนที่ gateway จะมีตัวตน ติดตั้งผ่าน Homebrew:
 
 ```sh
 brew install grpcurl
@@ -147,7 +149,7 @@ version.BuildInfo{Version:"v3.15.2", ...}
 
 คุณต้องมีที่สำหรับรัน chart มีสองทางเลือกที่ง่าย:
 
-**ตัวเลือก A — Kubernetes ที่มากับ Docker Desktop** ใน Docker Desktop เปิด **Settings → Kubernetes** แล้วติ๊ก **Enable Kubernetes** มันจะปั่น single-node cluster ขึ้นมาและชี้ `kubectl` ไปที่มัน
+**ตัวเลือก A — Kubernetes ที่มากับ Docker Desktop** ใน Docker Desktop เปิด **Settings → Kubernetes** แล้วติ๊ก **Enable Kubernetes** Docker Desktop จะปั่น single-node cluster ขึ้นมาให้ แล้วชี้ `kubectl` ไปที่ cluster นั้นเอง
 
 **ตัวเลือก B — kind (Kubernetes in Docker)** cluster ขนาดเบาที่รันอยู่ใน Docker container ติดตั้งและสร้างขึ้นมา:
 
@@ -173,9 +175,9 @@ shopmicro-control-plane   Ready    control-plane   1m    v1.30.0
 
 ทางไหนก็ได้ — เลือกหนึ่ง คุณต้องใช้ cluster เฉพาะใน Module 14 เท่านั้น จึงกลับมาทำขั้นนี้ทีหลังได้หากยังไม่อยากรันตอนนี้
 
-> **หมายเหตุ:** คุณ **ไม่ต้อง** ติดตั้ง Kafka, RabbitMQ หรือ PostgreSQL ลงบนเครื่องโดยตรง มันรันเป็น container ผ่าน Docker Compose ไฟล์ที่คุณจะสร้างใน [Module 1 · Setup & Tooling](/shopmicro/th/setup/) นั่นทำให้เครื่องของคุณสะอาดและสภาพแวดล้อมของทุกคนเหมือนกัน
+> **หมายเหตุ:** คุณ **ไม่ต้อง** ติดตั้ง Kafka, RabbitMQ หรือ PostgreSQL ลงบนเครื่องโดยตรง ทั้งสามตัวรันเป็น container ผ่าน Docker Compose ไฟล์ที่คุณจะสร้างใน [Module 1 · Setup & Tooling](/shopmicro/th/setup/) แบบนี้เครื่องของคุณสะอาด และสภาพแวดล้อมของทุกคนเหมือนกัน
 
-## Verify
+## ตรวจสอบผล
 
 รันการกวาดครั้งสุดท้ายนี้ ทุกบรรทัดควรพิมพ์เวอร์ชันออกมา และไม่ควรมีคำสั่งไหน "not found":
 
@@ -189,6 +191,6 @@ kubectl version --client && helm version
 
 ถ้าทุกคำสั่งตอบด้วย version string — และ Go เป็น 1.22+ — เครื่องของคุณก็พร้อมแล้ว
 
-## Recap
+## สรุป
 
 toolchain บน macOS ของคุณติดตั้งครบและ **ตรวจสอบ** แล้ว: **Go 1.22+** สำหรับเซอร์วิส, **buf** สำหรับ lint proto และ generate gRPC stub, **Docker Desktop** (engine + Compose) สำหรับรัน Postgres/Kafka/RabbitMQ, **grpcurl** สำหรับทดสอบ gRPC ด้วยมือ และ **kubectl** + **helm** + **cluster บนเครื่อง** สำหรับการ deploy ขึ้น Kubernetes ตัว broker และฐานข้อมูลเองรันใน Docker ไม่ใช่บนเครื่องของคุณ นี่คือจุดจบของ Module 0 ต่อไปคือ [Module 1 · Setup & Tooling](/shopmicro/th/setup/) ที่เราจะ scaffold Go monorepo และตั้งเซอร์วิสรองรับขึ้นมา

@@ -5,25 +5,25 @@ sidebar:
   order: 4
 ---
 
-## What we're building
+## สิ่งที่จะสร้าง
 
-`docker-compose.yml` ไฟล์เดียวใต้ `deploy/compose/` ที่ตั้งเซอร์วิสเบื้องหลังสามตัวที่ทุกเซอร์วิสของ ShopMicro พึ่งพา: **PostgreSQL** (พร้อมสอง database ที่ถูกสร้างตอนบูตครั้งแรก), **Kafka** ที่รันในโหมด **KRaft** (ไม่มี ZooKeeper) และ **RabbitMQ** พร้อม management UI ของมัน ยังไม่มีโค้ดแอปพลิเคชันรันตรงนี้ — นี่คือ infrastructure ล้วน ๆ ที่ `.env.example` ของ Module 1 ชี้ไปหาอยู่แล้ว
+`docker-compose.yml` ไฟล์เดียวใต้ `deploy/compose/` ที่ตั้งเซอร์วิสเบื้องหลังสามตัวที่ทุกเซอร์วิสของ ShopMicro พึ่งพา: **PostgreSQL** (พร้อมสอง database ที่ถูกสร้างตอนบูตครั้งแรก), **Kafka** ที่รันในโหมด **KRaft** (ไม่มี ZooKeeper) และ **RabbitMQ** พร้อม management UI ยังไม่มีโค้ดแอปพลิเคชันรันตรงนี้ — นี่คือ infrastructure ล้วน ๆ ที่ `.env.example` ของ Module 1 ชี้ไปหาอยู่แล้ว
 
-## Why
+## ทำไม
 
 การรัน Postgres, Kafka และ RabbitMQ เป็น daemon แบบ native บนเครื่องหมายถึงต้องติดตั้งและจัดการเวอร์ชันซอฟต์แวร์สามตัวแยกกัน แต่ละตัวมีเรื่องปลีกย่อยของตัวเองบน macOS Docker Compose รวมทั้งสามอย่างไว้ในไฟล์เดียวและคำสั่งเดียว โดยทุกค่า — user, password, port — ชัดเจนและเหมือนกันทุกประการในเครื่องของผู้ร่วมพัฒนาทุกคน
 
-**KRaft อธิบาย** แต่เดิม Kafka ต้องมี ZooKeeper cluster แยกต่างหากเพียงเพื่อเก็บ metadata ของ broker และเลือก controller ตั้งแต่ Kafka 3.3 **KRaft** (Kafka Raft) แทนที่ ZooKeeper ด้วย controller quorum แบบ Raft ที่มากับตัวมันเอง — broker เองจัดการ metadata และการเลือก leader ในตัว สำหรับการพัฒนาในเครื่องนั่นหมายถึง container เดียวแทนที่จะเป็นสอง ซึ่งตรงกับสิ่งที่ `KAFKA_PROCESS_ROLES: broker,controller` ด้านล่างตั้งค่าไว้: node เดียวทำหน้าที่ทั้ง broker และ controller
+**KRaft อธิบาย** แต่เดิม Kafka ต้องมี ZooKeeper cluster แยกต่างหากเพียงเพื่อเก็บ metadata ของ broker และเลือก controller ตั้งแต่ Kafka 3.3 **KRaft** (Kafka Raft) เข้ามาแทน ZooKeeper ด้วย controller quorum แบบ Raft ที่มีมาในตัว broker จึงจัดการ metadata และการเลือก leader ได้เอง สำหรับการพัฒนาในเครื่องนั่นหมายถึง container เดียวแทนที่จะเป็นสอง ซึ่งตรงกับสิ่งที่ `KAFKA_PROCESS_ROLES: broker,controller` ด้านล่างตั้งค่าไว้: node เดียวทำหน้าที่ทั้ง broker และ controller
 
 **Database-per-service อธิบาย** Catalog และ Order แต่ละตัวมี PostgreSQL database **ของตัวเอง** — ไม่ใช่ schema ของตัวเองใน database เดียวกัน แต่เป็น database แยกจริง ๆ Catalog ไม่สามารถ query ตาราง Order ได้แม้จะอยากทำก็ตาม ทางเดียวที่จะข้ามขอบเขตนั้นคือการเรียก gRPC การแยกตัวแบบนี้ที่บังคับใช้แม้ใน local dev คือสิ่งที่ทำให้เซอร์วิสยังคง deploy แยกอิสระได้ในภายหลัง
 
-**หมายเหตุเรื่องคำสงวน** `order` เป็นคำสงวน (reserved keyword) ของ SQL ใน PostgreSQL การตั้งชื่อ database ว่า `order` จะบังคับให้ `psql`, migration tool และทุก raw SQL string ต้อง quote มันเป็น `"order"` ตลอดไป เราหลบปัญหานี้ทั้งหมดด้วยการตั้งชื่อ database ว่า **`orders`** — ซึ่งก็เป็นเหตุผลที่ `ORDER_DB_URL` ใน `.env.example` (จาก [Repo Layout →](/shopmicro/th/setup/repo-layout/)) ลงท้ายด้วย `/orders`
+**หมายเหตุเรื่องคำสงวน** `order` เป็นคำสงวน (reserved keyword) ของ SQL ใน PostgreSQL การตั้งชื่อ database ว่า `order` จะบังคับให้ `psql`, migration tool และทุก raw SQL string ต้อง quote เป็น `"order"` ตลอดไป เราหลบปัญหานี้ทั้งหมดด้วยการตั้งชื่อ database ว่า **`orders`** — ซึ่งก็เป็นเหตุผลที่ `ORDER_DB_URL` ใน `.env.example` (จาก [Repo Layout →](/shopmicro/th/setup/repo-layout/)) ลงท้ายด้วย `/orders`
 
-## Pros & cons
+## ข้อดีข้อเสีย
 
 **ข้อดี**
 
-- `docker compose up -d` ตั้งเซอร์วิสทั้งสามตัวด้วยคำสั่งเดียว และ `healthcheck` ทำให้ tooling ที่พึ่งพามันรอจน "พร้อมจริง ๆ" ไม่ใช่แค่ "container เริ่มแล้ว"
+- `docker compose up -d` ตั้งเซอร์วิสทั้งสามตัวด้วยคำสั่งเดียว และ `healthcheck` ทำให้ tooling ที่พึ่งพาสามตัวนี้รอจน "พร้อมจริง ๆ" ไม่ใช่แค่ "container เริ่มแล้ว"
 - Named volume (`pgdata`) เก็บข้อมูล Postgres ไว้ข้ามการ restart โดยไม่รก filesystem ของเครื่อง
 - ทุกคนในทีมได้ infrastructure ที่เหมือนกันทุกประการ — เวอร์ชันเดียวกัน, user เดียวกัน, port เดียวกัน
 
@@ -31,9 +31,9 @@ sidebar:
 
 - KRaft broker แบบ node เดียวไม่ใช่ Kafka cluster ระดับ production — ไม่มี replication ไม่มี multi-broker failover และมีไว้เพียงจำลองรูปร่างของของจริงสำหรับการพัฒนาในเครื่องเท่านั้น
 - Docker บดบังข้อจำกัด resource จริง เซอร์วิสที่ทำงานได้ดีกับ container บน laptop แรง ๆ อาจมีพฤติกรรมต่างออกไปเมื่อเจอ production cluster ที่ size ถูกต้อง
-- Compose ไฟล์นี้กับ Helm chart ที่สร้างใน Module 14 อธิบาย infrastructure เดียวกันด้วยสองวิธีที่ต่างกัน มันแยกตัวออกจากกันได้ถ้าอัปเดตตัวหนึ่งโดยไม่อัปเดตอีกตัว
+- Compose ไฟล์นี้กับ Helm chart ที่สร้างใน Module 14 อธิบาย infrastructure เดียวกันด้วยสองวิธีที่ต่างกัน ทั้งสองไฟล์จึงเบี่ยงออกจากกันได้ ถ้าอัปเดตตัวหนึ่งแล้วลืมอีกตัว
 
-## Set it up
+## ติดตั้ง
 
 ### 1. Init script ของ Postgres
 
@@ -102,7 +102,7 @@ volumes:
 
 บันทึกเป็น `deploy/compose/docker-compose.yml`
 
-หมายเหตุเรื่อง `KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092`: มันบอก client ว่า "ต่อกลับมาที่ `localhost:9092`" ซึ่งถูกต้องสำหรับเซอร์วิสที่รันตรงบนเครื่อง host (แบบที่เป็นตลอดคอร์สนี้ จนกว่าจะถึง Docker module ของ Module 13 ที่ containerize เซอร์วิสด้วย) ถึงตอนนั้น advertised listener จะเปลี่ยนเป็น hostname ของ container ใน network — รูปแบบ `localhost` นี้เป็นความสะดวกเฉพาะโหมด development
+หมายเหตุเรื่อง `KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092` ค่านี้บอก client ว่า "ต่อกลับมาที่ `localhost:9092`" ซึ่งถูกต้องสำหรับเซอร์วิสที่รันตรงบนเครื่อง host (แบบที่เป็นตลอดคอร์สนี้ จนกว่าจะถึง Docker module ของ Module 13 ที่ containerize เซอร์วิสด้วย) ถึงตอนนั้น advertised listener จะเปลี่ยนเป็น hostname ของ container ใน network — รูปแบบ `localhost` นี้เป็นความสะดวกเฉพาะโหมด development
 
 ### 3. ตั้งขึ้นมา
 
@@ -111,7 +111,7 @@ cd deploy/compose
 docker compose up -d
 ```
 
-## Verify
+## ตรวจสอบผล
 
 ตรวจว่าทั้งสาม container รายงานว่า healthy:
 
@@ -137,6 +137,6 @@ Response ว่างเปล่าโดยไม่มี error แปลว�
 
 **RabbitMQ** — เปิด management UI ที่ [http://localhost:15672](http://localhost:15672) แล้ว login ด้วย `shopmicro` / `shopmicro` คุณควรมาถึงหน้า overview dashboard
 
-## Recap
+## สรุป
 
-`deploy/compose/docker-compose.yml` ตั้งเซอร์วิสเบื้องหลังสามตัวด้วย `docker compose up -d`: **PostgreSQL 16** ที่ initialize ผ่าน `initdb.sql` พร้อมสอง database — `catalog` และ `orders` (ชื่อ `orders` ไม่ใช่ `order` เพราะ `order` เป็นคำสงวนของ SQL); **Kafka** ในโหมด **KRaft** node เดียวทำหน้าที่ทั้ง broker และ controller โดยไม่มี ZooKeeper; และ **RabbitMQ** พร้อม management UI บนพอร์ต 15672 การที่แต่ละเซอร์วิสมี database ของตัวเองคือเวอร์ชัน local-dev ของการแยกตัวที่ทำให้เซอร์วิสของ ShopMicro ยัง deploy แยกอิสระได้ นั่นคือ Module 1 จบแล้ว — monorepo ถูก scaffold, Go module build ได้, buf ตั้งค่าแล้ว และ infrastructure ขึ้นและยืนยันแล้ว Module 2 จะเขียนสัญญา `.proto` จริงตัวแรกและ generate โค้ด Go จริงจากมัน
+`deploy/compose/docker-compose.yml` ตั้งเซอร์วิสเบื้องหลังสามตัวด้วย `docker compose up -d`: **PostgreSQL 16** ที่ initialize ผ่าน `initdb.sql` พร้อมสอง database — `catalog` และ `orders` (ชื่อ `orders` ไม่ใช่ `order` เพราะ `order` เป็นคำสงวนของ SQL); **Kafka** ในโหมด **KRaft** node เดียวทำหน้าที่ทั้ง broker และ controller โดยไม่มี ZooKeeper; และ **RabbitMQ** พร้อม management UI บนพอร์ต 15672 การที่แต่ละเซอร์วิสมี database ของตัวเองคือเวอร์ชัน local-dev ของการแยกตัวที่ทำให้เซอร์วิสของ ShopMicro ยัง deploy แยกอิสระได้ เท่านี้ Module 1 ก็จบ — วาง scaffold ของ monorepo แล้ว Go module build ได้ buf ตั้งค่าเรียบร้อย และ infrastructure ขึ้นพร้อมยืนยันแล้ว ต่อไป Module 2 จะเขียน contract `.proto` ตัวแรกและ generate โค้ด Go จริงออกมาจากไฟล์นั้น
