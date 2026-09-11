@@ -497,24 +497,20 @@ func main() {
 	var wg sync.WaitGroup
 
 	relay := outbox.New(pool, publisher)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		relay.Run(ctx)
-	}()
+	})
 	log.Println("order: outbox relay started")
 
 	sagaHandler := saga.New(orderRepo)
 	paymentsConsumer := kafka.NewConsumer(brokers, "order", "payments")
 	defer paymentsConsumer.Close()
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		if err := paymentsConsumer.Run(ctx, sagaHandler.Handle); err != nil {
 			log.Printf("order: saga consumer stopped: %v", err)
 		}
-	}()
+	})
 	log.Println("order: saga consumer started, group=order topic=payments")
 
 	catalogConn, err := grpc.NewClient(catalogAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -555,7 +551,7 @@ func main() {
 
 บันทึกทับ `services/order/cmd/main.go` สิ่งที่ใหม่ตั้งแต่ [Outbox & Relay →](/shopmicro/th/kafka/outbox-relay/):
 
-- **`sync.WaitGroup` หนึ่งตัวต่อ background goroutine หนึ่งตัว (`relay.Run`, `paymentsConsumer.Run`)** เรียก `wg.Add(1)` ก่อน `go` statement แต่ละตัวเสมอ ไม่เคยเรียกข้างใน goroutine เพราะเป็นกฎเดียวกับที่เลี่ยง race ที่ `wg.Wait()` return ตั้งแต่ goroutine ยังไม่ทันเริ่ม การวาง `wg.Wait()` ไว้หลัง `grpcServer.GracefulStop()` แปลว่า `main` จะไม่ exit จนกว่า background loop ทั้งสองจะเห็น `ctx.Done()` แล้ว return จริง ๆ ไม่ใช่แค่จนกว่าจะเรียก `cancel()`
+- **`sync.WaitGroup` หนึ่งตัวต่อ background goroutine หนึ่งตัว (`relay.Run`, `paymentsConsumer.Run`)** `wg.Go` (Go 1.25+) เรียก `Add(1)` ให้ก่อนเริ่ม goroutine และเรียก `Done()` ให้ตอน return จึงไม่เกิด race แบบคลาสสิกที่ `wg.Wait()` return ตั้งแต่ goroutine ยังไม่ทันเริ่ม การวาง `wg.Wait()` ไว้หลัง `grpcServer.GracefulStop()` แปลว่า `main` จะไม่ exit จนกว่า background loop ทั้งสองจะเห็น `ctx.Done()` แล้ว return จริง ๆ ไม่ใช่แค่จนกว่าจะเรียก `cancel()`
 - **`paymentsConsumer := kafka.NewConsumer(brokers, "order", "payments")`** — consumer group ของ Order เองชื่อ `"order"` อ่าน topic `"payments"` เป็น group ที่อิสระจาก group `"payment"` ของ Payment ที่อ่าน `"orders"` โดยสมบูรณ์ กฎจาก [Topics, Partitions & Consumer Groups →](/shopmicro/th/kafka/topics-groups/) ใช้ได้อีกครั้ง คือ Order เห็น event `payment.*` ครบทุกตัวที่เคย publish ไม่ว่า consumer group ของ Notification (Module 10) จะทำอะไรกับ topic เดียวกันก็ตาม
 - **สาม goroutine แชร์ `cancel()` ตัวเดียวกัน** `relay.Run(ctx)` return เมื่อ `ctx.Done()` fire (Module 6) ฝั่ง `paymentsConsumer.Run(ctx, sagaHandler.Handle)` ก็เหมือนกัน เพราะ `FetchMessage` คืน error ของ `ctx` เมื่อโดน cancel (Module 6, `pkg/kafka`) ส่วน `grpcServer.GracefulStop()` ก็ปิด RPC ที่ค้างอยู่ให้จบแล้วหยุดรับตัวใหม่ ทั้งสามจึงตอบสนองต่อ shutdown signal เดียวกันเป๊ะ ไม่มีตัวไหนค้างอยู่หลัง process ควรจะหายไปแล้ว
 

@@ -41,7 +41,7 @@ runtime base คือ `gcr.io/distroless/static:nonroot` คำว่า "Distr
 
 ```dockerfile
 # syntax=docker/dockerfile:1
-ARG GO_VERSION=1.23
+ARG GO_VERSION=1.27
 
 # --- build stage: has the toolchain, produces one static binary ---
 FROM golang:${GO_VERSION}-alpine AS build

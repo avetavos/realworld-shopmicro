@@ -11,7 +11,7 @@ In this lesson we get your **macOS** machine ready to build ShopMicro. No applic
 
 Here's the checklist we'll work through:
 
-- [ ] **Go 1.22+** — compile and run all five services
+- [ ] **Go 1.25+** — compile and run all five services
 - [ ] **buf** — lint the `.proto` files and generate gRPC Go stubs
 - [ ] **Docker Desktop** — run Postgres, Kafka, and RabbitMQ (and later, package the services)
 - [ ] **grpcurl** — call gRPC services from the terminal to test them
@@ -41,7 +41,7 @@ Version drift is the silent killer of "works on my machine." Pinning down the to
 
 Work top to bottom. After each install, run its verify command and match the output before moving on.
 
-### 1. Go 1.22+
+### 1. Go 1.25+
 
 Go is the language of all five ShopMicro services. Install it via Homebrew (or from [go.dev/dl](https://go.dev/dl/)):
 
@@ -58,7 +58,7 @@ go version
 Expected output (the version must be **1.22 or higher**):
 
 ```
-go version go1.22.5 darwin/arm64
+go version go1.27.1 darwin/arm64
 ```
 
 ### 2. buf
@@ -191,4 +191,4 @@ If every command answers with a version string — and Go is 1.22+ — your mach
 
 ## Recap
 
-Your macOS toolchain is installed and, crucially, **verified**: **Go 1.22+** for the services, **buf** to lint protos and generate gRPC stubs, **Docker Desktop** (engine + Compose) to run Postgres/Kafka/RabbitMQ, **grpcurl** to test gRPC by hand, and **kubectl** + **helm** + a **local cluster** for the Kubernetes deploy. The brokers and databases themselves run in Docker, not on your host. That's the end of Module 0. Next up is [Module 1 · Setup & Tooling](/shopmicro/en/setup/), where we scaffold the Go monorepo and stand up the backing services.
+Your macOS toolchain is installed and, crucially, **verified**: **Go 1.25+** for the services, **buf** to lint protos and generate gRPC stubs, **Docker Desktop** (engine + Compose) to run Postgres/Kafka/RabbitMQ, **grpcurl** to test gRPC by hand, and **kubectl** + **helm** + a **local cluster** for the Kubernetes deploy. The brokers and databases themselves run in Docker, not on your host. That's the end of Module 0. Next up is [Module 1 · Setup & Tooling](/shopmicro/en/setup/), where we scaffold the Go monorepo and stand up the backing services.

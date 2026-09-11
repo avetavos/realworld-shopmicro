@@ -11,7 +11,7 @@ sidebar:
 
 นี่คือ checklist ที่เราจะไล่ทำ:
 
-- [ ] **Go 1.22+** — compile และรันเซอร์วิสทั้งห้าตัว
+- [ ] **Go 1.25+** — compile และรันเซอร์วิสทั้งห้าตัว
 - [ ] **buf** — lint ไฟล์ `.proto` และ generate gRPC Go stub
 - [ ] **Docker Desktop** — รัน Postgres, Kafka และ RabbitMQ (และภายหลังใช้แพ็กเซอร์วิส)
 - [ ] **grpcurl** — เรียก gRPC service จาก terminal เพื่อทดสอบ
@@ -43,7 +43,7 @@ Version drift คือเพชฌฆาตเงียบของ "มัน�
 
 ทำจากบนลงล่าง หลังติดตั้งแต่ละตัว ให้รันคำสั่ง verify ของเครื่องมือนั้นแล้วเทียบ output ให้ตรงก่อนไปต่อ
 
-### 1. Go 1.22+
+### 1. Go 1.25+
 
 Go คือภาษาของเซอร์วิส ShopMicro ทั้งห้าตัว ติดตั้งผ่าน Homebrew (หรือจาก [go.dev/dl](https://go.dev/dl/)):
 
@@ -60,7 +60,7 @@ go version
 Output ที่คาดหวัง (เวอร์ชันต้องเป็น **1.22 ขึ้นไป**):
 
 ```
-go version go1.22.5 darwin/arm64
+go version go1.27.1 darwin/arm64
 ```
 
 ### 2. buf
@@ -193,4 +193,4 @@ kubectl version --client && helm version
 
 ## สรุป
 
-toolchain บน macOS ของคุณติดตั้งครบและ **ตรวจสอบ** แล้ว: **Go 1.22+** สำหรับเซอร์วิส, **buf** สำหรับ lint proto และ generate gRPC stub, **Docker Desktop** (engine + Compose) สำหรับรัน Postgres/Kafka/RabbitMQ, **grpcurl** สำหรับทดสอบ gRPC ด้วยมือ และ **kubectl** + **helm** + **cluster บนเครื่อง** สำหรับการ deploy ขึ้น Kubernetes ตัว broker และฐานข้อมูลเองรันใน Docker ไม่ใช่บนเครื่องของคุณ นี่คือจุดจบของ Module 0 ต่อไปคือ [Module 1 · Setup & Tooling](/shopmicro/th/setup/) ที่เราจะ scaffold Go monorepo และตั้งเซอร์วิสรองรับขึ้นมา
+toolchain บน macOS ของคุณติดตั้งครบและ **ตรวจสอบ** แล้ว: **Go 1.25+** สำหรับเซอร์วิส, **buf** สำหรับ lint proto และ generate gRPC stub, **Docker Desktop** (engine + Compose) สำหรับรัน Postgres/Kafka/RabbitMQ, **grpcurl** สำหรับทดสอบ gRPC ด้วยมือ และ **kubectl** + **helm** + **cluster บนเครื่อง** สำหรับการ deploy ขึ้น Kubernetes ตัว broker และฐานข้อมูลเองรันใน Docker ไม่ใช่บนเครื่องของคุณ นี่คือจุดจบของ Module 0 ต่อไปคือ [Module 1 · Setup & Tooling](/shopmicro/th/setup/) ที่เราจะ scaffold Go monorepo และตั้งเซอร์วิสรองรับขึ้นมา

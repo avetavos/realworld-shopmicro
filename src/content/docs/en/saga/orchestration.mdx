@@ -481,24 +481,20 @@ func main() {
 	var wg sync.WaitGroup
 
 	relay := outbox.New(pool, publisher)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		relay.Run(ctx)
-	}()
+	})
 	log.Println("order: outbox relay started")
 
 	sagaHandler := saga.New(orderRepo)
 	paymentsConsumer := kafka.NewConsumer(brokers, "order", "payments")
 	defer paymentsConsumer.Close()
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		if err := paymentsConsumer.Run(ctx, sagaHandler.Handle); err != nil {
 			log.Printf("order: saga consumer stopped: %v", err)
 		}
-	}()
+	})
 	log.Println("order: saga consumer started, group=order topic=payments")
 
 	catalogConn, err := grpc.NewClient(catalogAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -539,7 +535,7 @@ func main() {
 
 Save this over `services/order/cmd/main.go`. What's new since [Outbox & Relay →](/shopmicro/en/kafka/outbox-relay/):
 
-- **`sync.WaitGroup`, one per background goroutine (`relay.Run`, `paymentsConsumer.Run`).** `wg.Add(1)` runs before each `go` statement, never inside the goroutine — the same rule that avoids a race where `wg.Wait()` could return before a goroutine has even started. `wg.Wait()` after `grpcServer.GracefulStop()` means `main` doesn't exit until both background loops have actually observed `ctx.Done()` and returned, not just until `cancel()` was called.
+- **`sync.WaitGroup`, one per background goroutine (`relay.Run`, `paymentsConsumer.Run`).** `wg.Go` (Go 1.25+) calls `Add(1)` before starting the goroutine and `Done()` when it returns, so you cannot get the classic race where `wg.Wait()` returns before a goroutine has even started. `wg.Wait()` after `grpcServer.GracefulStop()` means `main` doesn't exit until both background loops have actually observed `ctx.Done()` and returned, not just until `cancel()` was called.
 - **`paymentsConsumer := kafka.NewConsumer(brokers, "order", "payments")`** — Order's own consumer group, `"order"`, reading the `"payments"` topic. It's a completely independent group from Payment's `"payment"` group reading `"orders"` — [Topics, Partitions & Consumer Groups →](/shopmicro/en/kafka/topics-groups/)'s rule applies again: Order sees every `payment.*` event ever published, regardless of what Notification's own consumer group (Module 10) does with the same topic.
 - **Three goroutines now share one `cancel()`.** `relay.Run(ctx)` returns when `ctx.Done()` fires (Module 6); `paymentsConsumer.Run(ctx, sagaHandler.Handle)` does too, since `FetchMessage` returns `ctx`'s error once cancelled (Module 6, `pkg/kafka`); and `grpcServer.GracefulStop()` finishes in-flight RPCs and stops accepting new ones. All three respond to the exact same shutdown signal, with no risk of one lingering after the process is meant to be gone.
 
