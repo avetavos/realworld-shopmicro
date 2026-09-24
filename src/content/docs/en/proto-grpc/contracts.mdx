@@ -231,6 +231,18 @@ message CreateOrderItem {
 
 ## Verify
 
+Now that real `.proto` files exist, resolve the `googleapis` dependency [Protobuf Tooling →](/shopmicro/en/setup/proto-tooling/)'s `buf.yaml` declared — this is the step that was impossible while `proto/` was empty, and it writes `buf.lock`, pinning the exact `googleapis` commit for everyone:
+
+```bash
+buf dep update
+```
+
+```text
+Resolved buf.build/googleapis/googleapis, locked to a pinned commit in buf.lock.
+```
+
+Now lint:
+
 ```bash
 buf lint
 ```
@@ -238,14 +250,14 @@ buf lint
 Running this against the two files above actually surfaces two violations from the `STANDARD` ruleset:
 
 ```txt
-catalog.proto:42:3:  "shopmicro.catalog.v1.Product" is used as the request or response type for multiple RPCs.
-catalog.proto:42:46: RPC response type "Product" should be named "GetProductResponse" or "CatalogServiceGetProductResponse".
-catalog.proto:45:3:  "shopmicro.catalog.v1.Product" is used as the request or response type for multiple RPCs.
-catalog.proto:45:52: RPC response type "Product" should be named "CreateProductResponse" or "CatalogServiceCreateProductResponse".
-order.proto:54:3:    "shopmicro.order.v1.Order" is used as the request or response type for multiple RPCs.
-order.proto:54:48:   RPC response type "Order" should be named "CreateOrderResponse" or "OrderServiceCreateOrderResponse".
-order.proto:57:3:    "shopmicro.order.v1.Order" is used as the request or response type for multiple RPCs.
-order.proto:57:42:   RPC response type "Order" should be named "GetOrderResponse" or "OrderServiceGetOrderResponse".
+proto/shopmicro/catalog/v1/catalog.proto:42:3:"shopmicro.catalog.v1.Product" is used as the request or response type for multiple RPCs.
+proto/shopmicro/catalog/v1/catalog.proto:42:46:RPC response type "Product" should be named "GetProductResponse" or "CatalogServiceGetProductResponse".
+proto/shopmicro/catalog/v1/catalog.proto:45:3:"shopmicro.catalog.v1.Product" is used as the request or response type for multiple RPCs.
+proto/shopmicro/catalog/v1/catalog.proto:45:52:RPC response type "Product" should be named "CreateProductResponse" or "CatalogServiceCreateProductResponse".
+proto/shopmicro/order/v1/order.proto:54:3:"shopmicro.order.v1.Order" is used as the request or response type for multiple RPCs.
+proto/shopmicro/order/v1/order.proto:54:48:RPC response type "Order" should be named "CreateOrderResponse" or "OrderServiceCreateOrderResponse".
+proto/shopmicro/order/v1/order.proto:57:3:"shopmicro.order.v1.Order" is used as the request or response type for multiple RPCs.
+proto/shopmicro/order/v1/order.proto:57:42:RPC response type "Order" should be named "GetOrderResponse" or "OrderServiceGetOrderResponse".
 ```
 
 `STANDARD`'s `RPC_REQUEST_RESPONSE_UNIQUE` and `RPC_RESPONSE_STANDARD_NAME` rules encode a strict convention: every RPC should return its own uniquely-named `*Response` wrapper type. This course deliberately doesn't follow that convention here — `GetProduct` and `CreateProduct` both return the bare `Product` resource, and `GetOrder`/`CreateOrder` both return the bare `Order` resource, because REST clients calling through the gateway expect the actual resource back, not an envelope type that exists only to satisfy a naming rule. That's a legitimate, common style for gRPC APIs whose primary consumers are REST clients via grpc-gateway — but the right move is to say so explicitly in `buf.yaml`, not to just ignore the warning:

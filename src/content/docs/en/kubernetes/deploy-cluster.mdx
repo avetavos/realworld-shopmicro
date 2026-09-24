@@ -89,7 +89,7 @@ The six service images came from [Service images →](/shopmicro/en/docker/servi
 
 ```bash
 docker build -t shopmicro/migrate:latest -f - migrations <<'EOF'
-FROM migrate/migrate:v4.17.1
+FROM migrate/migrate:v4.20.1
 COPY . /migrations
 EOF
 ```
@@ -117,6 +117,8 @@ helm install rabbitmq oci://registry-1.docker.io/bitnamicharts/rabbitmq \
 ```
 
 (Catalog and Order share one Postgres instance with two databases, `catalog` and `orders` — create the second database once Postgres is up, or point `infra.postgres` at two hosts if you prefer them separate.)
+
+**A freshness note on these three commands.** Since Broadcom's 2025 restructuring of Bitnami's catalog, the free tier of these OCI charts only ships an unpinned `:latest` image tag — the charts still install and run (verified above against a real `kind` cluster), but `helm install` now prints `WARNING: Rolling tag detected (bitnami/postgresql:latest), ...` for every Bitnami image the chart pulls, pointing at Broadcom's Bitnami Secure Images docs. That's expected noise, not a failure — `helm install`/`kubectl get pods` still succeed exactly as shown below — but it's worth knowing this is no longer a versioned, reproducible pull the way a pinned tag would be, and a production cluster would either pin a Bitnami Secure Images subscription tag or run its own Postgres/Kafka/RabbitMQ images instead.
 
 ## Verify
 

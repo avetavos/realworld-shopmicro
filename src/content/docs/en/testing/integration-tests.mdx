@@ -70,7 +70,7 @@ func newTestRepo(t *testing.T) *repo.OrderRepo {
 	t.Helper()
 	ctx := context.Background()
 
-	container, err := tcpostgres.Run(ctx, "postgres:16-alpine",
+	container, err := tcpostgres.Run(ctx, "postgres:18-alpine",
 		tcpostgres.WithDatabase("orders"),
 		tcpostgres.WithUsername("shopmicro"),
 		tcpostgres.WithPassword("shopmicro"),
@@ -110,7 +110,7 @@ func TestIntegrationCreateAndGet(t *testing.T) {
 	r := newTestRepo(t)
 
 	created, err := r.Create(ctx, "cust-1", []repo.PricedItem{
-		{ProductID: "prod-1", Quantity: 2, UnitPriceCents: 1299},
+		{ProductID: "11111111-1111-1111-1111-111111111111", Quantity: 2, UnitPriceCents: 1299},
 	})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -126,7 +126,7 @@ func TestIntegrationCreateAndGet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if len(got.Items) != 1 || got.Items[0].ProductID != "prod-1" {
+	if len(got.Items) != 1 || got.Items[0].ProductID != "11111111-1111-1111-1111-111111111111" {
 		t.Errorf("items = %+v, want one prod-1", got.Items)
 	}
 
@@ -149,7 +149,7 @@ func TestIntegrationApplyPaymentResultIdempotent(t *testing.T) {
 	r := newTestRepo(t)
 
 	order, err := r.Create(ctx, "cust-1", []repo.PricedItem{
-		{ProductID: "prod-1", Quantity: 1, UnitPriceCents: 5000},
+		{ProductID: "11111111-1111-1111-1111-111111111111", Quantity: 1, UnitPriceCents: 5000},
 	})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -205,13 +205,19 @@ If you'd rather not widen the repo's surface for a test, drop the outbox asserti
 
 ## Verify
 
+`golang-migrate`'s `database/postgres` driver (imported here for its side-effecting `init()` registration) pulls in `github.com/lib/pq` as a transitive dependency that `go get github.com/golang-migrate/migrate/v4` alone never recorded in `go.sum` — the same class of gap [Code Generation →](/shopmicro/en/proto-grpc/codegen/) hit first. Run `go mod tidy` once more before testing:
+
+```bash
+go mod tidy
+```
+
 Integration tests need Docker running. Start Docker Desktop (or your daemon), then run only the tagged tests:
 
 ```bash
 go test -tags=integration -v ./services/order/internal/repo/
 ```
 
-The first run pulls `postgres:16-alpine` if you don't have it, then:
+The first run pulls `postgres:18-alpine` if you don't have it, then:
 
 ```txt
 === RUN   TestIntegrationCreateAndGet

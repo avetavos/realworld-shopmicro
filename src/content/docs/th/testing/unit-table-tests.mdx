@@ -68,7 +68,7 @@ func New(pub publisher) *Processor {
 }
 ```
 
-ไม่มีอะไรอื่นใน `processor.go` เปลี่ยน และไม่มีอะไรใน `services/payment/cmd/main.go` เปลี่ยน — `processor.New(publisher)` ยังรับ `*kafka.Publisher` ที่เป็น concrete จาก [Process & Publish →](/shopmicro/th/payment-service/process-publish/) ซึ่งตอนนี้ satisfy interface แล้ว `go build ./...` ยังผ่าน type ของ field คือการแก้เดียวเท่านั้น
+ไม่มีอะไรใน `services/payment/cmd/main.go` เปลี่ยน — `processor.New(publisher)` ยังรับ `*kafka.Publisher` ที่เป็น concrete จาก [Process & Publish →](/shopmicro/th/payment-service/process-publish/) ซึ่งตอนนี้ satisfy interface แล้ว แต่ใน `processor.go` เองยังมีอีกจุดที่ต้องแก้: พอ field กับ constructor เปลี่ยนเป็น type `publisher` แทน `*kafka.Publisher` แล้ว ไม่มีที่ไหนในไฟล์อ้างถึง package `kafka` ตรง ๆ อีก ดังนั้น import `"github.com/avetavos/shopmicro/pkg/kafka"` ที่ตอนนี้ไม่ได้ใช้แล้วต้องลบทิ้งด้วย — ไม่งั้น `go build ./...` จะ fail ด้วย `"github.com/avetavos/shopmicro/pkg/kafka" imported and not used`
 
 ### 2. `services/payment/internal/processor/processor_test.go`
 

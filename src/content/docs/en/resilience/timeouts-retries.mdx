@@ -178,7 +178,7 @@ with the shared one:
 opts := resilience.DialOptions()
 ```
 
-Add `"github.com/avetavos/shopmicro/pkg/resilience"` to the imports and drop the now-unused `"google.golang.org/grpc/credentials/insecure"` import. Both `RegisterCatalogServiceHandlerFromEndpoint` and `RegisterOrderServiceHandlerFromEndpoint` already take that `opts` slice, so both of the gateway's gRPC connections are now bounded and retrying with no further change.
+Add `"github.com/avetavos/shopmicro/pkg/resilience"` to the imports and drop `"google.golang.org/grpc/credentials/insecure"` — and, since nothing else in this file references the `grpc` package directly once `opts` is built by `resilience.DialOptions()` instead of a literal `[]grpc.DialOption{...}`, drop the now-unused `"google.golang.org/grpc"` import too (`go build` fails with `"google.golang.org/grpc" imported and not used` if you leave it). Both `RegisterCatalogServiceHandlerFromEndpoint` and `RegisterOrderServiceHandlerFromEndpoint` already take that `opts` slice, so both of the gateway's gRPC connections are now bounded and retrying with no further change.
 
 ### 3. Route Order's Catalog client through it
 

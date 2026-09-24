@@ -233,6 +233,18 @@ message CreateOrderItem {
 
 ## ตรวจสอบผล
 
+ตอนนี้มีไฟล์ `.proto` จริงแล้ว มา resolve dependency `googleapis` ที่ `buf.yaml` ของ [Protobuf Tooling →](/shopmicro/th/setup/proto-tooling/) ประกาศไว้กัน — ขั้นตอนนี้เป็นไปไม่ได้ตอนที่ `proto/` ยังว่างเปล่า และมันจะเขียน `buf.lock` เพื่อ pin commit ของ `googleapis` ให้ทุกคนตรงกัน:
+
+```bash
+buf dep update
+```
+
+```text
+Resolved buf.build/googleapis/googleapis, locked to a pinned commit in buf.lock.
+```
+
+จากนั้น lint:
+
 ```bash
 buf lint
 ```
@@ -240,14 +252,14 @@ buf lint
 การรันคำสั่งนี้กับไฟล์ทั้งสองด้านบนจะแสดง violation สองตัวจาก ruleset `STANDARD` จริง ๆ:
 
 ```txt
-catalog.proto:42:3:  "shopmicro.catalog.v1.Product" is used as the request or response type for multiple RPCs.
-catalog.proto:42:46: RPC response type "Product" should be named "GetProductResponse" or "CatalogServiceGetProductResponse".
-catalog.proto:45:3:  "shopmicro.catalog.v1.Product" is used as the request or response type for multiple RPCs.
-catalog.proto:45:52: RPC response type "Product" should be named "CreateProductResponse" or "CatalogServiceCreateProductResponse".
-order.proto:54:3:    "shopmicro.order.v1.Order" is used as the request or response type for multiple RPCs.
-order.proto:54:48:   RPC response type "Order" should be named "CreateOrderResponse" or "OrderServiceCreateOrderResponse".
-order.proto:57:3:    "shopmicro.order.v1.Order" is used as the request or response type for multiple RPCs.
-order.proto:57:42:   RPC response type "Order" should be named "GetOrderResponse" or "OrderServiceGetOrderResponse".
+proto/shopmicro/catalog/v1/catalog.proto:42:3:"shopmicro.catalog.v1.Product" is used as the request or response type for multiple RPCs.
+proto/shopmicro/catalog/v1/catalog.proto:42:46:RPC response type "Product" should be named "GetProductResponse" or "CatalogServiceGetProductResponse".
+proto/shopmicro/catalog/v1/catalog.proto:45:3:"shopmicro.catalog.v1.Product" is used as the request or response type for multiple RPCs.
+proto/shopmicro/catalog/v1/catalog.proto:45:52:RPC response type "Product" should be named "CreateProductResponse" or "CatalogServiceCreateProductResponse".
+proto/shopmicro/order/v1/order.proto:54:3:"shopmicro.order.v1.Order" is used as the request or response type for multiple RPCs.
+proto/shopmicro/order/v1/order.proto:54:48:RPC response type "Order" should be named "CreateOrderResponse" or "OrderServiceCreateOrderResponse".
+proto/shopmicro/order/v1/order.proto:57:3:"shopmicro.order.v1.Order" is used as the request or response type for multiple RPCs.
+proto/shopmicro/order/v1/order.proto:57:42:RPC response type "Order" should be named "GetOrderResponse" or "OrderServiceGetOrderResponse".
 ```
 
 กฎ `RPC_REQUEST_RESPONSE_UNIQUE` และ `RPC_RESPONSE_STANDARD_NAME` ของ `STANDARD` เข้ารหัสข้อกำหนดที่เข้มงวด: ทุก RPC ควรคืน `*Response` wrapper type ที่มีชื่อเฉพาะของตัวเอง คอร์สนี้ตั้งใจไม่ทำตามข้อกำหนดนั้นตรงนี้ — `GetProduct` กับ `CreateProduct` คืนค่า resource `Product` เปล่า ๆ ทั้งคู่ และ `GetOrder`/`CreateOrder` คืนค่า resource `Order` เปล่า ๆ ทั้งคู่ เพราะ REST client ที่เรียกผ่าน gateway คาดหวัง resource จริง ๆ กลับมา ไม่ใช่ envelope type ที่มีอยู่แค่เพื่อทำตามกฎการตั้งชื่อ นี่เป็นสไตล์ที่ชอบธรรมและพบได้ทั่วไปสำหรับ gRPC API ที่ผู้บริโภคหลักคือ REST client ผ่าน grpc-gateway แต่วิธีที่ถูกต้องคือประกาศไว้อย่างชัดเจนใน `buf.yaml` ไม่ใช่ปล่อยผ่าน warning เฉย ๆ:

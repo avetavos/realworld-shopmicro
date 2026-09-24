@@ -51,7 +51,7 @@ CREATE DATABASE orders;
 ```yaml
 services:
   postgres:
-    image: postgres:16
+    image: postgres:18
     environment:
       POSTGRES_USER: shopmicro
       POSTGRES_PASSWORD: shopmicro
@@ -68,7 +68,7 @@ services:
       retries: 5
 
   kafka:
-    image: apache/kafka:3.8.0
+    image: apache/kafka:4.3.1
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -83,7 +83,7 @@ services:
       - "9092:9092"
 
   rabbitmq:
-    image: rabbitmq:3-management
+    image: rabbitmq:4-management
     environment:
       RABBITMQ_DEFAULT_USER: shopmicro
       RABBITMQ_DEFAULT_PASS: shopmicro
@@ -139,4 +139,4 @@ Response ว่างเปล่าโดยไม่มี error แปลว�
 
 ## สรุป
 
-`deploy/compose/docker-compose.yml` ตั้งเซอร์วิสเบื้องหลังสามตัวด้วย `docker compose up -d`: **PostgreSQL 16** ที่ initialize ผ่าน `initdb.sql` พร้อมสอง database — `catalog` และ `orders` (ชื่อ `orders` ไม่ใช่ `order` เพราะ `order` เป็นคำสงวนของ SQL); **Kafka** ในโหมด **KRaft** node เดียวทำหน้าที่ทั้ง broker และ controller โดยไม่มี ZooKeeper; และ **RabbitMQ** พร้อม management UI บนพอร์ต 15672 การที่แต่ละเซอร์วิสมี database ของตัวเองคือเวอร์ชัน local-dev ของการแยกตัวที่ทำให้เซอร์วิสของ ShopMicro ยัง deploy แยกอิสระได้ เท่านี้ Module 1 ก็จบ — วาง scaffold ของ monorepo แล้ว Go module build ได้ buf ตั้งค่าเรียบร้อย และ infrastructure ขึ้นพร้อมยืนยันแล้ว ต่อไป Module 2 จะเขียน contract `.proto` ตัวแรกและ generate โค้ด Go จริงออกมาจากไฟล์นั้น
+`deploy/compose/docker-compose.yml` ตั้งเซอร์วิสเบื้องหลังสามตัวด้วย `docker compose up -d`: **PostgreSQL 18** ที่ initialize ผ่าน `initdb.sql` พร้อมสอง database — `catalog` และ `orders` (ชื่อ `orders` ไม่ใช่ `order` เพราะ `order` เป็นคำสงวนของ SQL); **Kafka** ในโหมด **KRaft** node เดียวทำหน้าที่ทั้ง broker และ controller โดยไม่มี ZooKeeper; และ **RabbitMQ** พร้อม management UI บนพอร์ต 15672 การที่แต่ละเซอร์วิสมี database ของตัวเองคือเวอร์ชัน local-dev ของการแยกตัวที่ทำให้เซอร์วิสของ ShopMicro ยัง deploy แยกอิสระได้ เท่านี้ Module 1 ก็จบ — วาง scaffold ของ monorepo แล้ว Go module build ได้ buf ตั้งค่าเรียบร้อย และ infrastructure ขึ้นพร้อมยืนยันแล้ว ต่อไป Module 2 จะเขียน contract `.proto` ตัวแรกและ generate โค้ด Go จริงออกมาจากไฟล์นั้น

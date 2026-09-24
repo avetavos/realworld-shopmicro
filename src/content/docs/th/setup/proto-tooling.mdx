@@ -98,8 +98,14 @@ buf --version
 buf lint
 ```
 
-ตอนนี้ `proto/` ยังว่างเปล่า (Module 2 จะเพิ่มไฟล์ `.proto` แรก) ดังนั้น `buf lint` ยังไม่มีอะไรให้ตรวจ และควรจบแบบสะอาด ไม่มี violation พิมพ์ออกมา — นั่นคือสิ่งที่คาดหวัง ไม่ใช่สัญญาณว่ามีอะไรพัง สิ่งที่เรายืนยันตรงนี้คือ `buf.yaml` parse ได้, workspace resolve ได้ และ dependency `googleapis` เข้าถึงได้ เมื่อ Module 2 เติมไฟล์ `.proto` จริงเข้ามา คำสั่ง `buf lint` เดิมนี้จะเริ่มตรวจของจริง และ `buf generate` จะผลิต output จริงลงใน `gen/` โดยใช้ plugin ทั้งสี่ตัวที่ตั้งค่าไว้ข้างบน
+ตอนนี้ `proto/` ยังว่างเปล่า (Module 2 จะเพิ่มไฟล์ `.proto` แรก) และ buf จะปฏิเสธไม่ประมวลผล module ที่มีไฟล์ `.proto` เป็น **ศูนย์** — ไม่ว่า subcommand ไหนก็ตาม ไม่ใช่แค่ `lint`:
+
+```text
+Failure: Module "path: "proto"" had no .proto files
+```
+
+error นี้คือสิ่งที่คาดหวัง ไม่ใช่สัญญาณว่ามีอะไรพัง — มันพิสูจน์ว่า `buf.yaml` parse ผ่านแล้ว และ buf หา module `proto` เจอตรงตามที่ `modules: - path: proto` บอกไว้ เพียงแต่ยังไม่มีอะไรอยู่ข้างในเลย เรายัง resolve dependency `googleapis` ไม่ได้ด้วย (`buf dep update` จะเจอ error "had no .proto files" แบบเดียวกันตราบใดที่ module ยังว่างเปล่า) ดังนั้น `buf.lock` จะยังไม่มีจนกว่าจะถึง Module 2 เมื่อ Module 2 เติมไฟล์ `.proto` จริงตัวแรกเข้ามา `buf dep update` จะสำเร็จและเขียน `buf.lock` ให้ จากนั้น `buf lint` จะเริ่มตรวจของจริง และ `buf generate` จะผลิต output จริงลงใน `gen/` โดยใช้ plugin ทั้งสี่ตัวที่ตั้งค่าไว้ข้างบน
 
 ## สรุป
 
-buf ติดตั้งแล้ว และมีไฟล์ config สองไฟล์พร้อมใช้: `buf.yaml` กำหนด workspace `proto/`, กฎ lint แบบ `STANDARD` และ `deps:` ที่พึ่งพา `buf.build/googleapis/googleapis` สำหรับ annotation type ที่ gateway ต้องใช้; `buf.gen.yaml` เดินสายไปหา remote plugin สี่ตัว — `protocolbuffers/go` (Go message type), `grpc/go` (client/server stub), `grpc-ecosystem/gateway` (REST-to-gRPC reverse proxy) และ `grpc-ecosystem/openapiv2` (เอกสาร API ที่ generate) — เขียนลง `gen/` ทั้งหมด `buf lint` รันสะอาดกับ `proto/` ที่ว่างเปล่าวันนี้; Module 2 คือที่ที่ไฟล์ `.proto` จริงตัวแรกจะมาถึงและ tooling นี้จะเริ่มผลิตโค้ด Go ที่ generate ออกมา ต่อไป [Infra & Compose →](/shopmicro/th/setup/infra-compose/) จะตั้ง PostgreSQL, Kafka และ RabbitMQ ที่โปรเจกต์นี้รันด้วยในเครื่อง
+buf ติดตั้งแล้ว และมีไฟล์ config สองไฟล์พร้อมใช้: `buf.yaml` กำหนด workspace `proto/`, กฎ lint แบบ `STANDARD` และ `deps:` ที่พึ่งพา `buf.build/googleapis/googleapis` สำหรับ annotation type ที่ gateway ต้องใช้; `buf.gen.yaml` เดินสายไปหา remote plugin สี่ตัว — `protocolbuffers/go` (Go message type), `grpc/go` (client/server stub), `grpc-ecosystem/gateway` (REST-to-gRPC reverse proxy) และ `grpc-ecosystem/openapiv2` (เอกสาร API ที่ generate) — เขียนลง `gen/` ทั้งหมด `buf lint` (และ subcommand อื่นของ buf ทุกตัว) ปฏิเสธไม่รันกับ `proto/` ที่ว่างเปล่าวันนี้ ด้วย error "had no .proto files" — ตามคาด เพราะ buf.yaml resolve ถูกต้องแล้ว เพียงแต่ยังไม่มีอะไรใน module เลย; Module 2 คือที่ที่ไฟล์ `.proto` จริงตัวแรกจะมาถึง `buf dep update` จะเขียน `buf.lock` ได้ในที่สุด และ tooling นี้จะเริ่มผลิตโค้ด Go ที่ generate ออกมา ต่อไป [Infra & Compose →](/shopmicro/th/setup/infra-compose/) จะตั้ง PostgreSQL, Kafka และ RabbitMQ ที่โปรเจกต์นี้รันด้วยในเครื่อง

@@ -176,11 +176,22 @@ go run ./gateway/cmd
 curl -s localhost:8080/openapi/catalog.swagger.json | head -c 200
 ```
 
-```json
-{"swagger":"2.0","info":{"title":"catalog.proto","version":"version not set"},"tags":[{"name":"CatalogService"}],"consumes":["application/json"],"produces":["application/json"],"paths":{"/v1/products":{"get":{"operationId"
+```txt
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "shopmicro/catalog/v1/catalog.proto",
+    "version": "version not set"
+  },
+  "tags": [
+    {
+      "name": "CatalogService"
+    }
+  ],
+  "consumes": [
 ```
 
-`"swagger": "2.0"` ยืนยันว่านี่คือ OpenAPI v2 เป๊ะเดียวกับที่การเลือก plugin ใน [Code Generation →](/shopmicro/th/proto-grpc/codegen/) สร้างออกมา — `"info":{"title":"catalog.proto", ...}` กับ description ของแต่ละ operation ที่ว่างเปล่าลึกลงไปในเอกสาร คือผลลัพธ์ที่มองเห็นได้ตรง ๆ จากการที่ `catalog.proto` ไม่เคยมี comment `.proto` เลยให้ดึงมาใช้
+`"swagger": "2.0"` ยืนยันว่านี่คือ OpenAPI v2 เป๊ะเดียวกับที่การเลือก plugin ใน [Code Generation →](/shopmicro/th/proto-grpc/codegen/) สร้างออกมา — plugin `grpc-ecosystem/openapiv2` เวอร์ชันปัจจุบัน pretty-print เอกสารออกมา (ไม่ใช่รูปแบบบรรทัดเดียวแบบเวอร์ชันเก่า) และ `"title"` คือ path เต็มของไฟล์ `.proto` *เทียบกับ root ของ proto module* (`shopmicro/catalog/v1/catalog.proto`) ไม่ใช่แค่ basename เพราะนั่นคือ path ที่ buf ส่งให้ plugin สำหรับไฟล์ที่อยู่ใต้ `proto/shopmicro/catalog/v1/` ส่วน description ของแต่ละ operation ที่ว่างเปล่าลึกลงไปในเอกสาร คือผลลัพธ์ที่มองเห็นได้ตรง ๆ จากการที่ `catalog.proto` ไม่เคยมี comment `.proto` เลยให้ดึงมาใช้
 
 เปิด `http://localhost:8080/docs` ใน browser หน้านี้จะโหลด Swagger UI จาก CDN แล้วแสดง dropdown ที่มี **Catalog** กับ **Order**; สลับไปที่ **Catalog** แล้วขยาย `GET /v1/products` จากนั้นกด **Try it out** → **Execute** จะส่ง request เดียวกันเป๊ะกับที่ `curl -s localhost:8080/v1/products` ทำใน [grpc-gateway →](/shopmicro/th/gateway/grpc-gateway/) เพราะยิงเข้า gateway ตัวเดียวกัน ผ่าน REST surface เดียวกัน ที่อธิบายด้วยเอกสารที่ generate มาชุดเดียวกัน
 

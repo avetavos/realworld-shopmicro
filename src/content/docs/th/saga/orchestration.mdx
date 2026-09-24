@@ -50,13 +50,13 @@ design ตั้งใจให้เล็กที่สุดเท่าท�
 
 ## ติดตั้ง
 
-### 1. `migrations/order/0002_processed_events.sql`
+### 1. `migrations/order/0002_processed_events.up.sql`
 
 ```sql
 create table processed_events ( event_id text primary key, processed_at timestamptz not null default now() );
 ```
 
-บันทึกไฟล์นี้เป็น `migrations/order/0002_processed_events.sql` แล้ว apply migration:
+บันทึกไฟล์นี้เป็น `migrations/order/0002_processed_events.up.sql` แล้ว apply migration:
 
 ```bash
 migrate -path migrations/order -database "$ORDER_DB_URL" up

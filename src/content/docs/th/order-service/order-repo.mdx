@@ -7,7 +7,7 @@ sidebar:
 
 ## สิ่งที่จะสร้าง
 
-`migrations/order/0001_init.sql` (ตาราง `orders`, `order_items`, และ `outbox`) และ `services/order/internal/repo/orders.go` — `OrderRepo` ที่มีเมธอด `Create` insert ตัวคำสั่งซื้อ รายการสินค้า และ outbox row ที่อธิบาย event ทั้งหมดไว้ใน `pgx.Tx` **เดียว** จากนั้น `services/order/internal/server/server.go` — `Server` ตัวจริงที่ implement ทั้งสามเมธอดของ `OrderServiceServer` แทนที่ placeholder จาก [The gRPC Server →](/shopmicro/th/order-service/grpc-server/) และในที่สุดก็นำ Catalog client ที่ inject ไว้มาใช้งานจริง: `CreateOrder` หาราคาปัจจุบันของแต่ละรายการจาก Catalog ก่อนที่จะแตะ repository เลย
+`migrations/order/0001_init.up.sql` (ตาราง `orders`, `order_items`, และ `outbox`) และ `services/order/internal/repo/orders.go` — `OrderRepo` ที่มีเมธอด `Create` insert ตัวคำสั่งซื้อ รายการสินค้า และ outbox row ที่อธิบาย event ทั้งหมดไว้ใน `pgx.Tx` **เดียว** จากนั้น `services/order/internal/server/server.go` — `Server` ตัวจริงที่ implement ทั้งสามเมธอดของ `OrderServiceServer` แทนที่ placeholder จาก [The gRPC Server →](/shopmicro/th/order-service/grpc-server/) และในที่สุดก็นำ Catalog client ที่ inject ไว้มาใช้งานจริง: `CreateOrder` หาราคาปัจจุบันของแต่ละรายการจาก Catalog ก่อนที่จะแตะ repository เลย
 
 ## ทำไม
 
@@ -43,7 +43,7 @@ create table outbox ( id uuid primary key default gen_random_uuid(), aggregate_i
 create index on outbox (published_at) where published_at is null;
 ```
 
-บันทึกไฟล์นี้เป็น `migrations/order/0001_init.sql` แล้วรัน:
+บันทึกไฟล์นี้เป็น `migrations/order/0001_init.up.sql` แล้วรัน:
 
 ```bash
 migrate -path migrations/order -database "$ORDER_DB_URL" up
@@ -441,7 +441,7 @@ func toProto(o repo.Order) *orderv1.Order {
 		Status:     toProtoStatus(o.Status),
 		TotalCents: o.TotalCents,
 		Items:      items,
-		CreatedAt:  o.CreatedAt.Format(time.RFC3339),
+		CreatedAt:  o.CreatedAt.UTC().Format(time.RFC3339),
 	}
 }
 
@@ -464,7 +464,7 @@ func toProtoStatus(s string) orderv1.OrderStatus {
 - **`CreateOrder` ตั้งราคาทีละรายการ ใน loop ตามลำดับ** แต่ละ call `s.catalog.GetProduct` คือ gRPC round trip หนึ่งครั้ง คำสั่งซื้อที่มีห้ารายการต่างกันจึงยิงเรียงกันห้าครั้งก่อนที่ transaction จะเริ่มด้วยซ้ำ นี่คือต้นทุน latency จริงที่ควรพูดตรง ๆ — เวอร์ชันโปรดักชันอาจตั้งราคาแบบขนานหรือรวมเป็น Catalog RPC เดียว แต่ทั้งสองอย่างไม่มีอยู่ใน `.proto` contract ของคอร์สนี้ ดังนั้น loop ตามลำดับคือสิ่งที่ถูกต้องจริง ๆ ในตอนนี้
 - **`status.FromError(err)` แกะ error ของ gRPC กลับมาเป็น `codes.Code` กับข้อความ** นี่คือวิธีที่ `CreateOrder` แยก "Catalog บอกว่าสินค้านี้ไม่มีอยู่" (`codes.NotFound` จาก `GetProduct` ของ Catalog เอง) ออกจาก "การเรียก Catalog เองล้มเหลว" (network error, timeout) — มีแค่กรณีแรกเท่านั้นที่กลายเป็น `codes.FailedPrecondition` ส่วนกรณีที่สองกลายเป็น `codes.Internal` เพราะไม่ได้บอกข้อเท็จจริงอะไรเกี่ยวกับตัวสินค้าเลย
 - **`errors.Is(err, pgx.ErrNoRows)` เหมือนกับ `ProductRepo`/`Server` ใน Catalog ทุกประการ** `OrderRepo.Get` ห่อสิ่งที่ `Scan` คืนกลับมาด้วย `%w` ดังนั้น `GetOrder` จึงยัง unwrap ห่วงโซ่เพื่อหา sentinel ข้างในและแปลงเป็น `codes.NotFound` ได้
-- **`o.CreatedAt.Format(time.RFC3339)` ของ `toProto`** แปลง `time.Time` ของ repository เป็น `string` ธรรมดาที่ `.proto` contract ประกาศไว้สำหรับ `Order.created_at` — [The Contracts →](/shopmicro/th/proto-grpc/contracts/) เลือก field `string` แทน `google.protobuf.Timestamp` สำหรับคอร์สนี้ ดังนั้นการ map จึงเป็นแค่ call `Format` เดียว ไม่ใช่การแปลงแบบ `timestamppb`
+- **`o.CreatedAt.UTC().Format(time.RFC3339)` ของ `toProto`** แปลง `time.Time` ของ repository เป็น `string` ธรรมดาที่ `.proto` contract ประกาศไว้สำหรับ `Order.created_at` — [The Contracts →](/shopmicro/th/proto-grpc/contracts/) เลือก field `string` แทน `google.protobuf.Timestamp` สำหรับคอร์สนี้ ดังนั้นการ map จึงเป็นแค่ call `Format` เดียว ไม่ใช่การแปลงแบบ `timestamppb` การใส่ `.UTC()` ชัดเจนสำคัญมาก — `pgx` v5 scan คอลัมน์ `timestamptz` เป็น `time.Time` โดยใช้ timezone **local** ของเครื่องที่รัน Go process เป็นค่าเริ่มต้น (ไม่ได้ตั้ง `ScanLocation`) ไม่ใช่ UTC — เป็นจุดเวลาเดียวกันไม่ว่าจะแบบไหน แต่ถ้า format โดยไม่ใส่ `.UTC()` ก่อน จะพิมพ์ offset ท้องถิ่นของเครื่องคุณ (`+07:00`, `-05:00`, ...) แทนที่จะเป็น string UTC ที่ลงท้ายด้วย `Z` ซึ่งเป็นสิ่งที่ REST API ควรคืนค่าเสมอ
 
 ### 4. ต่อสาย `Server` เข้ากับ `main.go`
 
@@ -631,4 +631,4 @@ go build ./...
 
 ## สรุป
 
-`migrations/order/0001_init.sql` สร้าง `orders`, `order_items`, และ `outbox` — ตัวสุดท้ายมี partial index บนแถวที่ยังไม่ publish ซึ่ง [The Transactional Outbox →](/shopmicro/th/order-service/outbox/) จะอธิบายเต็ม ๆ `OrderRepo.Create` ใน `services/order/internal/repo/orders.go` insert คำสั่งซื้อ ทุกรายการสินค้า และ outbox row `order.created` อยู่ใน `pgx.Tx` เดียว ดังนั้นทั้งสามอย่างจึงสำเร็จพร้อมกันหรือไม่สำเร็จเลย; `Get`, `ListByCustomer`, และ `UpdateStatus` ทำให้ repository สมบูรณ์ ตัวสุดท้ายเขียน outbox row `order.confirmed`/`order.cancelled` ของตัวเองสำหรับ [Order Saga →](/shopmicro/th/saga/) (Module 9) ที่จะเรียกใช้ในที่สุด `Server` ใน `services/order/internal/server/server.go` implement `CreateOrder` โดยตั้งราคาทุกรายการผ่าน Catalog client ที่ inject ไว้ — `codes.FailedPrecondition` สำหรับสินค้าที่ Catalog รายงานว่าไม่มี, `codes.Internal` สำหรับความล้มเหลวอื่น ๆ ของ Catalog — ก่อนที่จะเรียก `repo.Create` เลย; `GetOrder` และ `ListOrders` เชื่อมตรงไปที่ repository `grpcurl` ยืนยันเส้นทางทั้งหมดแบบ end-to-end: สร้างสินค้าใน Catalog สั่งซื้อใน Order โดยตั้งราคาจาก `price_cents` จริงของสินค้านั้น ดึงกลับมา แสดงรายการ และเห็นทั้ง `codes.FailedPrecondition` กับ `codes.InvalidArgument` ทำงานถูกต้อง นั่นคือ Order service ที่สร้างคำสั่งซื้อจริงพร้อมราคาที่ถูกต้อง ต่อไป [The Transactional Outbox →](/shopmicro/th/order-service/outbox/) จะอธิบายว่าทำไมการ insert `outbox` นั้น — ไม่ใช่การ publish ตรงไปที่ Kafka — คือสิ่งที่ทำให้ `order.created` เชื่อถือได้
+`migrations/order/0001_init.up.sql` สร้าง `orders`, `order_items`, และ `outbox` — ตัวสุดท้ายมี partial index บนแถวที่ยังไม่ publish ซึ่ง [The Transactional Outbox →](/shopmicro/th/order-service/outbox/) จะอธิบายเต็ม ๆ `OrderRepo.Create` ใน `services/order/internal/repo/orders.go` insert คำสั่งซื้อ ทุกรายการสินค้า และ outbox row `order.created` อยู่ใน `pgx.Tx` เดียว ดังนั้นทั้งสามอย่างจึงสำเร็จพร้อมกันหรือไม่สำเร็จเลย; `Get`, `ListByCustomer`, และ `UpdateStatus` ทำให้ repository สมบูรณ์ ตัวสุดท้ายเขียน outbox row `order.confirmed`/`order.cancelled` ของตัวเองสำหรับ [Order Saga →](/shopmicro/th/saga/) (Module 9) ที่จะเรียกใช้ในที่สุด `Server` ใน `services/order/internal/server/server.go` implement `CreateOrder` โดยตั้งราคาทุกรายการผ่าน Catalog client ที่ inject ไว้ — `codes.FailedPrecondition` สำหรับสินค้าที่ Catalog รายงานว่าไม่มี, `codes.Internal` สำหรับความล้มเหลวอื่น ๆ ของ Catalog — ก่อนที่จะเรียก `repo.Create` เลย; `GetOrder` และ `ListOrders` เชื่อมตรงไปที่ repository `grpcurl` ยืนยันเส้นทางทั้งหมดแบบ end-to-end: สร้างสินค้าใน Catalog สั่งซื้อใน Order โดยตั้งราคาจาก `price_cents` จริงของสินค้านั้น ดึงกลับมา แสดงรายการ และเห็นทั้ง `codes.FailedPrecondition` กับ `codes.InvalidArgument` ทำงานถูกต้อง นั่นคือ Order service ที่สร้างคำสั่งซื้อจริงพร้อมราคาที่ถูกต้อง ต่อไป [The Transactional Outbox →](/shopmicro/th/order-service/outbox/) จะอธิบายว่าทำไมการ insert `outbox` นั้น — ไม่ใช่การ publish ตรงไปที่ Kafka — คือสิ่งที่ทำให้ `order.created` เชื่อถือได้

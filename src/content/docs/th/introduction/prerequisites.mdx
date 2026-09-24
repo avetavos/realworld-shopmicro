@@ -57,9 +57,9 @@ Verify:
 go version
 ```
 
-Output ที่คาดหวัง (เวอร์ชันต้องเป็น **1.22 ขึ้นไป**):
+Output ที่คาดหวัง (เวอร์ชันต้องเป็น **1.25 ขึ้นไป** — Go รุ่นเก่ากว่านี้ไม่มี `sync.WaitGroup.Go` ที่โมดูล saga ใช้):
 
-```
+```text
 go version go1.27.1 darwin/arm64
 ```
 
@@ -79,8 +79,8 @@ buf --version
 
 Output ที่คาดหวัง:
 
-```
-1.34.0
+```text
+1.71.0
 ```
 
 ### 3. Docker Desktop
@@ -96,9 +96,9 @@ docker compose version
 
 Output ที่คาดหวัง:
 
-```
-Docker version 27.0.3, build 7d4bcd8
-Docker Compose version v2.28.1
+```text
+Docker version 29.6.1, build 8900f1d
+Docker Compose version v5.3.0
 ```
 
 ถ้า `docker` แจ้ง error ว่า "Cannot connect to the Docker daemon" ให้แน่ใจว่าแอป Docker Desktop กำลังทำงานอยู่จริง (ไอคอนวาฬบน menu bar)
@@ -119,13 +119,13 @@ grpcurl --version
 
 Output ที่คาดหวัง:
 
-```
-grpcurl v1.9.1
+```text
+grpcurl 1.9.4
 ```
 
 ### 5. kubectl และ helm
 
-`kubectl` คือ command-line client สำหรับ Kubernetes; `helm` คือ package manager ที่เราใช้ติดตั้ง chart ของ ShopMicro ใน Module 14 ติดตั้งทั้งคู่ผ่าน Homebrew:
+`kubectl` คือ command-line client สำหรับ Kubernetes; `helm` คือ package manager ที่เราใช้ติดตั้ง chart ของ ShopMicro ใน Module 14 (คอร์สนี้ใช้ **Helm 4**) ติดตั้งทั้งคู่ผ่าน Homebrew:
 
 ```sh
 brew install kubectl helm
@@ -140,9 +140,9 @@ helm version
 
 Output ที่คาดหวัง (โดยประมาณ):
 
-```
-Client Version: v1.30.2
-version.BuildInfo{Version:"v3.15.2", ...}
+```text
+Client Version: v1.36.1
+version.BuildInfo{Version:"v4.3.0", ...}
 ```
 
 ### 6. Kubernetes cluster บนเครื่อง
@@ -167,10 +167,10 @@ kubectl get nodes
 
 Output ที่คาดหวัง (control plane ที่กำลังทำงานและ node อย่างน้อยหนึ่งตัวที่ `Ready`):
 
-```
+```text
 Kubernetes control plane is running at https://127.0.0.1:6443
 NAME                      STATUS   ROLES           AGE   VERSION
-shopmicro-control-plane   Ready    control-plane   1m    v1.30.0
+shopmicro-control-plane   Ready    control-plane   1m    v1.37.0
 ```
 
 ทางไหนก็ได้ — เลือกหนึ่ง คุณต้องใช้ cluster เฉพาะใน Module 14 เท่านั้น จึงกลับมาทำขั้นนี้ทีหลังได้หากยังไม่อยากรันตอนนี้
@@ -189,7 +189,7 @@ grpcurl --version && \
 kubectl version --client && helm version
 ```
 
-ถ้าทุกคำสั่งตอบด้วย version string — และ Go เป็น 1.22+ — เครื่องของคุณก็พร้อมแล้ว
+ถ้าทุกคำสั่งตอบด้วย version string — และ Go เป็น 1.25+ — เครื่องของคุณก็พร้อมแล้ว
 
 ## สรุป
 

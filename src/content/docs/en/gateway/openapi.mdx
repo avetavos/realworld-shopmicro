@@ -176,11 +176,22 @@ Fetch the raw OpenAPI document and confirm it's a real Swagger 2.0 document:
 curl -s localhost:8080/openapi/catalog.swagger.json | head -c 200
 ```
 
-```json
-{"swagger":"2.0","info":{"title":"catalog.proto","version":"version not set"},"tags":[{"name":"CatalogService"}],"consumes":["application/json"],"produces":["application/json"],"paths":{"/v1/products":{"get":{"operationId"
+```txt
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "shopmicro/catalog/v1/catalog.proto",
+    "version": "version not set"
+  },
+  "tags": [
+    {
+      "name": "CatalogService"
+    }
+  ],
+  "consumes": [
 ```
 
-`"swagger": "2.0"` confirms this is OpenAPI v2, exactly as the plugin choice in [Code Generation →](/shopmicro/en/proto-grpc/codegen/) produces — `"info":{"title":"catalog.proto", ...}` and the empty per-operation descriptions further down the document are the direct, visible consequence of `catalog.proto` never having any `.proto` comments to draw from.
+`"swagger": "2.0"` confirms this is OpenAPI v2, exactly as the plugin choice in [Code Generation →](/shopmicro/en/proto-grpc/codegen/) produces — the current `grpc-ecosystem/openapiv2` plugin pretty-prints the document (not the single-line form older versions produced), and `"title"` is the `.proto` file's full path *relative to the proto module root* (`shopmicro/catalog/v1/catalog.proto`), not just its basename, because that's the path `buf` passes the plugin for a file under `proto/shopmicro/catalog/v1/`. The empty per-operation descriptions further down the document are the direct, visible consequence of `catalog.proto` never having any `.proto` comments to draw from.
 
 Open `http://localhost:8080/docs` in a browser. The page loads Swagger UI from the CDN and shows a dropdown with **Catalog** and **Order**; switching to **Catalog** and expanding `GET /v1/products`, then clicking **Try it out** → **Execute**, sends the exact same request `curl -s localhost:8080/v1/products` did in [grpc-gateway →](/shopmicro/en/gateway/grpc-gateway/) — because it's hitting the same gateway, over the same REST surface, described by the same generated document.
 

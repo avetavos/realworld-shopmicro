@@ -29,6 +29,11 @@ queue นั้นคือ **work queue** ซึ่งทำงานต่า�
 - **Pros:** การจับคู่ routing key แบบเป๊ะ ๆ เป็นกฎที่ง่ายที่สุดเท่าที่จะคิดได้ — "job นี้ไป queue นี้" จบ — ไม่มีต้นทุนการจับคู่ pattern และไม่มีความเสี่ยงที่ wildcard binding จะจับ routing key ที่ไม่ควรจับผิดพลาด
 - **Cons:** exchange แบบ direct ไม่สามารถแสดงออกว่า "route อะไรก็ตามที่ขึ้นต้นด้วย `notification.`" ได้ (ต้องใช้ topic exchange) หรือ "ให้สำเนาแก่ผู้ subscribe ทุกคน" (ต้องใช้ fanout) — ถ้า `pkg/amqp` มี job type ที่สองที่บาง queue ต้องการแต่บาง queue ไม่ต้องการในอนาคต binding แบบ exact-match ของ direct exchange จะเป็นตัวเลือกที่ยืดหยุ่นน้อยที่สุดของ RabbitMQ
 
+**Classic queue แบบ durable** (ที่ใช้ในบทนี้) เทียบกับ **quorum queue**
+
+- **Pros:** classic queue เป็นตัวเลือกที่ง่ายที่สุดและเพียงพอสำหรับ broker node เดียวในเครื่อง `notification.send` ประกาศเป็น `durable: true` อยู่แล้ว ซึ่ง RabbitMQ 4 บังคับอยู่ดี — RabbitMQ 4 เอา queue ที่ไม่ durable และไม่ exclusive แบบมีชื่อออกไปทั้งหมด (feature flag `transient_nonexcl_queues` ที่ถูก deprecate) ดังนั้นการประกาศ durable จึงไม่ใช่ทางเลือกอีกต่อไปแม้แต่ในโหมด dev
+- **Cons:** ความทนทานของ classic queue ยังขึ้นกับ node เดียวที่มันอยู่ — ไม่มี replication **Quorum queue** (`x-queue-type: quorum` ใน argument ตอน declare) จะ replicate queue ข้าม cluster หลาย node ด้วย Raft consensus log ทำให้ node ล่มไม่ทำให้ job ที่ค้างอยู่หายไป นี่คือ queue type ที่แนะนำสำหรับ production สำหรับอะไรก็ตามที่ต้องรอดจาก broker ที่ล่ม และคุ้มค่าที่จะเปลี่ยนไปใช้เมื่อ ShopMicro รันบน RabbitMQ cluster หลาย node จริงแทนที่ container เดียวในเครื่องนี้
+
 ## ติดตั้ง
 
 ### 1. `pkg/amqp/amqp.go`
@@ -240,10 +245,10 @@ func (c *Client) Close() {
 }
 ```
 
-เซฟไฟล์นี้เป็น `pkg/amqp/amqp.go` แล้วดึง client library เข้ามา:
+เซฟไฟล์นี้เป็น `pkg/amqp/amqp.go` [Go Module & Dependencies →](/shopmicro/th/setup/go-workspace/) รัน `go get github.com/rabbitmq/amqp091-go` ไปแล้วตั้งแต่ Module 1 แต่ `go mod tidy` ครั้งแรกของ [Code Generation →](/shopmicro/th/proto-grpc/codegen/) ได้ตัด requirement นั้นออกไปแล้ว เพราะตอนนั้นยังไม่มีใคร import เลย — เหตุผลเดียวกับที่ [The gRPC Server →](/shopmicro/th/catalog-service/grpc-server/) กับ [Producer & Consumer →](/shopmicro/th/kafka/producer-consumer/) ต้องรัน `go mod tidy` อีกครั้งเพื่อ `pgxpool` กับ `kafka-go` โค้ด `pkg/amqp/amqp.go` ข้างบนคือ import จริงตัวแรก จึงต้องรันมันอีกครั้งตอนนี้:
 
 ```bash
-go get github.com/rabbitmq/amqp091-go
+go mod tidy
 ```
 
 ### 2. Demo เล็ก ๆ ที่ publish แล้ว consume กลับ
@@ -378,7 +383,7 @@ consumed from notification.send: {"to":"customer@example.com","message":"Your or
 go build ./...
 ```
 
-ไม่มี output แปลว่าสำเร็จ
+ไม่มี output แปลว่าสำเร็จ (ถ้าข้าม `go mod tidy` ข้างบน จะ fail ด้วย `no required module provides package github.com/rabbitmq/amqp091-go`)
 
 ตรวจสอบความเข้าใจของคุณ:
 

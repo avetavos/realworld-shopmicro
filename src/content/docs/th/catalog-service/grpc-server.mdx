@@ -212,14 +212,20 @@ ERROR:
 catalog: shutting down
 ```
 
+`pkg/pg/pg.go` เป็น import จริงตัวแรกของ `pgxpool` ในคอร์สนี้ และ `pgxpool` ดึง `github.com/jackc/puddle/v2` เข้ามาด้วย — dependency ทางอ้อมที่ `go get github.com/jackc/pgx/v5` ใน [Go Module & Dependencies →](/shopmicro/th/setup/go-workspace/) ไม่เคยบันทึก `go.sum` ไว้ให้ เพราะตอนนั้นยังไม่มีใคร import `pgxpool` เลย รัน `go mod tidy` ก่อน:
+
+```bash
+go mod tidy
+```
+
 จากนั้นยืนยันว่าทั้ง module ยัง build ผ่านอยู่:
 
 ```bash
 go build ./...
 ```
 
-ไม่มี output แปลว่าสำเร็จ
+ไม่มี output แปลว่าสำเร็จ (ถ้าข้าม `go mod tidy` ตรงนี้ `go build ./...` จะ fail ด้วย `missing go.sum entry for module providing package github.com/jackc/puddle/v2`)
 
 ## สรุป
 
-`services/catalog/cmd/main.go` คือ composition root ของ Catalog service: `pkg/pg.NewPool` เปิดและตรวจสุขภาพ connection pool ของ PostgreSQL, `net.Listen` bind พอร์ต gRPC, `grpc.NewServer()` สร้าง server, `reflection.Register` เปิด introspection และ `placeholderServer` — ที่เป็นแค่ `catalogv1.UnimplementedCatalogServiceServer` ที่ embed แบบ value — ก็ satisfy `CatalogServiceServer` ได้ดีพอที่จะลงทะเบียน serve และตอบ `grpcurl` ด้วย error `codes.Unimplemented` ที่ถูกต้องสมบูรณ์ `SIGINT`/`SIGTERM` จะสั่ง `grpcServer.GracefulStop()` เพื่อออกจากระบบอย่างสะอาด ต่อไป [The Postgres Repository →](/shopmicro/th/catalog-service/postgres-repo/) จะสร้าง `ProductRepo` ตัวจริงที่ placeholder นี้ยืนแทนอยู่
+`services/catalog/cmd/main.go` คือ composition root ของ Catalog service: `pkg/pg.NewPool` เปิดและตรวจสุขภาพ connection pool ของ PostgreSQL, `net.Listen` bind พอร์ต gRPC, `grpc.NewServer()` สร้าง server, `reflection.Register` เปิด introspection และ `placeholderServer` — ที่เป็นแค่ `catalogv1.UnimplementedCatalogServiceServer` ที่ embed แบบ value — ก็ satisfy `CatalogServiceServer` ได้ดีพอที่จะลงทะเบียน serve และตอบ `grpcurl` ด้วย error `codes.Unimplemented` ที่ถูกต้องสมบูรณ์ `SIGINT`/`SIGTERM` จะสั่ง `grpcServer.GracefulStop()` เพื่อออกจากระบบอย่างสะอาด `go mod tidy` รันตรงนี้เป็นครั้งแรกนับตั้งแต่ [Code Generation →](/shopmicro/th/proto-grpc/codegen/) เพราะ import `pgxpool` จริงของ `pkg/pg` เป็นจุดแรกที่ต้องการ `github.com/jackc/puddle/v2` ใน `go.sum` ต่อไป [The Postgres Repository →](/shopmicro/th/catalog-service/postgres-repo/) จะสร้าง `ProductRepo` ตัวจริงที่ placeholder นี้ยืนแทนอยู่

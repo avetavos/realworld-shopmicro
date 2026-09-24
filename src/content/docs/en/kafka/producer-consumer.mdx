@@ -180,10 +180,10 @@ func (c *Consumer) Close() error {
 }
 ```
 
-Save this as `pkg/kafka/kafka.go`, and pull in the client library:
+Save this as `pkg/kafka/kafka.go`. [Go Module & Dependencies →](/shopmicro/en/setup/go-workspace/) already ran `go get github.com/segmentio/kafka-go` back in Module 1, but [Code Generation →](/shopmicro/en/proto-grpc/codegen/)'s `go mod tidy` (the first time this course ran it) pruned that requirement straight back out of `go.mod`, since nothing imported `kafka-go` yet at that point — the same reason [The gRPC Server →](/shopmicro/en/catalog-service/grpc-server/) needed `go mod tidy` again for `pgxpool`. `pkg/kafka/kafka.go` above is the first real import, so re-run it now:
 
 ```bash
-go get github.com/segmentio/kafka-go
+go mod tidy
 ```
 
 ### 3. A tiny produce → consume demo
@@ -309,7 +309,7 @@ Then confirm the module still builds:
 go build ./...
 ```
 
-No output means success.
+No output means success. (Skipping the `go mod tidy` above fails this with `no required module provides package github.com/segmentio/kafka-go`.)
 
 Check your understanding:
 

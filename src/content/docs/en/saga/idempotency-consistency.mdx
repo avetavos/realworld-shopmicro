@@ -76,7 +76,7 @@ Now the honesty. Two things this saga does **not** give you, on purpose:
 
 ## Set it up
 
-Nothing new to write — the two guards this lesson is about are already in `services/order/internal/repo/orders.go` from [The Saga Handler →](/shopmicro/en/saga/orchestration/), and `processed_events` was created by that lesson's `migrations/order/0002_processed_events.sql`. Re-read the two guards with this lesson's framing, this time as the whole picture rather than a detail passed over:
+Nothing new to write — the two guards this lesson is about are already in `services/order/internal/repo/orders.go` from [The Saga Handler →](/shopmicro/en/saga/orchestration/), and `processed_events` was created by that lesson's `migrations/order/0002_processed_events.up.sql`. Re-read the two guards with this lesson's framing, this time as the whole picture rather than a detail passed over:
 
 ```go
 // Guard 1: dedupe. Already-seen event id -> commit the no-op, touch nothing.
@@ -102,7 +102,7 @@ if status != "pending" {
 }
 ```
 
-If you skipped applying `0002_processed_events.sql` earlier, it's just:
+If you skipped applying `0002_processed_events.up.sql` earlier, it's just:
 
 ```sql
 create table processed_events ( event_id text primary key, processed_at timestamptz not null default now() );
@@ -144,7 +144,14 @@ curl -s -X POST localhost:8080/v1/orders \
   -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
 ```
 
-Poll it back until it's `ORDER_STATUS_CONFIRMED`, and note its id. Now prove idempotency directly: **redeliver the exact same `payment.succeeded` event** onto the `payments` topic, with the same `id` the console consumer showed in [Process & Publish →](/shopmicro/en/payment-service/process-publish/) (`<order-id>:payment`). Produce one raw record straight to Kafka:
+Poll it back until it's `ORDER_STATUS_CONFIRMED`, and note its id. Now prove idempotency directly: **redeliver the exact same `payment.succeeded` event** onto the `payments` topic, with the exact `id` [Process & Publish →](/shopmicro/en/payment-service/process-publish/)'s console consumer printed for it. That id is **not** `<order-id>:payment` — it's `<outbox-row-id>:payment`, derived from the `order.created` event's own `id`, which is the `outbox` table's own generated `id` column, a UUID independent of the order's `id`/`aggregate_id`. Get the real value straight from the database if you don't have it from the terminal output:
+
+```bash
+docker compose exec -T postgres psql -U shopmicro -d orders -c \
+  "select id from outbox where aggregate_id = '3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90' and event_type = 'order.created';"
+```
+
+Using anything else — including the order's own id, which only happens to equal the outbox row id in this lesson's illustrative sample values — produces an id `processed_events` has never seen, so Guard 1 would insert it as new and only Guard 2 (the order's already `confirmed`) would stop it, which is not what this first test is meant to demonstrate. Produce one raw record straight to Kafka, with the real outbox-row-derived id substituted in:
 
 ```bash
 docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \

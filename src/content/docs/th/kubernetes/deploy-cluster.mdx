@@ -91,7 +91,7 @@ image ของทั้งหก service มาจาก [Service images →](/
 
 ```bash
 docker build -t shopmicro/migrate:latest -f - migrations <<'EOF'
-FROM migrate/migrate:v4.17.1
+FROM migrate/migrate:v4.20.1
 COPY . /migrations
 EOF
 ```
@@ -119,6 +119,8 @@ helm install rabbitmq oci://registry-1.docker.io/bitnamicharts/rabbitmq \
 ```
 
 (Catalog และ Order ใช้ Postgres instance เดียวกันร่วมกันด้วยสอง database, `catalog` และ `orders` — สร้าง database ที่สองเมื่อ Postgres ขึ้นแล้ว หรือชี้ `infra.postgres` ไปสอง host ถ้าคุณอยากให้แยกกัน)
+
+**หมายเหตุเรื่องความสดใหม่ของสามคำสั่งนี้** ตั้งแต่ Broadcom ปรับโครงสร้าง catalog ของ Bitnami ใหม่ในปี 2025 free tier ของ OCI chart พวกนี้เหลือแค่ image tag `:latest` ที่ไม่ได้ pin เวอร์ชัน — chart ยังติดตั้งและรันได้ (ยืนยันแล้วข้างบนกับ `kind` cluster จริง) แต่ `helm install` จะพิมพ์ `WARNING: Rolling tag detected (bitnami/postgresql:latest), ...` สำหรับทุก image ของ Bitnami ที่ chart ดึงมา ชี้ไปเอกสาร Bitnami Secure Images ของ Broadcom นั่นคือ noise ที่คาดหวัง ไม่ใช่ความล้มเหลว — `helm install`/`kubectl get pods` ยังสำเร็จเป๊ะตามที่แสดงด้านล่าง — แต่ควรรู้ไว้ว่านี่ไม่ใช่การ pull แบบ versioned reproducible เหมือน tag ที่ pin ไว้อีกต่อไป production cluster จริงควรสมัคร Bitnami Secure Images แล้ว pin tag หรือไม่ก็รัน image Postgres/Kafka/RabbitMQ ของตัวเองแทน
 
 ## ตรวจสอบผล
 

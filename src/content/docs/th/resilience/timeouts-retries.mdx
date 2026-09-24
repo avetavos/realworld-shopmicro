@@ -182,7 +182,7 @@ opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials(
 opts := resilience.DialOptions()
 ```
 
-เพิ่ม `"github.com/avetavos/shopmicro/pkg/resilience"` เข้า import แล้วลบ import `"google.golang.org/grpc/credentials/insecure"` ที่ตอนนี้ไม่ได้ใช้ ทั้ง `RegisterCatalogServiceHandlerFromEndpoint` และ `RegisterOrderServiceHandlerFromEndpoint` รับ slice `opts` นั้นอยู่แล้ว ดังนั้นทั้งสอง gRPC connection ของ gateway ตอนนี้มีขอบเขตและ retry โดยไม่ต้องแก้อะไรเพิ่ม
+เพิ่ม `"github.com/avetavos/shopmicro/pkg/resilience"` เข้า import แล้วลบ `"google.golang.org/grpc/credentials/insecure"` — และเพราะไม่มีที่ไหนในไฟล์นี้อ้างถึง package `grpc` ตรง ๆ อีกแล้วเมื่อ `opts` มาจาก `resilience.DialOptions()` แทนที่จะเป็น literal `[]grpc.DialOption{...}` ก็ต้องลบ import `"google.golang.org/grpc"` ที่ไม่ได้ใช้แล้วด้วย (`go build` จะ fail ด้วย `"google.golang.org/grpc" imported and not used` ถ้าทิ้งไว้) ทั้ง `RegisterCatalogServiceHandlerFromEndpoint` และ `RegisterOrderServiceHandlerFromEndpoint` รับ slice `opts` นั้นอยู่แล้ว ดังนั้นทั้งสอง gRPC connection ของ gateway ตอนนี้มีขอบเขตและ retry โดยไม่ต้องแก้อะไรเพิ่ม
 
 ### 3. Route Catalog client ของ Order ผ่าน interceptor
 

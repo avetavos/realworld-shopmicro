@@ -55,9 +55,9 @@ Verify:
 go version
 ```
 
-Expected output (the version must be **1.22 or higher**):
+Expected output (the version must be **1.25 or higher** — earlier Go doesn't have `sync.WaitGroup.Go`, which the saga module uses):
 
-```
+```text
 go version go1.27.1 darwin/arm64
 ```
 
@@ -77,8 +77,8 @@ buf --version
 
 Expected output:
 
-```
-1.34.0
+```text
+1.71.0
 ```
 
 ### 3. Docker Desktop
@@ -94,9 +94,9 @@ docker compose version
 
 Expected output:
 
-```
-Docker version 27.0.3, build 7d4bcd8
-Docker Compose version v2.28.1
+```text
+Docker version 29.6.1, build 8900f1d
+Docker Compose version v5.3.0
 ```
 
 If `docker` errors with "Cannot connect to the Docker daemon," make sure the Docker Desktop app is actually running (whale icon in the menu bar).
@@ -117,13 +117,13 @@ grpcurl --version
 
 Expected output:
 
-```
-grpcurl v1.9.1
+```text
+grpcurl 1.9.4
 ```
 
 ### 5. kubectl and helm
 
-`kubectl` is the command-line client for Kubernetes; `helm` is the package manager we use to install ShopMicro's chart in Module 14. Install both via Homebrew:
+`kubectl` is the command-line client for Kubernetes; `helm` is the package manager we use to install ShopMicro's chart in Module 14 (this course uses **Helm 4**). Install both via Homebrew:
 
 ```sh
 brew install kubectl helm
@@ -138,9 +138,9 @@ helm version
 
 Expected output (roughly):
 
-```
-Client Version: v1.30.2
-version.BuildInfo{Version:"v3.15.2", ...}
+```text
+Client Version: v1.36.1
+version.BuildInfo{Version:"v4.3.0", ...}
 ```
 
 ### 6. A local Kubernetes cluster
@@ -165,10 +165,10 @@ kubectl get nodes
 
 Expected output (a running control plane and at least one `Ready` node):
 
-```
+```text
 Kubernetes control plane is running at https://127.0.0.1:6443
 NAME                      STATUS   ROLES           AGE   VERSION
-shopmicro-control-plane   Ready    control-plane   1m    v1.30.0
+shopmicro-control-plane   Ready    control-plane   1m    v1.37.0
 ```
 
 Either option is fine — pick one. You only need the cluster for Module 14, so you can come back to this step later if you'd rather not run it now.
@@ -187,7 +187,7 @@ grpcurl --version && \
 kubectl version --client && helm version
 ```
 
-If every command answers with a version string — and Go is 1.22+ — your machine is ready.
+If every command answers with a version string — and Go is 1.25+ — your machine is ready.
 
 ## Recap
 

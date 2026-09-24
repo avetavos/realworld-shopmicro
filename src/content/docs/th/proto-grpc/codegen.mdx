@@ -125,14 +125,20 @@ find gen -type f | sort
 grep -n "CatalogServiceServer interface" gen/shopmicro/catalog/v1/catalog_grpc.pb.go
 ```
 
+โค้ดใน `gen/` เป็นจุดแรกในคอร์สนี้ที่ import `google.golang.org/genproto/googleapis/api/annotations` จริง ๆ (ดึงมาทางอ้อมผ่าน output ของ plugin `protocolbuffers/go` กับ `gateway`) — `go get` ทุกคำสั่งใน [Go Module & Dependencies →](/shopmicro/th/setup/go-workspace/) ไม่เคยแตะมันเลย จึงยังไม่มีใน `go.sum` นี่คือจังหวะที่ [Go Module & Dependencies →](/shopmicro/th/setup/go-workspace/) บอกไว้ล่วงหน้าพอดี: "เราจะปล่อยให้ import จริงของแต่ละโมดูลถัดไปดึง `// indirect` ออกเองตามธรรมชาติ และทำให้ `tidy` พอใจตั้งแต่นั้นไป" รันมันตอนนี้ เป็นครั้งแรกในคอร์สนี้:
+
+```bash
+go mod tidy
+```
+
 จากนั้นยืนยันว่าทั้ง module ยัง compile ได้ — generated code เป็น Go source จริง จึงถูกครอบคลุมด้วย `go build ./...` เดียวกันกับที่ทุกบทในคอร์สนี้ใช้ยืนยัน:
 
 ```bash
 go build ./...
 ```
 
-ไม่มี output แปลว่าสำเร็จ
+ไม่มี output แปลว่าสำเร็จ (ถ้าข้าม `go mod tidy` แล้วรัน `go build ./...` ตรง ๆ จะ fail ด้วย `missing go.sum entry for module providing package google.golang.org/genproto/googleapis/api/annotations` — `go build` เพียงลำพังไม่เคยแก้ `go.mod`/`go.sum` ให้คุณ)
 
 ## สรุป
 
-`buf generate` เปลี่ยน contract `.proto` ทั้งสองให้กลายเป็นแปดไฟล์ใต้ `gen/`: `.pb.go` (Go message type), `_grpc.pb.go` (`CatalogServiceServer`/`CatalogServiceClient` — interface ที่เซอร์วิส implement กับ interface ที่ฝั่งผู้เรียกใช้), `.pb.gw.go` (reverse proxy จาก REST ไป gRPC ที่ API Gateway จะรัน) และ `.swagger.json` (เอกสาร OpenAPI ที่ generate อัตโนมัติ) — หนึ่งชุดต่อเซอร์วิส คอร์สนี้เก็บ `gen/` ไว้นอก Git และปฏิบัติ `buf generate` เป็นขั้นตอน build ที่จำเป็น แลก build ครั้งแรกที่ช้าลงกับต้นไม้ที่ sync กับ `proto/` เสมอโดยธรรมชาติของโครงสร้าง การ commit `gen/` แทนก็เป็นทางเลือกที่ชอบธรรมเมื่อการ clone-and-build ที่เร็วและไม่ต้องมี toolchain สำคัญกว่า ต่อไป [Catalog Service →](/shopmicro/th/catalog-service/) คือจุดที่ `CatalogServiceServer` จะได้ implementation จริงตัวแรก
+`buf generate` เปลี่ยน contract `.proto` ทั้งสองให้กลายเป็นแปดไฟล์ใต้ `gen/`: `.pb.go` (Go message type), `_grpc.pb.go` (`CatalogServiceServer`/`CatalogServiceClient` — interface ที่เซอร์วิส implement กับ interface ที่ฝั่งผู้เรียกใช้), `.pb.gw.go` (reverse proxy จาก REST ไป gRPC ที่ API Gateway จะรัน) และ `.swagger.json` (เอกสาร OpenAPI ที่ generate อัตโนมัติ) — หนึ่งชุดต่อเซอร์วิส `go mod tidy` รันเป็นครั้งแรกในคอร์สนี้ตรงนี้ เพราะ import จริงใน `gen/` เป็นจุดแรกที่ต้องการ `google.golang.org/genproto/googleapis/api/annotations` ใน `go.sum` คอร์สนี้เก็บ `gen/` ไว้นอก Git และปฏิบัติ `buf generate` เป็นขั้นตอน build ที่จำเป็น แลก build ครั้งแรกที่ช้าลงกับต้นไม้ที่ sync กับ `proto/` เสมอโดยธรรมชาติของโครงสร้าง การ commit `gen/` แทนก็เป็นทางเลือกที่ชอบธรรมเมื่อการ clone-and-build ที่เร็วและไม่ต้องมี toolchain สำคัญกว่า ต่อไป [Catalog Service →](/shopmicro/th/catalog-service/) คือจุดที่ `CatalogServiceServer` จะได้ implementation จริงตัวแรก

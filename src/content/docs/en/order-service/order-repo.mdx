@@ -7,7 +7,7 @@ sidebar:
 
 ## What we're building
 
-`migrations/order/0001_init.sql` (the `orders`, `order_items`, and `outbox` tables) and `services/order/internal/repo/orders.go` — an `OrderRepo` whose `Create` method inserts an order, its line items, and an outbox row describing the event, all inside **one** `pgx.Tx`. Then `services/order/internal/server/server.go` — a real `Server` implementing all three `OrderServiceServer` methods, replacing [The gRPC Server →](/shopmicro/en/order-service/grpc-server/)'s placeholder and finally putting its injected Catalog client to work: `CreateOrder` looks up each item's current price from Catalog before ever touching the repository.
+`migrations/order/0001_init.up.sql` (the `orders`, `order_items`, and `outbox` tables) and `services/order/internal/repo/orders.go` — an `OrderRepo` whose `Create` method inserts an order, its line items, and an outbox row describing the event, all inside **one** `pgx.Tx`. Then `services/order/internal/server/server.go` — a real `Server` implementing all three `OrderServiceServer` methods, replacing [The gRPC Server →](/shopmicro/en/order-service/grpc-server/)'s placeholder and finally putting its injected Catalog client to work: `CreateOrder` looks up each item's current price from Catalog before ever touching the repository.
 
 ## Why
 
@@ -39,7 +39,7 @@ create table outbox ( id uuid primary key default gen_random_uuid(), aggregate_i
 create index on outbox (published_at) where published_at is null;
 ```
 
-Save this as `migrations/order/0001_init.sql` and apply it:
+Save this as `migrations/order/0001_init.up.sql` and apply it:
 
 ```bash
 migrate -path migrations/order -database "$ORDER_DB_URL" up
@@ -437,7 +437,7 @@ func toProto(o repo.Order) *orderv1.Order {
 		Status:     toProtoStatus(o.Status),
 		TotalCents: o.TotalCents,
 		Items:      items,
-		CreatedAt:  o.CreatedAt.Format(time.RFC3339),
+		CreatedAt:  o.CreatedAt.UTC().Format(time.RFC3339),
 	}
 }
 
@@ -460,7 +460,7 @@ Save this as `services/order/internal/server/server.go`. A few mapping and valid
 - **`CreateOrder` prices items one at a time, in a sequential loop.** Each `s.catalog.GetProduct` call is its own gRPC round trip, so an order with five distinct items makes five sequential calls before the transaction even begins. That's a real latency cost worth naming honestly — a production version might price items concurrently or batch them into a single Catalog RPC, but neither exists in this course's `.proto` contract, so a sequential loop is what's genuinely correct today.
 - **`status.FromError(err)` unwraps a gRPC error back into its `codes.Code` and message.** This is how `CreateOrder` tells "Catalog said this product doesn't exist" (`codes.NotFound` from Catalog's own `GetProduct`) apart from "the call to Catalog itself failed" (a network error, a timeout) — only the first becomes `codes.FailedPrecondition`; the second becomes `codes.Internal`, since it isn't a fact about the product at all.
 - **`errors.Is(err, pgx.ErrNoRows)`, exactly like `ProductRepo`/`Server` in Catalog.** `OrderRepo.Get` wraps whatever `Scan` returns with `%w`, so `GetOrder` can still unwrap the chain to find the sentinel underneath and translate it into `codes.NotFound`.
-- **`toProto`'s `o.CreatedAt.Format(time.RFC3339)`** converts the repository's `time.Time` into the plain `string` the `.proto` contract declared for `Order.created_at` — [The Contracts →](/shopmicro/en/proto-grpc/contracts/) chose a `string` field over `google.protobuf.Timestamp` for this course, so the mapping is a single `Format` call rather than a `timestamppb` conversion.
+- **`toProto`'s `o.CreatedAt.UTC().Format(time.RFC3339)`** converts the repository's `time.Time` into the plain `string` the `.proto` contract declared for `Order.created_at` — [The Contracts →](/shopmicro/en/proto-grpc/contracts/) chose a `string` field over `google.protobuf.Timestamp` for this course, so the mapping is a single `Format` call rather than a `timestamppb` conversion. The explicit `.UTC()` matters: `pgx` v5 scans a `timestamptz` column into a `time.Time` using the Go process's **local** timezone by default (`ScanLocation` is unset), not UTC — the value is the same instant either way, but formatting it without `.UTC()` first would print your machine's local offset (`+07:00`, `-05:00`, ...) instead of the `Z`-suffixed UTC string a JSON API should always return.
 
 ### 4. Wiring `Server` into `main.go`
 
@@ -627,4 +627,4 @@ No output means success.
 
 ## Recap
 
-`migrations/order/0001_init.sql` creates `orders`, `order_items`, and `outbox` — the last with a partial index on unpublished rows that [The Transactional Outbox →](/shopmicro/en/order-service/outbox/) explains in full. `OrderRepo.Create` in `services/order/internal/repo/orders.go` inserts the order, every line item, and an `order.created` outbox row inside one `pgx.Tx`, so all three commit together or none do; `Get`, `ListByCustomer`, and `UpdateStatus` round out the repository, the last of these writing its own `order.confirmed`/`order.cancelled` outbox row for [Order Saga →](/shopmicro/en/saga/) (Module 9) to eventually trigger. `services/order/internal/server/server.go`'s `Server` implements `CreateOrder` by pricing every item through the injected Catalog client — `codes.FailedPrecondition` for a product Catalog reports missing, `codes.Internal` for any other Catalog failure — before ever calling `repo.Create`; `GetOrder` and `ListOrders` round-trip straight to the repository. `grpcurl` confirms the whole path end-to-end: create a product in Catalog, place an order in Order priced from that product's real `price_cents`, fetch it back, list it, and see both `codes.FailedPrecondition` and `codes.InvalidArgument` fire correctly. That's the Order service placing real, correctly-priced orders. Next, [The Transactional Outbox →](/shopmicro/en/order-service/outbox/) explains exactly why that `outbox` insert — and not a direct publish to Kafka — is what makes `order.created` reliable.
+`migrations/order/0001_init.up.sql` creates `orders`, `order_items`, and `outbox` — the last with a partial index on unpublished rows that [The Transactional Outbox →](/shopmicro/en/order-service/outbox/) explains in full. `OrderRepo.Create` in `services/order/internal/repo/orders.go` inserts the order, every line item, and an `order.created` outbox row inside one `pgx.Tx`, so all three commit together or none do; `Get`, `ListByCustomer`, and `UpdateStatus` round out the repository, the last of these writing its own `order.confirmed`/`order.cancelled` outbox row for [Order Saga →](/shopmicro/en/saga/) (Module 9) to eventually trigger. `services/order/internal/server/server.go`'s `Server` implements `CreateOrder` by pricing every item through the injected Catalog client — `codes.FailedPrecondition` for a product Catalog reports missing, `codes.Internal` for any other Catalog failure — before ever calling `repo.Create`; `GetOrder` and `ListOrders` round-trip straight to the repository. `grpcurl` confirms the whole path end-to-end: create a product in Catalog, place an order in Order priced from that product's real `price_cents`, fetch it back, list it, and see both `codes.FailedPrecondition` and `codes.InvalidArgument` fire correctly. That's the Order service placing real, correctly-priced orders. Next, [The Transactional Outbox →](/shopmicro/en/order-service/outbox/) explains exactly why that `outbox` insert — and not a direct publish to Kafka — is what makes `order.created` reliable.

@@ -51,7 +51,7 @@ Save this as `deploy/compose/initdb.sql`.
 ```yaml
 services:
   postgres:
-    image: postgres:16
+    image: postgres:18
     environment:
       POSTGRES_USER: shopmicro
       POSTGRES_PASSWORD: shopmicro
@@ -68,7 +68,7 @@ services:
       retries: 5
 
   kafka:
-    image: apache/kafka:3.8.0
+    image: apache/kafka:4.3.1
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -83,7 +83,7 @@ services:
       - "9092:9092"
 
   rabbitmq:
-    image: rabbitmq:3-management
+    image: rabbitmq:4-management
     environment:
       RABBITMQ_DEFAULT_USER: shopmicro
       RABBITMQ_DEFAULT_PASS: shopmicro
@@ -139,4 +139,4 @@ An empty response with no error means the broker is up and reachable.
 
 ## Recap
 
-`deploy/compose/docker-compose.yml` brings up three backing services with `docker compose up -d`: **PostgreSQL 16**, initialized via `initdb.sql` with two databases — `catalog` and `orders` (named `orders`, not `order`, because `order` is a reserved SQL keyword); **Kafka** in **KRaft** mode, a single node acting as both broker and controller with no ZooKeeper; and **RabbitMQ** with its management UI on port 15672. Each service owning its own database is the local-dev version of the isolation that keeps ShopMicro's services independently deployable. That's Module 1 done — the monorepo is scaffolded, the Go module builds, buf is configured, and the infrastructure is up and verified. Module 2 writes the first real `.proto` contracts and generates actual Go code from them.
+`deploy/compose/docker-compose.yml` brings up three backing services with `docker compose up -d`: **PostgreSQL 18**, initialized via `initdb.sql` with two databases — `catalog` and `orders` (named `orders`, not `order`, because `order` is a reserved SQL keyword); **Kafka** in **KRaft** mode, a single node acting as both broker and controller with no ZooKeeper; and **RabbitMQ** with its management UI on port 15672. Each service owning its own database is the local-dev version of the isolation that keeps ShopMicro's services independently deployable. That's Module 1 done — the monorepo is scaffolded, the Go module builds, buf is configured, and the infrastructure is up and verified. Module 2 writes the first real `.proto` contracts and generates actual Go code from them.

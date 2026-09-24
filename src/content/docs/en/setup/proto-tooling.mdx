@@ -98,8 +98,14 @@ buf --version
 buf lint
 ```
 
-`proto/` is still empty at this point (Module 2 adds the first `.proto` file), so `buf lint` has nothing to check yet and should exit cleanly with no violations printed — that's expected, not a sign anything is broken. What we've verified here is that `buf.yaml` parses, the workspace resolves, and the `googleapis` dependency is reachable. Once Module 2 lands real `.proto` files, the same `buf lint` command will start actually checking them, and `buf generate` will produce real output in `gen/` using the four plugins configured above.
+`proto/` is still empty at this point (Module 2 adds the first `.proto` file), and buf refuses to process a module with **zero** `.proto` files at all — for *any* subcommand, not just `lint`:
+
+```text
+Failure: Module "path: "proto"" had no .proto files
+```
+
+That failure is expected, not a sign anything is broken: it proves `buf.yaml` parsed and buf found the `proto` module exactly where `modules: - path: proto` says to look — there's just nothing in it yet. We can't resolve the `googleapis` dependency yet either (`buf dep update` hits the same "had no .proto files" failure while the module is empty), so `buf.lock` doesn't exist until Module 2. Once Module 2 lands the first real `.proto` files, `buf dep update` will succeed and write `buf.lock`, and from then on `buf lint` actually checks the files and `buf generate` produces real output in `gen/` using the four plugins configured above.
 
 ## Recap
 
-buf is installed, and two config files are in place: `buf.yaml` defines the `proto/` workspace, the `STANDARD` lint ruleset, and a `deps:` dependency on `buf.build/googleapis/googleapis` for the HTTP annotation types the gateway needs; `buf.gen.yaml` wires up four remote plugins — `protocolbuffers/go` (Go message types), `grpc/go` (client/server stubs), `grpc-ecosystem/gateway` (the REST-to-gRPC reverse proxy), and `grpc-ecosystem/openapiv2` (generated API docs) — all writing into `gen/`. `buf lint` runs clean against an empty `proto/` today; Module 2 is where the first real `.proto` files arrive and this tooling starts producing generated Go code. Next, [Infra & Compose →](/shopmicro/en/setup/infra-compose/) stands up the PostgreSQL, Kafka, and RabbitMQ this project runs against locally.
+buf is installed, and two config files are in place: `buf.yaml` defines the `proto/` workspace, the `STANDARD` lint ruleset, and a `deps:` dependency on `buf.build/googleapis/googleapis` for the HTTP annotation types the gateway needs; `buf.gen.yaml` wires up four remote plugins — `protocolbuffers/go` (Go message types), `grpc/go` (client/server stubs), `grpc-ecosystem/gateway` (the REST-to-gRPC reverse proxy), and `grpc-ecosystem/openapiv2` (generated API docs) — all writing into `gen/`. `buf lint` (and every other buf subcommand) refuses to run against an empty `proto/` today with a "had no .proto files" failure — expected, since buf.yaml resolved correctly and there's simply nothing in the module yet; Module 2 is where the first real `.proto` files arrive, `buf dep update` can finally write `buf.lock`, and this tooling starts producing generated Go code. Next, [Infra & Compose →](/shopmicro/en/setup/infra-compose/) stands up the PostgreSQL, Kafka, and RabbitMQ this project runs against locally.

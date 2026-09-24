@@ -100,7 +100,7 @@ dedupe จับ *event เดิม* ที่มาสองครั้ง �
 
 ## ติดตั้ง
 
-ไม่มีอะไรใหม่ต้องเขียน — guard สองตัวที่บทนี้พูดถึงอยู่ใน `services/order/internal/repo/orders.go` แล้วจาก [The Saga Handler →](/shopmicro/th/saga/orchestration/) และ `processed_events` ถูกสร้างโดย `migrations/order/0002_processed_events.sql` ของบทนั้น อ่าน guard ทั้งสองอีกครั้งด้วย framing ของบทนี้ คราวนี้เป็นภาพรวมแทนที่จะเป็นรายละเอียดที่ผ่านไป:
+ไม่มีอะไรใหม่ต้องเขียน — guard สองตัวที่บทนี้พูดถึงอยู่ใน `services/order/internal/repo/orders.go` แล้วจาก [The Saga Handler →](/shopmicro/th/saga/orchestration/) และ `processed_events` ถูกสร้างโดย `migrations/order/0002_processed_events.up.sql` ของบทนั้น อ่าน guard ทั้งสองอีกครั้งด้วย framing ของบทนี้ คราวนี้เป็นภาพรวมแทนที่จะเป็นรายละเอียดที่ผ่านไป:
 
 ```go
 // Guard 1: dedupe. Already-seen event id -> commit the no-op, touch nothing.
@@ -126,7 +126,7 @@ if status != "pending" {
 }
 ```
 
-ถ้าก่อนหน้านี้คุณข้ามการ apply `0002_processed_events.sql` ไป ก็แค่รัน:
+ถ้าก่อนหน้านี้คุณข้ามการ apply `0002_processed_events.up.sql` ไป ก็แค่รัน:
 
 ```sql
 create table processed_events ( event_id text primary key, processed_at timestamptz not null default now() );
@@ -168,7 +168,14 @@ curl -s -X POST localhost:8080/v1/orders \
   -d '{"customer_id":"cust-1","items":[{"product_id":"8f14e45f-ceea-4c9d-b2a5-0c1e3f4a9b21","quantity":2}]}'
 ```
 
-Poll สถานะจนได้ `ORDER_STATUS_CONFIRMED` แล้วจด id ของคำสั่งซื้อไว้ ทีนี้พิสูจน์ idempotency ตรง ๆ: **redeliver event `payment.succeeded` เดิมเป๊ะ** ลงบน topic `payments` ด้วย `id` เดิมที่ console consumer แสดงใน [Process & Publish →](/shopmicro/th/payment-service/process-publish/) (`<order-id>:payment`) produce record ดิบหนึ่งอันตรงเข้า Kafka:
+Poll สถานะจนได้ `ORDER_STATUS_CONFIRMED` แล้วจด id ของคำสั่งซื้อไว้ ทีนี้พิสูจน์ idempotency ตรง ๆ: **redeliver event `payment.succeeded` เดิมเป๊ะ** ลงบน topic `payments` ด้วย `id` เดิมเป๊ะที่ console consumer ของ [Process & Publish →](/shopmicro/th/payment-service/process-publish/) พิมพ์ไว้ id นั้น**ไม่ใช่** `<order-id>:payment` — แต่เป็น `<outbox-row-id>:payment` ที่มาจาก `id` ของ event `order.created` เอง ซึ่งคือคอลัมน์ `id` ที่ table `outbox` generate เอง เป็น UUID คนละตัวกับ `id`/`aggregate_id` ของคำสั่งซื้อ ถ้าไม่มีค่าจริงจาก terminal output ให้ดึงตรงจาก database:
+
+```bash
+docker compose exec -T postgres psql -U shopmicro -d orders -c \
+  "select id from outbox where aggregate_id = '3a7c9e21-1e4d-4b8a-9c6e-2f8b1d5a7c90' and event_type = 'order.created';"
+```
+
+การใช้ค่าอื่น — รวมถึง id ของคำสั่งซื้อเอง ซึ่งบังเอิญเท่ากับ id ของ outbox row แค่ในตัวอย่างสมมติของบทนี้ — จะได้ id ที่ `processed_events` ไม่เคยเห็นมาก่อน ทำให้ Guard 1 insert เป็นของใหม่ แล้วมีแค่ Guard 2 (คำสั่งซื้อ `confirmed` ไปแล้ว) เท่านั้นที่หยุดมันไว้ ซึ่งไม่ใช่สิ่งที่การทดสอบแรกนี้ตั้งใจจะพิสูจน์ produce record ดิบหนึ่งอันตรงเข้า Kafka โดยแทนที่ด้วย id จริงที่มาจาก outbox row:
 
 ```bash
 docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \

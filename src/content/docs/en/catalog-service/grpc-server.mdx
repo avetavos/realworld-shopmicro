@@ -212,14 +212,20 @@ Stop the server with `Ctrl-C` in the first terminal and confirm it logs the shut
 catalog: shutting down
 ```
 
+`pkg/pg/pg.go` is this course's first real import of `pgxpool`, and `pgxpool` pulls in `github.com/jackc/puddle/v2` — a transitive dependency [Go Module & Dependencies →](/shopmicro/en/setup/go-workspace/)'s `go get github.com/jackc/pgx/v5` never recorded a `go.sum` entry for, since nothing imported `pgxpool` yet at the time. Run `go mod tidy` first:
+
+```bash
+go mod tidy
+```
+
 Then confirm the whole module still builds cleanly:
 
 ```bash
 go build ./...
 ```
 
-No output means success.
+No output means success. (Skipping `go mod tidy` here fails `go build ./...` with `missing go.sum entry for module providing package github.com/jackc/puddle/v2`.)
 
 ## Recap
 
-`services/catalog/cmd/main.go` is the Catalog service's composition root: `pkg/pg.NewPool` opens and health-checks a PostgreSQL connection pool, `net.Listen` binds the gRPC port, `grpc.NewServer()` creates the server, `reflection.Register` turns on introspection, and a `placeholderServer` — nothing more than `catalogv1.UnimplementedCatalogServiceServer` embedded by value — satisfies `CatalogServiceServer` well enough to register, serve, and respond to `grpcurl` with well-formed `codes.Unimplemented` errors. `SIGINT`/`SIGTERM` trigger `grpcServer.GracefulStop()` for a clean exit. Next, [The Postgres Repository →](/shopmicro/en/catalog-service/postgres-repo/) builds the real `ProductRepo` this placeholder is standing in for.
+`services/catalog/cmd/main.go` is the Catalog service's composition root: `pkg/pg.NewPool` opens and health-checks a PostgreSQL connection pool, `net.Listen` binds the gRPC port, `grpc.NewServer()` creates the server, `reflection.Register` turns on introspection, and a `placeholderServer` — nothing more than `catalogv1.UnimplementedCatalogServiceServer` embedded by value — satisfies `CatalogServiceServer` well enough to register, serve, and respond to `grpcurl` with well-formed `codes.Unimplemented` errors. `SIGINT`/`SIGTERM` trigger `grpcServer.GracefulStop()` for a clean exit. `go mod tidy` ran here for the first time since [Code Generation →](/shopmicro/en/proto-grpc/codegen/), because `pkg/pg`'s real `pgxpool` import is the first thing that needs `github.com/jackc/puddle/v2` in `go.sum`. Next, [The Postgres Repository →](/shopmicro/en/catalog-service/postgres-repo/) builds the real `ProductRepo` this placeholder is standing in for.

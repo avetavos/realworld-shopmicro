@@ -29,6 +29,11 @@ That queue is a **work queue**, and it behaves fundamentally differently from th
 - **Pros:** exact routing-key matching is the simplest possible rule to reason about — "this job goes to this queue," full stop — with no pattern-matching cost and no risk of a wildcard binding accidentally catching a routing key it shouldn't.
 - **Cons:** a direct exchange can't express "route anything starting with `notification.`" (that needs a topic exchange) or "give a copy to every subscriber" (that needs fanout) — if `pkg/amqp` ever grows a second job type that some queues want and others don't, a direct exchange's exact-match binding is the least flexible of RabbitMQ's routing options.
 
+**Classic durable queue** (used here) vs. **quorum queue**
+
+- **Pros:** a classic queue is the simplest option and is all a single-node local broker needs; `notification.send` is already declared `durable: true`, which RabbitMQ 4 requires anyway — RabbitMQ 4 removed support for non-durable, non-exclusive named queues entirely (the deprecated `transient_nonexcl_queues` feature flag), so a durable declaration isn't optional even in dev.
+- **Cons:** a classic queue's durability still depends on the single node it lives on — no replication. A **quorum queue** (`x-queue-type: quorum` in the declare arguments) replicates the queue across a multi-node cluster with a Raft consensus log, so a node failure doesn't lose queued jobs; that's the production-recommended queue type for anything that must survive a broker crash, and worth switching to once ShopMicro runs on a real multi-node RabbitMQ cluster instead of this single local container.
+
 ## Set it up
 
 ### 1. `pkg/amqp/amqp.go`
@@ -240,10 +245,10 @@ func (c *Client) Close() {
 }
 ```
 
-Save this as `pkg/amqp/amqp.go`, and pull in the client library:
+Save this as `pkg/amqp/amqp.go`. [Go Module & Dependencies →](/shopmicro/en/setup/go-workspace/) already ran `go get github.com/rabbitmq/amqp091-go` back in Module 1, but [Code Generation →](/shopmicro/en/proto-grpc/codegen/)'s first `go mod tidy` pruned that requirement straight back out, since nothing imported it yet — the same reason [The gRPC Server →](/shopmicro/en/catalog-service/grpc-server/) and [Producer & Consumer →](/shopmicro/en/kafka/producer-consumer/) each needed `go mod tidy` again for `pgxpool` and `kafka-go`. `pkg/amqp/amqp.go` above is the first real import, so re-run it now:
 
 ```bash
-go get github.com/rabbitmq/amqp091-go
+go mod tidy
 ```
 
 ### 2. A tiny publish → consume demo
@@ -378,7 +383,7 @@ Then confirm the module still builds:
 go build ./...
 ```
 
-No output means success.
+No output means success. (Skipping the `go mod tidy` above fails this with `no required module provides package github.com/rabbitmq/amqp091-go`.)
 
 Check your understanding:
 

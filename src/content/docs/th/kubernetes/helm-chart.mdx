@@ -234,6 +234,99 @@ spec:
 - `notification`: `KAFKA_BROKERS` และ `RABBITMQ_URL` จาก ConfigMap
 - `notification-worker`: `RABBITMQ_URL` อย่างเดียว และ `replicas: {{ .Values.services.notificationWorker.replicas }}` (default เป็น 2 — การ scale-out แบบ competing-consumers ที่ [The Send Worker →](/shopmicro/th/notification-service/worker-deliver/) สร้างตอนนี้เป็นแค่จำนวน replica)
 
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment
+  labels:
+    {{- include "shopmicro.labels" . | nindent 4 }}
+    app.kubernetes.io/name: payment
+spec:
+  replicas: {{ .Values.services.payment.replicas }}
+  selector:
+    matchLabels:
+      {{- include "shopmicro.selectorLabels" (dict "name" "payment") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "shopmicro.selectorLabels" (dict "name" "payment") | nindent 8 }}
+    spec:
+      containers:
+        - name: payment
+          image: "{{ .Values.image.repository }}/payment:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef: { name: shopmicro-config, key: KAFKA_BROKERS }
+```
+
+เซฟไฟล์นี้เป็น `templates/payment.yaml`
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification
+  labels:
+    {{- include "shopmicro.labels" . | nindent 4 }}
+    app.kubernetes.io/name: notification
+spec:
+  replicas: {{ .Values.services.notification.replicas }}
+  selector:
+    matchLabels:
+      {{- include "shopmicro.selectorLabels" (dict "name" "notification") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "shopmicro.selectorLabels" (dict "name" "notification") | nindent 8 }}
+    spec:
+      containers:
+        - name: notification
+          image: "{{ .Values.image.repository }}/notification:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef: { name: shopmicro-config, key: KAFKA_BROKERS }
+            - name: RABBITMQ_URL
+              valueFrom:
+                configMapKeyRef: { name: shopmicro-config, key: RABBITMQ_URL }
+```
+
+เซฟไฟล์นี้เป็น `templates/notification.yaml`
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-worker
+  labels:
+    {{- include "shopmicro.labels" . | nindent 4 }}
+    app.kubernetes.io/name: notification-worker
+spec:
+  replicas: {{ .Values.services.notificationWorker.replicas }}
+  selector:
+    matchLabels:
+      {{- include "shopmicro.selectorLabels" (dict "name" "notification-worker") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "shopmicro.selectorLabels" (dict "name" "notification-worker") | nindent 8 }}
+    spec:
+      containers:
+        - name: notification-worker
+          image: "{{ .Values.image.repository }}/notification-worker:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: RABBITMQ_URL
+              valueFrom:
+                configMapKeyRef: { name: shopmicro-config, key: RABBITMQ_URL }
+```
+
+เซฟไฟล์นี้เป็น `templates/notification-worker.yaml`
+
 ### 7. `deploy/helm/shopmicro/templates/gateway.yaml`
 
 ```yaml

@@ -125,14 +125,20 @@ You should see the eight files listed above — four under `gen/shopmicro/catalo
 grep -n "CatalogServiceServer interface" gen/shopmicro/catalog/v1/catalog_grpc.pb.go
 ```
 
+`gen/`'s code is the first thing in this module that actually imports `google.golang.org/genproto/googleapis/api/annotations` (pulled in transitively through the `protocolbuffers/go` and `gateway` plugin output) — none of [Go Module & Dependencies →](/shopmicro/en/setup/go-workspace/)'s `go get` calls ever touched it, so it's not in `go.sum` yet. This is exactly the moment [Go Module & Dependencies →](/shopmicro/en/setup/go-workspace/) told you to expect: "we'll let each later module's real import statements naturally drop the `// indirect` markers and keep `tidy` happy from then on." Run it now, for the first time in this course:
+
+```bash
+go mod tidy
+```
+
 Then confirm the whole module still compiles — generated code is real Go source, so it's covered by the same `go build ./...` every other lesson in this course verifies with:
 
 ```bash
 go build ./...
 ```
 
-No output means success.
+No output means success. (Skipping `go mod tidy` here and running `go build ./...` directly fails with `missing go.sum entry for module providing package google.golang.org/genproto/googleapis/api/annotations` — `go build` alone never modifies `go.mod`/`go.sum` for you.)
 
 ## Recap
 
-`buf generate` turned the two `.proto` contracts into eight files under `gen/`: `.pb.go` (Go message types), `_grpc.pb.go` (`CatalogServiceServer`/`CatalogServiceClient` — the interface a service implements and the interface its callers use), `.pb.gw.go` (the REST-to-gRPC reverse proxy the API Gateway will run), and `.swagger.json` (auto-generated OpenAPI docs) — one set per service. This course keeps `gen/` out of Git and treats `buf generate` as a required build step, trading a slower first build for a tree that's always in sync with `proto/` by construction; committing `gen/` instead is a legitimate alternative when a fast, toolchain-free clone-and-build matters more. Next, [Catalog Service →](/shopmicro/en/catalog-service/) is where `CatalogServiceServer` gets its first real implementation.
+`buf generate` turned the two `.proto` contracts into eight files under `gen/`: `.pb.go` (Go message types), `_grpc.pb.go` (`CatalogServiceServer`/`CatalogServiceClient` — the interface a service implements and the interface its callers use), `.pb.gw.go` (the REST-to-gRPC reverse proxy the API Gateway will run), and `.swagger.json` (auto-generated OpenAPI docs) — one set per service. `go mod tidy` ran for the first time in this course here, because `gen/`'s real imports are the first thing that actually needs `google.golang.org/genproto/googleapis/api/annotations` in `go.sum`. This course keeps `gen/` out of Git and treats `buf generate` as a required build step, trading a slower first build for a tree that's always in sync with `proto/` by construction; committing `gen/` instead is a legitimate alternative when a fast, toolchain-free clone-and-build matters more. Next, [Catalog Service →](/shopmicro/en/catalog-service/) is where `CatalogServiceServer` gets its first real implementation.

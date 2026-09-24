@@ -36,13 +36,13 @@ For a two-hop loop like `order.created` → `payment.*` → order status, choreo
 
 ## Set it up
 
-### 1. `migrations/order/0002_processed_events.sql`
+### 1. `migrations/order/0002_processed_events.up.sql`
 
 ```sql
 create table processed_events ( event_id text primary key, processed_at timestamptz not null default now() );
 ```
 
-Save this as `migrations/order/0002_processed_events.sql` and apply it:
+Save this as `migrations/order/0002_processed_events.up.sql` and apply it:
 
 ```bash
 migrate -path migrations/order -database "$ORDER_DB_URL" up

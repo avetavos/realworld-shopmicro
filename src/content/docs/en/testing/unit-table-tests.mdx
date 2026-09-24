@@ -60,7 +60,7 @@ func New(pub publisher) *Processor {
 }
 ```
 
-Nothing else in `processor.go` changes, and nothing in `services/payment/cmd/main.go` changes — `processor.New(publisher)` still receives the concrete `*kafka.Publisher` [Process & Publish →](/shopmicro/en/payment-service/process-publish/), which now satisfies the interface. `go build ./...` still passes; the field type is the only edit.
+Nothing in `services/payment/cmd/main.go` changes — `processor.New(publisher)` still receives the concrete `*kafka.Publisher` [Process & Publish →](/shopmicro/en/payment-service/process-publish/), which now satisfies the interface. One thing *does* still need to change in `processor.go` itself, though: with the field and constructor both now typed `publisher` instead of `*kafka.Publisher`, nothing in the file references the `kafka` package by name anymore, so its now-unused `"github.com/avetavos/shopmicro/pkg/kafka"` import has to go too — drop it, or `go build ./...` fails with `"github.com/avetavos/shopmicro/pkg/kafka" imported and not used`.
 
 ### 2. `services/payment/internal/processor/processor_test.go`
 
