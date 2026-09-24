@@ -1,15 +1,15 @@
 ---
 title: Roadmap
-description: "ShopMicro คือโปรเจกต์ #3 ของซีรีส์หกโปรเจกต์ที่ต่อยอดทั้งแค็ตตาล็อกของ Learn Hub มาเป็นแอปพลิเคชันจริง นี่คือตำแหน่งของ ShopMicro และโปรเจกต์ที่อยู่รอบ ๆ"
+description: "ShopMicro คือโปรเจกต์ #3 ของซีรีส์เจ็ดโปรเจกต์ที่ต่อยอดทั้งแค็ตตาล็อกของ Learn Hub มาเป็นแอปพลิเคชันจริง นี่คือตำแหน่งของ ShopMicro และโปรเจกต์ที่อยู่รอบ ๆ"
 sidebar:
   order: 4
 ---
 
 ## ShopMicro อยู่ตรงไหนของซีรีส์
 
-ShopMicro คือ **โปรเจกต์ #3** ของซีรีส์ **Real-World Projects** ที่มีหกโปรเจกต์ แต่ละโปรเจกต์หยิบแอปพลิเคชันจริงคนละตัวมาสร้างใหม่ตั้งแต่ repo เปล่า ๆ โดยจงใจดึงคอร์สคนละส่วนใน Learn Hub มาใช้ พอรวมทั้งหกเข้าด้วยกันจึงครอบคลุมแค็ตตาล็อกเกือบทั้งหมด
+ShopMicro คือ **โปรเจกต์ #3** ของซีรีส์ **Real-World Projects** ที่มีเจ็ดโปรเจกต์ แต่ละโปรเจกต์หยิบแอปพลิเคชันจริงคนละตัวมาสร้างใหม่ตั้งแต่ repo เปล่า ๆ โดยจงใจดึงคอร์สคนละส่วนใน Learn Hub มาใช้ พอรวมทั้งเจ็ดเข้าด้วยกันจึงครอบคลุมแค็ตตาล็อกเกือบทั้งหมด
 
-สองโปรเจกต์แรก **เสร็จและใช้งานได้จริง** แล้ววันนี้ ShopMicro คือตัวที่คุณกำลังสร้างอยู่ ส่วนอีกสามตัวจะตามมาเติมแผนที่ให้ครบทั้งฝั่ง mobile, offline web และ cloud infrastructure จริง
+ทั้งเจ็ดโปรเจกต์ **ใช้งานได้จริง** แล้ววันนี้ ShopMicro คือตัวที่คุณกำลังสร้างอยู่ ส่วนอีกสี่ตัวถัดจากนี้เติมแผนที่ให้ครบทั้งฝั่ง mobile, micro-frontend, offline web และ cloud infrastructure จริง
 
 ## TaskFlow — realtime Kanban board ✅ live
 
@@ -32,27 +32,34 @@ ShopMicro คือ **โปรเจกต์ #3** ของซีรีส์ 
 - **Stack:** Go + gRPC + PostgreSQL + Kafka + RabbitMQ + Kubernetes
 - **Adapts:** Go Deep Dive, Go for TypeScript Developers, gRPC, Microservices, Kafka, RabbitMQ, Docker, Kubernetes
 
-## FitTrack — mobile-first fitness app
+## FitTrack — mobile-first fitness app ✅ live
 
 แอปติดตามการออกกำลังกายที่มีทั้งแอป mobile แบบ native และเพื่อนคู่หูฝั่งเว็บ รองรับด้วย Python API และแพลตฟอร์ม Postgres/auth แบบ managed คุณจะสร้างโปรดักต์เดียวกันสำหรับ client สองตัวและแชร์ backend เดียวกัน
 
 - **Stack:** Python/FastAPI + Supabase + Flutter + Svelte
 - **Adapts:** Python Deep Dive, Python for TypeScript Developers, Supabase, Flutter (×2), Svelte
 
-## OfflineNotes — offline-first PWA
+## Mosaic — micro-frontend storefront ✅ live
+
+storefront ที่ประกอบขึ้นจาก micro-frontend ที่ deploy แยกกันอิสระ: React shell จะ compose remote ของ React, Svelte และ Astro ตอน runtime ด้วย Module Federation, Web Components เป็นขอบเขตกลางที่เชื่อมทุก framework เข้าหากัน และแต่ละ slice เป็นเจ้าของ UI กับ BFF บาง ๆ ของตัวเอง คุณจะสร้าง design system ที่ใช้ร่วมกัน, การสื่อสารข้าม slice, routing ที่ host เป็นเจ้าของ, ความทนทานเมื่อ remote ตัวใดตัวหนึ่งล่ม และการ deploy แยกราย slice — ShopMicro แยก backend ออกเป็นเซอร์วิสอิสระ ส่วน Mosaic แยก frontend ออกเป็น app อิสระ
+
+- **Stack:** Module Federation 2.0 + React + Svelte + Astro + Web Components + Hono
+- **Adapts:** Astro Deep Dive, Astro for React Developers, React Deep Dive, Svelte Deep Dive, Svelte for React Developers, Web Components
+
+## OfflineNotes — offline-first PWA ✅ live
 
 แอปจดโน้ตที่ทำงานได้แม้ไม่มีเครือข่ายเลย: โน้ตอยู่ใน browser และ sync เมื่อคุณกลับมาออนไลน์ คุณจะสร้าง **Web Components** ที่นำกลับมาใช้ซ้ำได้ เก็บข้อมูลใน **IndexedDB** เร่ง hot path ด้วย **WebAssembly** แล้วส่งออกเป็น PWA ที่ติดตั้งได้
 
 - **Stack:** TypeScript + Web Components + IndexedDB + WebAssembly + Astro
 - **Adapts:** TypeScript, Web Components, Browser Storage, PWA, WebAssembly, Web for Designers
 
-## CloudDeploy — infra capstone
+## CloudDeploy — infra capstone ✅ live
 
-บทสรุปปิดท้าย: หยิบโปรเจกต์ 1–5 มา **deploy จริง** คุณจะจัดเตรียม cloud infrastructure แบบ as code ข้ามสาม cloud รันบน Kubernetes แล้วเพิ่ม authentication, feature flag และ observability
+บทสรุปปิดท้าย: หยิบ **ShopMicro** — Helm chart ของโปรเจกต์นี้ — มา **deploy จริง** คุณจะจัดเตรียม cloud infrastructure แบบ as code ข้ามสาม cloud รันบน Kubernetes แล้วเพิ่ม authentication, feature flag และ observability
 
 - **Stack:** Terraform/Terragrunt (AWS/GCP/Azure) + Kubernetes + Datadog + Keycloak + GrowthBook
 - **Adapts:** Terraform (×3), Kubernetes, Datadog, Keycloak, GrowthBook
 
 ## เริ่มที่นี่
 
-TaskFlow และ DevBlog เสร็จและใช้งานได้จริงแล้ว ส่วน FitTrack, OfflineNotes และ CloudDeploy กำลังตามมา วันนี้ตัวที่จะสร้างคือ **ShopMicro** ไปที่ [Overview](/shopmicro/th/introduction/overview/) แล้วเริ่มจาก repo เปล่า ๆ ได้เลย
+ทั้งเจ็ดโปรเจกต์ใช้งานได้จริงแล้ว คู่มือนี้สร้าง **ShopMicro** ไปที่ [Overview](/shopmicro/th/introduction/overview/) แล้วเริ่มจาก repo เปล่า ๆ ได้เลย

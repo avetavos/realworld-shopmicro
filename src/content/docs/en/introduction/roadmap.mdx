@@ -1,13 +1,13 @@
 ---
 title: Real-World Projects Roadmap
-description: "ShopMicro is project #3 of a six-project series that adapts the whole Learn Hub catalog into real applications. Here's where it fits and what's around it."
+description: "ShopMicro is project #3 of a seven-project series that adapts the whole Learn Hub catalog into real applications. Here's where it fits and what's around it."
 sidebar:
   order: 4
 ---
 
 ## Where ShopMicro fits
 
-ShopMicro is **project #3** of a six-project **Real-World Projects** series. Each project takes a different real application and rebuilds it from an empty repo, deliberately drawing on a different slice of the Learn Hub courses — so that, taken together, the six cover almost the entire catalog. The first two projects are **complete and live** today; ShopMicro is the one you're building now; and three more follow to finish the map across mobile, the offline web, and real cloud infrastructure.
+ShopMicro is **project #3** of a seven-project **Real-World Projects** series. Each project takes a different real application and rebuilds it from an empty repo, deliberately drawing on a different slice of the Learn Hub courses — so that, taken together, the seven cover almost the entire catalog. All seven are **live** today; ShopMicro is the one you're building now, and the four after it finish the map across mobile, micro-frontends, the offline web, and real cloud infrastructure.
 
 ## TaskFlow — realtime Kanban board ✅ live
 
@@ -30,27 +30,34 @@ An online store split into independent services — catalog, orders, payments, n
 - **Stack:** Go + gRPC + PostgreSQL + Kafka + RabbitMQ + Kubernetes
 - **Adapts:** Go Deep Dive, Go for TypeScript Developers, gRPC, Microservices, Kafka, RabbitMQ, Docker, Kubernetes
 
-## FitTrack — mobile-first fitness app
+## FitTrack — mobile-first fitness app ✅ live
 
 A workout tracker with a native mobile app and a web companion, backed by a Python API and a managed Postgres/auth platform. You build the same product for two clients and share one backend.
 
 - **Stack:** Python/FastAPI + Supabase + Flutter + Svelte
 - **Adapts:** Python Deep Dive, Python for TypeScript Developers, Supabase, Flutter (×2), Svelte
 
-## OfflineNotes — offline-first PWA
+## Mosaic — micro-frontend storefront ✅ live
+
+A storefront composed of independently deployed micro-frontends: a React shell composes React, Svelte, and Astro remotes at runtime with Module Federation, Web Components are the universal boundary between frameworks, and each slice owns its UI and a thin BFF. You build a shared design system, cross-slice communication, host-owned routing, resilience when a remote is down, and per-slice deployment — where ShopMicro splits a backend into independent services, Mosaic splits a frontend into independent apps.
+
+- **Stack:** Module Federation 2.0 + React + Svelte + Astro + Web Components + Hono
+- **Adapts:** Astro Deep Dive, Astro for React Developers, React Deep Dive, Svelte Deep Dive, Svelte for React Developers, Web Components
+
+## OfflineNotes — offline-first PWA ✅ live
 
 A note-taking app that works with no network at all: notes live in the browser and sync when you come back online. You build reusable **Web Components**, store data in **IndexedDB**, speed up a hot path with **WebAssembly**, and ship it as an installable PWA.
 
 - **Stack:** TypeScript + Web Components + IndexedDB + WebAssembly + Astro
 - **Adapts:** TypeScript, Web Components, Browser Storage, PWA, WebAssembly, Web for Designers
 
-## CloudDeploy — infra capstone
+## CloudDeploy — infra capstone ✅ live
 
-The capstone: take projects 1–5 and **deploy them for real**. You provision cloud infrastructure as code across three clouds, run it on Kubernetes, and add authentication, feature flags, and observability.
+The capstone: take **ShopMicro** — this project's Helm chart — and **deploy it for real**. You provision cloud infrastructure as code across three clouds, run it on Kubernetes, and add authentication, feature flags, and observability.
 
 - **Stack:** Terraform/Terragrunt (AWS/GCP/Azure) + Kubernetes + Datadog + Keycloak + GrowthBook
 - **Adapts:** Terraform (×3), Kubernetes, Datadog, Keycloak, GrowthBook
 
 ## Start here
 
-TaskFlow and DevBlog are done and live; FitTrack, OfflineNotes, and CloudDeploy are on the way. Today, the one to build is **ShopMicro** — head to the [Overview](/shopmicro/en/introduction/overview/) and start from an empty repo.
+All seven projects are live. This guide builds **ShopMicro** — head to the [Overview](/shopmicro/en/introduction/overview/) and start from an empty repo.
